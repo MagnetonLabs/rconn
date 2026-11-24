@@ -13,8 +13,16 @@ use thiserror::Error;
 /// misbehaving peer can't make the other side allocate without limit.
 pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
-/// Length of the random challenge a host must sign to prove it holds its cert key.
+/// Length of each random nonce (client's and server's) in the host auth handshake.
 pub const CHALLENGE_LEN: usize = 32;
+
+/// WebRTC data-channel `protocol` string. Viewer and host refuse a channel whose protocol
+/// differs, so a [`DataMessage`] schema change bumps this, never edits v1 in place.
+pub const DATA_CHANNEL_PROTOCOL: &str = "rconn-data/1";
+
+/// Capabilities this build's server advertises in [`ServerMessage::Welcome`]. Clients
+/// only use optional features the server lists; unknown entries are ignored.
+pub const SERVER_CAPABILITIES: &[&str] = &["sessions", "ice-relay"];
 
 // ---------------------------------------------------------------------------
 // Signaling: client -> server
@@ -24,15 +32,17 @@ pub const CHALLENGE_LEN: usize = 32;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// First message from a host. `cert_pem` is the host certificate issued by the
-    /// org's fleet CA. The server answers with [`ServerMessage::Challenge`].
+    /// org's fleet CA. `client_nonce` is fresh random bytes ([`CHALLENGE_LEN`]).
+    /// The server answers with [`ServerMessage::Challenge`].
     HostHello {
         protocol_version: u16,
         host_id: HostId,
         cert_pem: String,
+        client_nonce: Vec<u8>,
     },
-    /// Signature over the challenge nonce, made with the host cert's private key.
-    /// Proves possession at the application layer, so it works behind proxies that
-    /// terminate TLS (Cloudflare, cloud load balancers).
+    /// Signature, with the host cert's private key, over
+    /// [`crate::fleet::host_proof_transcript`]. Proves possession at the application layer,
+    /// so it works behind proxies that terminate TLS (Cloudflare, cloud load balancers).
     HostProof { signature: Vec<u8> },
     /// First message from a viewer. `token` comes from operator login (accounts,
     /// passkey or OIDC); the socket itself carries no identity.
@@ -67,6 +77,9 @@ pub enum ServerMessage {
         org_id: OrgId,
         /// STUN/TURN servers with short-lived credentials.
         ice_servers: Vec<IceServer>,
+        /// Optional features this server supports. See [`SERVER_CAPABILITIES`].
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     /// To a host: an operator wants a session. Carries the effective policy for it.
     IncomingSession {
@@ -90,6 +103,10 @@ pub enum ServerMessage {
         code: ErrorCode,
         message: String,
     },
+    /// A message type this build doesn't know (sent by a newer server). Clients ignore
+    /// it; anything that changes auth or policy semantics bumps `PROTOCOL_VERSION` instead.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -153,6 +170,9 @@ pub enum ErrorCode {
 // Data channel: viewer <-> host
 // ---------------------------------------------------------------------------
 
+/// Frozen for [`DATA_CHANNEL_PROTOCOL`] `rconn-data/1`: postcard encodes variants by
+/// index, so variants and fields here (and in nested enums) must never be reordered,
+/// removed or inserted. Changes go into a new protocol version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DataMessage {
     Input(InputEvent),
@@ -216,6 +236,8 @@ pub enum CodecError {
     Postcard(#[from] postcard::Error),
     #[error("clipboard payload is {0} bytes, limit is {MAX_CLIPBOARD_BYTES}")]
     ClipboardTooLarge(usize),
+    #[error("{0} unexpected trailing bytes")]
+    TrailingBytes(usize),
 }
 
 impl ClientMessage {
@@ -248,7 +270,10 @@ impl DataMessage {
         if bytes.len() > MAX_CLIPBOARD_BYTES + 16 {
             return Err(CodecError::ClipboardTooLarge(bytes.len()));
         }
-        let msg: Self = postcard::from_bytes(bytes)?;
+        let (msg, rest): (Self, _) = postcard::take_from_bytes(bytes)?;
+        if !rest.is_empty() {
+            return Err(CodecError::TrailingBytes(rest.len()));
+        }
         msg.check_limits()?;
         Ok(msg)
     }
@@ -274,6 +299,7 @@ mod tests {
                 protocol_version: crate::PROTOCOL_VERSION,
                 host_id: HostId::new(),
                 cert_pem: "-----BEGIN CERTIFICATE-----".into(),
+                client_nonce: vec![7; CHALLENGE_LEN],
             },
             ClientMessage::HostProof {
                 signature: vec![1, 2, 3],
@@ -352,6 +378,33 @@ mod tests {
         assert!(matches!(
             DataMessage::decode(&raw),
             Err(CodecError::ClipboardTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_server_message_decodes_as_unknown() {
+        let msg = ServerMessage::from_json(r#"{"type":"some_future_thing","x":1}"#).unwrap();
+        assert_eq!(msg, ServerMessage::Unknown);
+    }
+
+    #[test]
+    fn welcome_without_capabilities_still_parses() {
+        let org = OrgId::new();
+        let json = format!(r#"{{"type":"welcome","org_id":"{org}","ice_servers":[]}}"#);
+        let ServerMessage::Welcome { capabilities, .. } = ServerMessage::from_json(&json).unwrap()
+        else {
+            panic!("not welcome")
+        };
+        assert!(capabilities.is_empty());
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let mut bytes = DataMessage::Control(Control::Ping(1)).encode().unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            DataMessage::decode(&bytes),
+            Err(CodecError::TrailingBytes(1))
         ));
     }
 }

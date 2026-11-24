@@ -95,6 +95,8 @@ pub enum WriteDenied {
     LockedByPolicy(String),
     #[error("unknown setting `{0}`")]
     UnknownKey(String),
+    #[error("`{0}` can only be changed by an administrator")]
+    AdminOnly(String),
 }
 
 #[derive(Debug, Error)]
@@ -111,72 +113,132 @@ pub struct SettingsLayers {
 }
 
 const POLICY_NAME: &str = "fleet policy";
+const USER_FILE_NAME: &str = "user file";
 
-/// Fleet policy as a figment provider with its own name, so provenance can tell it
-/// apart from the (also serialized) defaults.
-struct PolicyProvider(serde_json::Value);
+/// Keys only an administrator may set: the system file, fleet policy, or an admin write.
+/// The per-user file can't change them, so a user can't hide the session indicator or
+/// repoint the host at another server.
+pub const ADMIN_ONLY_KEYS: &[&str] = &["server", "hidden_mode", "host_kind"];
 
-impl Provider for PolicyProvider {
+/// Who is asking to change a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writer {
+    User,
+    Admin,
+}
+
+/// A JSON object as a figment provider with a fixed name, so provenance can tell the
+/// layers apart (defaults are also serialized).
+struct NamedProvider {
+    name: &'static str,
+    value: serde_json::Value,
+}
+
+impl Provider for NamedProvider {
     fn metadata(&self) -> Metadata {
-        Metadata::named(POLICY_NAME)
+        Metadata::named(self.name)
     }
     fn data(&self) -> Result<Map<Profile, Dict>, figment::Error> {
-        Serialized::globals(&self.0).data()
+        // Default profile, like the files: figment's Global profile would outrank later layers.
+        Serialized::defaults(&self.value).data()
     }
 }
 
 #[derive(Debug)]
 pub struct LoadedSettings {
-    pub settings: HostSettings,
+    settings: HostSettings,
     figment: Figment,
     layers: SettingsLayers,
+    /// Every dotted path the fleet policy sets, including ones set to null.
+    policy_paths: Vec<String>,
+    /// Admin-only keys found (and dropped) in the user file. Worth a warning in logs.
+    pub ignored_user_keys: Vec<String>,
 }
 
 impl LoadedSettings {
     pub fn load(layers: SettingsLayers) -> Result<Self, LoadError> {
         let mut fig = Figment::from(Serialized::defaults(HostSettings::default()));
+        let mut ignored_user_keys = Vec::new();
         if let Some(p) = &layers.user_file {
-            fig = fig.merge(Toml::file_exact(p));
+            let mut value: serde_json::Value = Figment::from(Toml::file_exact(p))
+                .extract()
+                .map_err(Box::new)?;
+            if let Some(obj) = value.as_object_mut() {
+                for key in ADMIN_ONLY_KEYS {
+                    if obj.remove(*key).is_some() {
+                        ignored_user_keys.push((*key).to_string());
+                    }
+                }
+            }
+            fig = fig.merge(NamedProvider {
+                name: USER_FILE_NAME,
+                value,
+            });
         }
         if let Some(p) = &layers.system_file {
             fig = fig.merge(Toml::file_exact(p));
         }
+        let mut policy_paths = Vec::new();
         if let Some(policy) = &layers.fleet_policy {
-            fig = fig.merge(PolicyProvider(policy.clone()));
+            collect_paths(policy, "", &mut policy_paths);
+            fig = fig.merge(NamedProvider {
+                name: POLICY_NAME,
+                value: policy.clone(),
+            });
         }
         let settings = fig.extract().map_err(Box::new)?;
         Ok(Self {
             settings,
             figment: fig,
             layers,
+            policy_paths,
+            ignored_user_keys,
         })
+    }
+
+    /// The effective settings. Read-only: changes go through the host service, which
+    /// calls [`check_write`](Self::check_write) under its session lock and reloads.
+    pub fn settings(&self) -> &HostSettings {
+        &self.settings
     }
 
     /// Source of a dotted key such as `"server.url"` or `"clipboard"`.
     pub fn source(&self, key: &str) -> Source {
+        if self.is_locked(key) {
+            return Source::FleetPolicy;
+        }
         let Some(meta) = self.figment.find_metadata(key) else {
             return Source::Default;
         };
-        if meta.name == POLICY_NAME {
-            return Source::FleetPolicy;
+        if meta.name == USER_FILE_NAME {
+            return Source::UserFile;
         }
-        let from_file = |file: &Option<PathBuf>| matches!((&meta.source, file), (Some(figment::Source::File(src)), Some(f)) if same_path(src, f));
-        if from_file(&self.layers.system_file) {
+        let from_system = matches!(
+            (&meta.source, &self.layers.system_file),
+            (Some(figment::Source::File(src)), Some(f)) if same_path(src, f)
+        );
+        if from_system {
             Source::SystemFile
-        } else if from_file(&self.layers.user_file) {
-            Source::UserFile
         } else {
             Source::Default
         }
     }
 
+    /// A key is locked if policy sets it, an ancestor of it (`server` locks `server.url`,
+    /// even when set to null), or a descendant of it (`server.url` locks `server`).
     pub fn is_locked(&self, key: &str) -> bool {
-        self.source(key) == Source::FleetPolicy
+        self.policy_paths.iter().any(|p| overlaps(p, key))
     }
 
-    /// Gate for every local settings write. Enforced by the host service, not just the UI.
-    pub fn check_write(&self, key: &str, session_active: bool) -> Result<(), WriteDenied> {
-        if !is_known_key(key) {
+    /// Gate for every local settings write. The caller (host service) must hold its
+    /// session lock across this check and the write, so a session can't start in between.
+    pub fn check_write(
+        &self,
+        key: &str,
+        writer: Writer,
+        session_active: bool,
+    ) -> Result<(), WriteDenied> {
+        if !KNOWN_KEYS.contains(&key) {
             return Err(WriteDenied::UnknownKey(key.into()));
         }
         if session_active {
@@ -185,7 +247,33 @@ impl LoadedSettings {
         if self.is_locked(key) {
             return Err(WriteDenied::LockedByPolicy(key.into()));
         }
+        if writer == Writer::User && ADMIN_ONLY_KEYS.iter().any(|a| overlaps(a, key)) {
+            return Err(WriteDenied::AdminOnly(key.into()));
+        }
         Ok(())
+    }
+}
+
+/// True if one dotted path is equal to, an ancestor of, or a descendant of the other.
+fn overlaps(a: &str, b: &str) -> bool {
+    let nested = |outer: &str, inner: &str| {
+        inner.len() > outer.len()
+            && inner.starts_with(outer)
+            && inner.as_bytes()[outer.len()] == b'.'
+    };
+    a == b || nested(a, b) || nested(b, a)
+}
+
+fn collect_paths(v: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    let Some(obj) = v.as_object() else { return };
+    for (k, child) in obj {
+        let path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        collect_paths(child, &path, out);
+        out.push(path);
     }
 }
 
@@ -200,10 +288,6 @@ pub const KNOWN_KEYS: &[&str] = &[
     "max_bitrate_kbps",
     "log_level",
 ];
-
-fn is_known_key(key: &str) -> bool {
-    KNOWN_KEYS.contains(&key)
-}
 
 fn same_path(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
@@ -251,13 +335,13 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(s.settings.log_level, "debug");
+        assert_eq!(s.settings().log_level, "debug");
         assert_eq!(s.source("log_level"), Source::UserFile);
-        assert_eq!(s.settings.max_bitrate_kbps, 2000);
+        assert_eq!(s.settings().max_bitrate_kbps, 2000);
         assert_eq!(s.source("max_bitrate_kbps"), Source::SystemFile);
-        assert!(!s.settings.clipboard);
+        assert!(!s.settings().clipboard);
         assert_eq!(s.source("clipboard"), Source::FleetPolicy);
-        assert_eq!(s.settings.hidden_mode, HiddenMode::Indicator);
+        assert_eq!(s.settings().hidden_mode, HiddenMode::Indicator);
         assert!(s.is_locked("hidden_mode"));
         assert!(!s.is_locked("log_level"));
     }
@@ -272,11 +356,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            s.settings.server.as_ref().unwrap().url,
+            s.settings().server.as_ref().unwrap().url,
             "wss://fleet.example"
         );
         assert_eq!(
-            s.check_write("server.url", false),
+            s.check_write("server.url", Writer::Admin, false),
             Err(WriteDenied::LockedByPolicy("server.url".into()))
         );
     }
@@ -288,17 +372,17 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(s.check_write("log_level", false), Ok(()));
+        assert_eq!(s.check_write("log_level", Writer::Admin, false), Ok(()));
         assert_eq!(
-            s.check_write("log_level", true),
+            s.check_write("log_level", Writer::Admin, true),
             Err(WriteDenied::SessionActive)
         );
         assert_eq!(
-            s.check_write("clipboard", false),
+            s.check_write("clipboard", Writer::Admin, false),
             Err(WriteDenied::LockedByPolicy("clipboard".into()))
         );
         assert_eq!(
-            s.check_write("nope", false),
+            s.check_write("nope", Writer::Admin, false),
             Err(WriteDenied::UnknownKey("nope".into()))
         );
     }
@@ -330,5 +414,91 @@ mod tests {
         assert!(s.shows_indicator(HostKind::Vm));
         s.hidden_mode = HiddenMode::Hidden;
         assert!(!s.shows_indicator(HostKind::Physical));
+    }
+
+    #[test]
+    fn null_parent_in_policy_locks_children() {
+        let s = LoadedSettings::load(SettingsLayers {
+            fleet_policy: Some(json!({ "server": null })),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(s.is_locked("server"));
+        assert!(s.is_locked("server.url"));
+        assert!(
+            !s.is_locked("serverless"),
+            "prefix match must respect the dot"
+        );
+        assert_eq!(
+            s.check_write("server.url", Writer::Admin, false),
+            Err(WriteDenied::LockedByPolicy("server.url".into()))
+        );
+    }
+
+    #[test]
+    fn child_in_policy_locks_parent() {
+        let s = LoadedSettings::load(SettingsLayers {
+            fleet_policy: Some(json!({ "server": { "url": "wss://a" } })),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(s.is_locked("server"));
+    }
+
+    #[test]
+    fn user_file_cannot_set_admin_only_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = write(
+            &dir,
+            "user.toml",
+            "hidden_mode = \"hidden\"\nhost_kind = \"vm\"\nlog_level = \"debug\"\n[server]\nurl = \"wss://evil\"\n",
+        );
+        let s = LoadedSettings::load(SettingsLayers {
+            user_file: Some(user),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.settings().hidden_mode, HiddenMode::Auto);
+        assert_eq!(s.settings().host_kind, None);
+        assert_eq!(s.settings().server, None);
+        assert_eq!(s.settings().log_level, "debug", "ordinary keys still apply");
+        let mut ignored = s.ignored_user_keys.clone();
+        ignored.sort();
+        assert_eq!(ignored, ["hidden_mode", "host_kind", "server"]);
+        assert!(s.shows_indicator_for_physical());
+    }
+
+    #[test]
+    fn system_file_can_set_admin_only_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = write(&dir, "system.toml", "hidden_mode = \"hidden\"\n");
+        let s = LoadedSettings::load(SettingsLayers {
+            system_file: Some(system),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.settings().hidden_mode, HiddenMode::Hidden);
+        assert_eq!(s.source("hidden_mode"), Source::SystemFile);
+    }
+
+    #[test]
+    fn users_cannot_write_admin_only_keys() {
+        let s = LoadedSettings::load(SettingsLayers::default()).unwrap();
+        assert_eq!(
+            s.check_write("hidden_mode", Writer::User, false),
+            Err(WriteDenied::AdminOnly("hidden_mode".into()))
+        );
+        assert_eq!(
+            s.check_write("server.url", Writer::User, false),
+            Err(WriteDenied::AdminOnly("server.url".into()))
+        );
+        assert_eq!(s.check_write("hidden_mode", Writer::Admin, false), Ok(()));
+        assert_eq!(s.check_write("log_level", Writer::User, false), Ok(()));
+    }
+
+    impl LoadedSettings {
+        fn shows_indicator_for_physical(&self) -> bool {
+            self.settings().shows_indicator(HostKind::Physical)
+        }
     }
 }

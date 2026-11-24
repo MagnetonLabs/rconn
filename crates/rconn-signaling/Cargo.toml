@@ -1,7 +1,7 @@
 [package]
 name = "rconn-signaling"
 description = "Open-source signaling server for rconn (hosted and self-hosted modes)."
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,17 @@ rconn-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+axum = { version = "0.8.9", features = ["ws"] }
+tokio = { version = "1.54.1", features = ["full"] }
+futures-util = "0.3.34"
+rand = "0.10.4"
+thiserror.workspace = true
+async-trait = "0.1.92"
+sha2 = "0.11.1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+futures-util = "0.3.34"
+tokio-tungstenite = "0.30.0"
