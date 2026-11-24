@@ -147,3 +147,25 @@ impl Injector for SendInputInjector {
         });
     }
 }
+
+/// Self-test: inject an absolute move to 25%/25% of the primary display, read the cursor
+/// back, then restore it. Returns (expected, actual) in pixels.
+pub fn selftest_pointer() -> windows::core::Result<((i32, i32), (i32, i32))> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetCursorPos,
+    };
+    let mut inj = SendInputInjector::default();
+    inj.attach();
+    unsafe {
+        let mut saved = POINT::default();
+        GetCursorPos(&mut saved)?;
+        let (w, h) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        inj.pointer_move(0.25, 0.25);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut now = POINT::default();
+        GetCursorPos(&mut now)?;
+        let _ = SetCursorPos(saved.x, saved.y);
+        Ok(((w / 4, h / 4), (now.x, now.y)))
+    }
+}

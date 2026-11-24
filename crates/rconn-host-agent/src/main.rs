@@ -28,19 +28,30 @@ use webrtc::peer_connection::RTCPeerConnectionState;
 #[derive(Parser, Clone)]
 #[command(version, about = "rconn host agent")]
 struct Cli {
+    /// Check that input injection reaches the active desktop, then exit.
+    #[arg(long, exclusive = true)]
+    selftest_input: bool,
     /// Signaling WebSocket URL, e.g. wss://rconn.example.com/v1/ws
-    #[arg(long, env = "RCONN_SERVER")]
-    server: String,
+    #[arg(long, env = "RCONN_SERVER", required_unless_present = "selftest_input")]
+    server: Option<String>,
     /// Server identity this host was enrolled for (bound into the auth proof).
-    #[arg(long, env = "RCONN_SERVER_ID")]
-    server_id: String,
+    #[arg(
+        long,
+        env = "RCONN_SERVER_ID",
+        required_unless_present = "selftest_input"
+    )]
+    server_id: Option<String>,
     /// Pinned server key (`sha256:...` from `rconn-signaling init`). Omit for servers
     /// with a public certificate.
     #[arg(long, env = "RCONN_FINGERPRINT")]
     fingerprint: Option<String>,
     /// Directory with host.id, host.cert.pem and host.key.pem from `enroll-host`.
-    #[arg(long, env = "RCONN_IDENTITY_DIR")]
-    identity: PathBuf,
+    #[arg(
+        long,
+        env = "RCONN_IDENTITY_DIR",
+        required_unless_present = "selftest_input"
+    )]
+    identity: Option<PathBuf>,
     /// Cisco openh264 library. Default: next to this executable.
     #[arg(long, env = "RCONN_OPENH264")]
     openh264: Option<PathBuf>,
@@ -103,8 +114,17 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    if cli.selftest_input {
+        println!("{}", input::selftest()?);
+        return Ok(());
+    }
+    let (server, server_id, identity) = (
+        cli.server.clone().context("--server is required")?,
+        cli.server_id.clone().context("--server-id is required")?,
+        cli.identity.clone().context("--identity is required")?,
+    );
     let read =
-        |f: &str| fs::read_to_string(cli.identity.join(f)).with_context(|| format!("reading {f}"));
+        |f: &str| fs::read_to_string(identity.join(f)).with_context(|| format!("reading {f}"));
     let host_id = HostId(
         read("host.id")?
             .trim()
@@ -126,12 +146,12 @@ async fn main() -> Result<()> {
     let mut backoff = Duration::from_secs(1);
     loop {
         let creds = HostCredentials {
-            server_id: &cli.server_id,
+            server_id: &server_id,
             host_id,
             key: &key,
             cert_pem: &cert,
         };
-        match SignalingClient::connect_host(&cli.server, &trust, creds).await {
+        match SignalingClient::connect_host(&server, &trust, creds).await {
             Ok(sig) => {
                 backoff = Duration::from_secs(1);
                 tracing::info!("connected to signaling");

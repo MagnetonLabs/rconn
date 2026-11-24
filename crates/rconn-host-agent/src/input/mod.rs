@@ -8,6 +8,23 @@
 #[cfg(windows)]
 mod windows;
 
+/// Inject a pointer move and check the OS cursor followed. Windows only.
+pub fn selftest() -> anyhow::Result<String> {
+    #[cfg(windows)]
+    {
+        let (want, got) = windows::selftest_pointer()?;
+        let ok = (want.0 - got.0).abs() <= 2 && (want.1 - got.1).abs() <= 2;
+        anyhow::ensure!(ok, "cursor at {got:?}, expected {want:?}");
+        Ok(format!(
+            "pointer injection ok: expected {want:?}, cursor at {got:?}"
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("input self-test is Windows-only")
+    }
+}
+
 use rconn_core::protocol::{InputEvent, MouseButton};
 use std::collections::HashSet;
 use std::sync::mpsc;
