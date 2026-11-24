@@ -83,6 +83,13 @@ pub fn console_session() -> Result<u32> {
     Ok(id)
 }
 
+/// Is Windows shutting down or restarting? (Don't relaunch the agent then: the OS is
+/// killing processes, and relaunching only produces online/offline flapping.)
+pub fn shutting_down() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
 /// A process started by [`launch_in_session`].
 pub struct Child {
     pub pid: u32,

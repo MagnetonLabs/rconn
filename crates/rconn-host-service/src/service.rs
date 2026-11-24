@@ -13,7 +13,7 @@
 //! C:\ProgramData\rconn\agent.log     agent output (truncated past 10 MB)
 //! ```
 
-use crate::console::{Child, console_session, launch_in_session};
+use crate::console::{Child, console_session, launch_in_session, shutting_down};
 use anyhow::{Context, Result};
 use rconn_core::settings::{LoadedSettings, SettingsLayers};
 use std::ffi::OsString;
@@ -98,6 +98,9 @@ fn supervise(stop: &mpsc::Receiver<()>) {
         match stop.recv_timeout(Duration::from_secs(2)) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if shutting_down() {
+            continue; // the OS is stopping processes; wait for our own Stop/Shutdown
         }
         let Ok(session) = console_session() else {
             continue;
