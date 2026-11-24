@@ -11,6 +11,7 @@ use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage};
 use rconn_peer::rtc::PeerOptions;
 use rconn_peer::session::{ChannelHandler, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
+use rconn_peer::trust::ServerTrust;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +27,10 @@ struct Cli {
     /// Server identity this host was enrolled for (bound into the auth proof).
     #[arg(long, env = "RCONN_SERVER_ID")]
     server_id: String,
+    /// Pinned server key (`sha256:...` from `rconn-signaling init`). Omit for servers
+    /// with a public certificate.
+    #[arg(long, env = "RCONN_FINGERPRINT")]
+    fingerprint: Option<String>,
     /// Directory with host.id, host.cert.pem and host.key.pem from `enroll-host`.
     #[arg(long, env = "RCONN_IDENTITY_DIR")]
     identity: PathBuf,
@@ -57,6 +62,7 @@ async fn main() -> Result<()> {
         openh264 = rconn_media::cisco::current_binary_name(), "host agent starting"
     );
 
+    let trust = ServerTrust::from_fingerprint(cli.fingerprint.as_deref());
     // Reconnect forever with capped backoff: an unattended host must come back by itself.
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -66,7 +72,7 @@ async fn main() -> Result<()> {
             key: &key,
             cert_pem: &cert,
         };
-        match SignalingClient::connect_host(&cli.server, creds).await {
+        match SignalingClient::connect_host(&cli.server, &trust, creds).await {
             Ok(sig) => {
                 backoff = Duration::from_secs(1);
                 tracing::info!("connected to signaling");

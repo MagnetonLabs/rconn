@@ -13,16 +13,19 @@ anyhow.workspace = true
 tracing.workspace = true
 webrtc = "=0.21.1"
 tokio = { version = "1.54.1", features = ["full"] }
-tokio-tungstenite = "0.30.0"
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3.34"
 async-trait = "0.1.92"
 bytes = "1.12.2"
 uuid = { workspace = true, features = ["v4"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1.0.12"
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 axum = "0.8.9"
+axum-server = { version = "0.9.2", features = ["tls-rustls-ring"] }
 rconn-signaling = { path = "../rconn-signaling" }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

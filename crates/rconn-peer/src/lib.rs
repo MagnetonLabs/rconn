@@ -4,3 +4,4 @@
 pub mod rtc;
 pub mod session;
 pub mod signaling;
+pub mod trust;

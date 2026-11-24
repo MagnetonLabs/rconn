@@ -31,8 +31,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create the org's fleet CA in the data dir.
-    Init,
+    /// Create the org's fleet CA and the server TLS identity in the data dir.
+    Init {
+        /// Hostnames for the TLS certificate (repeatable).
+        #[arg(long = "hostname")]
+        hostnames: Vec<String>,
+    },
     /// Issue a host identity (key + cert) into `out`. Copy `out` to the host's
     /// admin-only config directory, then delete it here.
     EnrollHost {
@@ -73,6 +77,9 @@ enum Cmd {
             requires = "turn_url"
         )]
         turn_secret: Option<String>,
+        /// Serve plain HTTP/WebSocket (only behind a TLS-terminating proxy).
+        #[arg(long, env = "RCONN_PLAIN")]
+        plain: bool,
     },
 }
 
@@ -87,13 +94,16 @@ async fn main() -> Result<()> {
     let store = DataDir::new(&cli.data_dir);
 
     match cli.cmd {
-        Cmd::Init => {
-            let ca = store.init()?;
+        Cmd::Init { hostnames } => {
+            let ca = store.init(&hostnames)?;
             println!(
                 "org {} initialised in {}",
                 ca.org_id(),
                 cli.data_dir.display()
             );
+            if let Some(fp) = store.tls_fingerprint()? {
+                println!("server fingerprint (pin this in host and viewer profiles): {fp}");
+            }
         }
         Cmd::EnrollHost { out } => {
             let ca = store.load_ca()?;
@@ -123,6 +133,7 @@ async fn main() -> Result<()> {
             turn_ports,
             turn_url,
             turn_secret,
+            plain,
         } => {
             let turn = match turn_public_ip {
                 Some(ip) => Some(TurnConfig {
@@ -142,7 +153,7 @@ async fn main() -> Result<()> {
                 (Some(_), None) => anyhow::bail!("--turn-url needs --turn-secret"),
                 _ => None,
             };
-            serve(&store, &bind, server_id, ice, turn, external).await?
+            serve(&store, &bind, server_id, ice, turn, external, plain).await?
         }
     }
     Ok(())
@@ -164,6 +175,7 @@ async fn serve(
     ice: Vec<String>,
     turn: Option<TurnConfig>,
     external_turn: Option<TurnMinter>,
+    plain: bool,
 ) -> Result<()> {
     let ca = store.load_ca()?;
     let org_id = ca.org_id();
@@ -204,15 +216,39 @@ async fn serve(
         auth.revoke(*h);
     }
 
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("binding {bind}"))?;
-    tracing::info!(%org_id, %server_id, addr = %listener.local_addr()?, revoked = revoked.len(), "serving");
-    axum::serve(listener, router(AppState::new(Arc::new(auth))))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let app = router(AppState::new(Arc::new(auth)));
+    let addr: std::net::SocketAddr = bind.parse().with_context(|| format!("--bind {bind}"))?;
+    let handle = axum_server::Handle::new();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        h.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+    });
+    match (plain, store.tls_pem()?) {
+        (false, Some((cert, key))) => {
+            let fp = rconn_core::tls::spki_fingerprint_pem(&cert)?;
+            tracing::info!(%org_id, %server_id, %addr, fingerprint = %fp, revoked = revoked.len(), "serving wss");
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+                cert.into_bytes(),
+                key.into_bytes(),
+            )
+            .await?;
+            axum_server::bind_rustls(addr, tls)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        (false, None) => anyhow::bail!(
+            "no tls.cert.pem in the data dir; run `init`, or pass --plain behind a TLS proxy"
+        ),
+        (true, _) => {
+            tracing::warn!(%org_id, %server_id, %addr, revoked = revoked.len(), "serving PLAIN ws (expecting a TLS proxy in front)");
+            axum_server::bind(addr)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+    }
     if let Some(relay) = relay {
         relay.close().await?;
     }

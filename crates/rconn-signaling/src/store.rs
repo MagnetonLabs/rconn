@@ -26,8 +26,9 @@ impl DataDir {
         self.0.join(name)
     }
 
-    /// Create the org CA. Refuses to overwrite an existing one.
-    pub fn init(&self) -> Result<FleetCa> {
+    /// Create the org CA and the server's TLS identity. Refuses to overwrite an existing CA.
+    /// `hostnames` go into the TLS certificate's SANs (informational for pinned clients).
+    pub fn init(&self, hostnames: &[String]) -> Result<FleetCa> {
         if self.p("ca.pem").exists() {
             bail!("{} already holds a fleet CA", self.0.display());
         }
@@ -37,7 +38,28 @@ impl DataDir {
         write_private(&self.p("ca.key.pem"), ca.key_pem())?;
         fs::write(self.p("operators.json"), "{}")?;
         fs::write(self.p("revoked.json"), "[]")?;
+        let tls = rconn_core::tls::generate_server_tls(hostnames)?;
+        fs::write(self.p("tls.cert.pem"), &tls.cert_pem)?;
+        write_private(&self.p("tls.key.pem"), &tls.key_pem)?;
         Ok(ca)
+    }
+
+    /// Server TLS certificate and key (PEM), if `init` created them.
+    pub fn tls_pem(&self) -> Result<Option<(String, String)>> {
+        let cert = self.p("tls.cert.pem");
+        if !cert.exists() {
+            return Ok(None);
+        }
+        let key = fs::read_to_string(self.p("tls.key.pem")).context("reading tls.key.pem")?;
+        Ok(Some((fs::read_to_string(cert)?, key)))
+    }
+
+    /// The pin clients put in their server profile: `sha256:<hex>` of the TLS public key.
+    pub fn tls_fingerprint(&self) -> Result<Option<String>> {
+        Ok(match self.tls_pem()? {
+            Some((cert, _)) => Some(rconn_core::tls::spki_fingerprint_pem(&cert)?),
+            None => None,
+        })
     }
 
     pub fn load_ca(&self) -> Result<FleetCa> {
@@ -128,12 +150,19 @@ mod tests {
     fn init_then_reload_and_manage_operators_and_revocations() {
         let dir = tempfile::tempdir().unwrap();
         let store = DataDir::new(dir.path());
-        let ca = store.init().unwrap();
+        let ca = store.init(&[]).unwrap();
         assert!(
-            store.init().is_err(),
+            store.init(&[]).is_err(),
             "init must not overwrite an existing CA"
         );
         assert_eq!(store.load_ca().unwrap().org_id(), ca.org_id());
+        assert!(
+            store
+                .tls_fingerprint()
+                .unwrap()
+                .unwrap()
+                .starts_with("sha256:")
+        );
 
         let (id, token) = store.add_operator().unwrap();
         let ops = store.operators().unwrap();

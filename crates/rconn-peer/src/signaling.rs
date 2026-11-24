@@ -1,14 +1,18 @@
 //! WebSocket client for the signaling server.
 
+use crate::trust::ServerTrust;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use rconn_core::PROTOCOL_VERSION;
 use rconn_core::fleet::{HostKey, host_proof_transcript};
 use rconn_core::ids::{HostId, OrgId};
 use rconn_core::protocol::{CHALLENGE_LEN, ClientMessage, IceServer, ServerMessage};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async, connect_async_tls_with_config,
+};
 
 pub struct SignalingClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -26,10 +30,12 @@ pub struct HostCredentials<'a> {
 }
 
 impl SignalingClient {
-    pub async fn connect_host(url: &str, creds: HostCredentials<'_>) -> Result<Self> {
-        let (mut ws, _) = connect_async(url)
-            .await
-            .context("connecting to signaling server")?;
+    pub async fn connect_host(
+        url: &str,
+        trust: &ServerTrust,
+        creds: HostCredentials<'_>,
+    ) -> Result<Self> {
+        let mut ws = open(url, trust).await?;
         let client_nonce: [u8; CHALLENGE_LEN] = random_nonce();
         send_on(
             &mut ws,
@@ -61,10 +67,8 @@ impl SignalingClient {
         Self::finish(ws).await
     }
 
-    pub async fn connect_operator(url: &str, token: &str) -> Result<Self> {
-        let (mut ws, _) = connect_async(url)
-            .await
-            .context("connecting to signaling server")?;
+    pub async fn connect_operator(url: &str, trust: &ServerTrust, token: &str) -> Result<Self> {
+        let mut ws = open(url, trust).await?;
         send_on(
             &mut ws,
             &ClientMessage::OperatorHello {
@@ -156,6 +160,32 @@ impl SignalingClient {
             }
         });
         (SignalingTx(out_tx), in_rx)
+    }
+}
+
+/// Open the WebSocket, applying `trust` to `wss://`. Plain `ws://` is for local testing
+/// only and is refused for pinned profiles, which exist precisely to authenticate the server.
+async fn open(
+    url: &str,
+    trust: &ServerTrust,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    if url.starts_with("wss://") {
+        let connector = Connector::Rustls(Arc::new(trust.client_config()?));
+        let (ws, _) = connect_async_tls_with_config(url, None, false, Some(connector))
+            .await
+            .context("connecting to signaling server")?;
+        Ok(ws)
+    } else if url.starts_with("ws://") {
+        if matches!(trust, ServerTrust::Pinned(_)) {
+            bail!("server is pinned but the URL is plaintext ws://; use wss://");
+        }
+        tracing::warn!(%url, "plaintext signaling connection (testing only)");
+        let (ws, _) = connect_async(url)
+            .await
+            .context("connecting to signaling server")?;
+        Ok(ws)
+    } else {
+        bail!("signaling URL must start with wss:// (or ws:// for local testing)");
     }
 }
 

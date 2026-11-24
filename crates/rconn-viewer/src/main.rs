@@ -9,6 +9,7 @@ use rconn_core::protocol::{Control, DataMessage};
 use rconn_peer::rtc::PeerOptions;
 use rconn_peer::session::open_viewer_session;
 use rconn_peer::signaling::SignalingClient;
+use rconn_peer::trust::ServerTrust;
 use std::time::{Duration, Instant};
 use webrtc::data_channel::DataChannelEvent;
 
@@ -19,6 +20,9 @@ struct Cli {
     server: String,
     #[arg(long, env = "RCONN_TOKEN", hide_env_values = true)]
     token: String,
+    /// Pinned server key (`sha256:...`). Omit for servers with a public certificate.
+    #[arg(long, env = "RCONN_FINGERPRINT")]
+    fingerprint: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -55,6 +59,7 @@ async fn main() -> Result<()> {
         } => {
             ping(
                 &cli.server,
+                &ServerTrust::from_fingerprint(cli.fingerprint.as_deref()),
                 &cli.token,
                 HostId(host),
                 count,
@@ -68,6 +73,7 @@ async fn main() -> Result<()> {
 
 async fn ping(
     server: &str,
+    trust: &ServerTrust,
     token: &str,
     host: HostId,
     count: u32,
@@ -75,7 +81,7 @@ async fn ping(
     relay_only: bool,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let sig = SignalingClient::connect_operator(server, token).await?;
+    let sig = SignalingClient::connect_operator(server, trust, token).await?;
     let session = open_viewer_session(
         sig,
         host,

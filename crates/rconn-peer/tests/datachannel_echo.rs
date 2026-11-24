@@ -9,6 +9,7 @@ use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage};
 use rconn_peer::rtc::PeerOptions;
 use rconn_peer::session::{ChannelHandler, open_viewer_session, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
+use rconn_peer::trust::ServerTrust;
 use rconn_signaling::auth::OperatorIdentity;
 use rconn_signaling::fleet_auth::FleetAuthenticator;
 use rconn_signaling::turn_relay::{TurnConfig, TurnMinter, TurnRelay};
@@ -80,6 +81,7 @@ async fn run(relay_only: bool) {
     };
     let host_sig = SignalingClient::connect_host(
         &url,
+        &ServerTrust::WebPki,
         HostCredentials {
             server_id: SERVER_ID,
             host_id,
@@ -89,7 +91,7 @@ async fn run(relay_only: bool) {
     )
     .await
     .unwrap();
-    let viewer_sig = SignalingClient::connect_operator(&url, "tok")
+    let viewer_sig = SignalingClient::connect_operator(&url, &ServerTrust::WebPki, "tok")
         .await
         .unwrap();
     if relay_only {
