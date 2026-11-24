@@ -22,6 +22,18 @@ opusic-sys = { workspace = true, features = ["no-simd"] }
 tracing.workspace = true
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_StationsAndDesktops", "Win32_System_Threading"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+tracing.workspace = true
+objc2 = "0.6.3"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSString", "NSObject"] }
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = ["std", "SCStream", "SCShareableContent", "SCError", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics", "objc2-core-foundation"] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMSampleBuffer", "CMTime", "CMBase", "CMAttachment", "objc2-core-video"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn", "CVBase"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFString", "CFNumber"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGDirectDisplay"] }
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+
 [lints]
 workspace = true
 

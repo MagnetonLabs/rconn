@@ -2,9 +2,12 @@
 //!
 //! Injection runs on one dedicated OS thread per session. On Windows that thread attaches
 //! to the input desktop, so input reaches the lock screen and UAC prompts too (the agent
-//! runs as SYSTEM in the console session). When the session ends, every key and button
+//! runs as SYSTEM in the console session). On macOS it posts CGEvents at the HID tap,
+//! which needs the Accessibility permission. When the session ends, every key and button
 //! still held is released, so a dropped connection can't leave Ctrl stuck down.
 
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
 
@@ -102,7 +105,11 @@ fn platform_injector() -> Option<Box<dyn Injector>> {
     {
         Some(Box::new(windows::SendInputInjector::default()))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Some(Box::new(macos::CgInjector::new()))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         None
     }

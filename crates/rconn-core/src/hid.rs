@@ -137,10 +137,120 @@ pub fn to_windows_scancode(hid: u16) -> Option<ScanCode> {
     }
 }
 
+/// HID usage -> macOS virtual key code (`kVK_*` from Carbon's `Events.h`), positional on
+/// an ANSI keyboard. `None` for keys macOS has no code for (F21..F24).
+///
+/// PC-only keys follow what macOS itself does with a PC keyboard: Print Screen, Scroll
+/// Lock and Pause become F13..F15, Insert becomes Help, Num Lock becomes keypad Clear.
+pub fn to_mac_keycode(hid: u16) -> Option<u16> {
+    use usage::*;
+    // Letters A..Z in HID order.
+    const LETTERS: [u16; 26] = [
+        0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2E, 0x2D, 0x1F,
+        0x23, 0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07, 0x10, 0x06,
+    ];
+    // 1..9, 0 in HID order.
+    const DIGITS: [u16; 10] = [0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19, 0x1D];
+    const F1_12: [u16; 12] = [
+        0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64, 0x65, 0x6D, 0x67, 0x6F,
+    ];
+    const F13_20: [u16; 8] = [0x69, 0x6B, 0x71, 0x6A, 0x40, 0x4F, 0x50, 0x5A];
+    match hid {
+        h if (A..A + 26).contains(&h) => Some(LETTERS[usize::from(h - A)]),
+        h if (DIGIT1..=DIGIT0).contains(&h) => Some(DIGITS[usize::from(h - DIGIT1)]),
+        ENTER => Some(0x24),
+        ESCAPE => Some(0x35),
+        BACKSPACE => Some(0x33), // kVK_Delete
+        TAB => Some(0x30),
+        SPACE => Some(0x31),
+        MINUS => Some(0x1B),
+        EQUAL => Some(0x18),
+        BRACKET_LEFT => Some(0x21),
+        BRACKET_RIGHT => Some(0x1E),
+        BACKSLASH => Some(0x2A),
+        SEMICOLON => Some(0x29),
+        QUOTE => Some(0x27),
+        BACKQUOTE => Some(0x32),
+        COMMA => Some(0x2B),
+        PERIOD => Some(0x2F),
+        SLASH => Some(0x2C),
+        CAPS_LOCK => Some(0x39),
+        h if (F1..F1 + 12).contains(&h) => Some(F1_12[usize::from(h - F1)]),
+        PRINT_SCREEN => Some(0x69), // F13
+        SCROLL_LOCK => Some(0x6B),  // F14
+        PAUSE => Some(0x71),        // F15
+        INSERT => Some(0x72),       // kVK_Help
+        HOME => Some(0x73),
+        PAGE_UP => Some(0x74),
+        DELETE => Some(0x75), // kVK_ForwardDelete
+        END => Some(0x77),
+        PAGE_DOWN => Some(0x79),
+        ARROW_RIGHT => Some(0x7C),
+        ARROW_LEFT => Some(0x7B),
+        ARROW_DOWN => Some(0x7D),
+        ARROW_UP => Some(0x7E),
+        NUM_LOCK => Some(0x47),       // kVK_ANSI_KeypadClear
+        INTL_BACKSLASH => Some(0x0A), // kVK_ISO_Section
+        CONTEXT_MENU => Some(0x6E),   // kVK_ContextualMenu
+        h if (F13..F13 + 8).contains(&h) => Some(F13_20[usize::from(h - F13)]),
+        CONTROL_LEFT => Some(0x3B),
+        SHIFT_LEFT => Some(0x38),
+        ALT_LEFT => Some(0x3A),  // Option
+        META_LEFT => Some(0x37), // Command
+        CONTROL_RIGHT => Some(0x3E),
+        SHIFT_RIGHT => Some(0x3C),
+        ALT_RIGHT => Some(0x3D),
+        META_RIGHT => Some(0x36),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::usage::*;
     use super::*;
+
+    #[test]
+    fn mac_spot_checks_against_kvk() {
+        assert_eq!(to_mac_keycode(A), Some(0x00)); // kVK_ANSI_A
+        assert_eq!(to_mac_keycode(A + 18), Some(0x01)); // S
+        assert_eq!(to_mac_keycode(A + 25), Some(0x06)); // Z
+        assert_eq!(to_mac_keycode(DIGIT1), Some(0x12));
+        assert_eq!(to_mac_keycode(DIGIT1 + 4), Some(0x17)); // 5
+        assert_eq!(to_mac_keycode(DIGIT0), Some(0x1D));
+        assert_eq!(to_mac_keycode(ENTER), Some(0x24));
+        assert_eq!(to_mac_keycode(F1), Some(0x7A));
+        assert_eq!(to_mac_keycode(F1 + 11), Some(0x6F)); // F12
+        assert_eq!(to_mac_keycode(F13 + 7), Some(0x5A)); // F20
+        assert_eq!(to_mac_keycode(F13 + 8), None); // F21: no macOS code
+        assert_eq!(to_mac_keycode(ARROW_LEFT), Some(0x7B));
+        assert_eq!(to_mac_keycode(META_LEFT), Some(0x37)); // kVK_Command
+        assert_eq!(to_mac_keycode(ALT_RIGHT), Some(0x3D)); // kVK_RightOption
+        assert_eq!(to_mac_keycode(0x01), None);
+    }
+
+    #[test]
+    fn every_mac_keycode_is_unique_except_pc_aliases() {
+        // PC keys macOS folds onto F13..F15, as it does for a real PC keyboard.
+        let aliases = [PRINT_SCREEN, SCROLL_LOCK, PAUSE];
+        let mut seen = std::collections::HashSet::new();
+        for hid in 0..=0xFF {
+            if aliases.contains(&hid) {
+                continue;
+            }
+            if let Some(code) = to_mac_keycode(hid) {
+                assert!(code <= 0x7F, "HID {hid:#x} -> {code:#x} out of kVK range");
+                assert!(seen.insert(code), "duplicate keycode for HID {hid:#x}");
+            }
+        }
+        assert!(seen.len() > 90, "only {} keys mapped", seen.len());
+        // Every key Windows maps, macOS maps too, except F21..F24.
+        for hid in 0..=0xFF {
+            if to_windows_scancode(hid).is_some() && !(F13 + 8..F13 + 12).contains(&hid) {
+                assert!(to_mac_keycode(hid).is_some(), "HID {hid:#x} unmapped");
+            }
+        }
+    }
 
     #[test]
     fn spot_checks_against_the_set1_table() {
