@@ -120,6 +120,9 @@ impl VideoEncoder {
             .bitrate(BitRate::from_bps(self.settings.bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(self.settings.max_fps))
             .complexity(Complexity::Low)
+            // Not supported for screen content; openh264 warns and disables them anyway.
+            .adaptive_quantization(false)
+            .background_detection(false)
             .skip_frames(true)
             // Keyframes come from RequestKeyframe/PLI, not a timer.
             .intra_frame_period(IntraFramePeriod::from_num_frames(0))
