@@ -18,8 +18,9 @@ use webrtc::data_channel::DataChannelEvent;
 struct Cli {
     #[arg(long, env = "RCONN_SERVER")]
     server: String,
+    /// Operator token. Defaults to the one saved by `login` for this server.
     #[arg(long, env = "RCONN_TOKEN", hide_env_values = true)]
-    token: String,
+    token: Option<String>,
     /// Pinned server key (`sha256:...`). Omit for servers with a public certificate.
     #[arg(long, env = "RCONN_FINGERPRINT")]
     fingerprint: Option<String>,
@@ -29,6 +30,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Log in with an account; saves a session token for this server.
+    /// Password from RCONN_PASSWORD or the first line of stdin.
+    Login {
+        #[arg(long)]
+        username: String,
+    },
     /// Open a session to a host and measure data-channel round-trip time.
     Ping {
         host: uuid::Uuid,
@@ -50,7 +57,8 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    match cli.cmd {
+    match &cli.cmd {
+        Cmd::Login { username } => login(&cli.server, &trust(&cli), username).await,
         Cmd::Ping {
             host,
             count,
@@ -59,12 +67,12 @@ async fn main() -> Result<()> {
         } => {
             ping(
                 &cli.server,
-                &ServerTrust::from_fingerprint(cli.fingerprint.as_deref()),
-                &cli.token,
-                HostId(host),
-                count,
-                udp,
-                relay_only,
+                &trust(&cli),
+                &token_for(&cli)?,
+                HostId(*host),
+                *count,
+                udp.clone(),
+                *relay_only,
             )
             .await
         }
@@ -142,4 +150,79 @@ async fn ping(
         ms(rtts[rtts.len() - 1])
     );
     Ok(())
+}
+
+fn trust(cli: &Cli) -> ServerTrust {
+    ServerTrust::from_fingerprint(cli.fingerprint.as_deref())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedToken {
+    server: String,
+    token: String,
+    expires_at: u64,
+}
+
+fn token_path() -> Result<std::path::PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "rconn")
+        .ok_or_else(|| anyhow::anyhow!("no home directory for the token cache"))?;
+    Ok(dirs.config_dir().join("token.json"))
+}
+
+fn token_for(cli: &Cli) -> Result<String> {
+    if let Some(t) = &cli.token {
+        return Ok(t.clone());
+    }
+    let path = token_path()?;
+    let saved: SavedToken =
+        serde_json::from_str(&std::fs::read_to_string(&path).map_err(|_| {
+            anyhow::anyhow!(
+                "not logged in: run `rconn-viewer --server {} login --username <name>`",
+                cli.server
+            )
+        })?)?;
+    if saved.server != cli.server {
+        bail!(
+            "saved login is for {}, not {}; log in again",
+            saved.server,
+            cli.server
+        );
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    if now >= saved.expires_at {
+        bail!("saved login expired; log in again");
+    }
+    Ok(saved.token)
+}
+
+async fn login(server: &str, trust: &ServerTrust, username: &str) -> Result<()> {
+    let password = read_password()?;
+    let (token, expires_at) =
+        SignalingClient::password_login(server, trust, username, &password).await?;
+    let path = token_path()?;
+    std::fs::create_dir_all(path.parent().expect("token path has a parent"))?;
+    let saved = SavedToken {
+        server: server.to_owned(),
+        token,
+        expires_at,
+    };
+    std::fs::write(&path, serde_json::to_string(&saved)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!("logged in as {username}; token saved to {}", path.display());
+    Ok(())
+}
+
+fn read_password() -> Result<String> {
+    if let Ok(p) = std::env::var("RCONN_PASSWORD") {
+        return Ok(p);
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_owned())
 }

@@ -101,6 +101,35 @@ impl DataDir {
         Ok(secret)
     }
 
+    pub fn accounts(&self) -> Result<crate::accounts::Accounts> {
+        let path = self.p("accounts.json");
+        if !path.exists() {
+            return Ok(Default::default());
+        }
+        read_json(&path)
+    }
+
+    pub fn add_account(&self, username: &str, password: &str) -> Result<OperatorId> {
+        let mut accounts = self.accounts()?;
+        let id = accounts.add(username, password)?;
+        write_private(
+            &self.p("accounts.json"),
+            &serde_json::to_string_pretty(&accounts)?,
+        )?;
+        Ok(id)
+    }
+
+    /// Key that signs session tokens, created on first use. Delete it to log everyone out.
+    pub fn session_key(&self) -> Result<[u8; 32]> {
+        let path = self.p("session.key");
+        if let Ok(s) = fs::read_to_string(&path) {
+            return unhex32(s.trim()).context("corrupt session.key");
+        }
+        let key: [u8; 32] = rand::random();
+        write_private(&path, &hex(&key))?;
+        Ok(key)
+    }
+
     pub fn revoked(&self) -> Result<Vec<HostId>> {
         read_json(&self.p("revoked.json"))
     }

@@ -18,6 +18,9 @@ clap = { version = "4.6.9", features = ["derive", "env"] }
 webrtc = "=0.21.1"
 bytes = "1.12.2"
 uuid.workspace = true
+directories = "6.0.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

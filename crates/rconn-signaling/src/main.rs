@@ -43,8 +43,13 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Create an operator and print its token once.
+    /// Create an operator and print its token once (for automation; people use accounts).
     AddOperator,
+    /// Create a login account. Password from RCONN_PASSWORD or the first line of stdin.
+    AddAccount {
+        #[arg(long)]
+        username: String,
+    },
     /// Refuse a host from its next connect onward (restart `serve` to apply).
     RevokeHost { host_id: uuid::Uuid },
     /// Run the server.
@@ -115,6 +120,11 @@ async fn main() -> Result<()> {
             fs::write(out.join("host.cert.pem"), &cert)?;
             write_private(&out.join("host.key.pem"), &key.to_pem())?;
             println!("host {host_id} enrolled into {}", out.display());
+        }
+        Cmd::AddAccount { username } => {
+            let password = rconn_signaling::accounts::read_password()?;
+            let id = store.add_account(&username, &password)?;
+            println!("account {username} created (operator {id})");
         }
         Cmd::AddOperator => {
             let (id, token) = store.add_operator()?;
@@ -207,6 +217,15 @@ async fn serve(
         }
         None => None,
     };
+    let accounts = store.accounts()?;
+    if !accounts.0.is_empty() {
+        tracing::info!(accounts = accounts.0.len(), "password login enabled");
+    }
+    auth = auth.with_accounts(
+        org_id,
+        accounts,
+        rconn_signaling::accounts::SessionTokens::new(store.session_key()?),
+    );
     if let Some(minter) = external_turn {
         tracing::info!(urls = ?minter.turn_urls, "using external TURN");
         auth = auth.with_turn(minter);

@@ -80,6 +80,35 @@ impl SignalingClient {
         Self::finish(ws).await
     }
 
+    /// Exchange a username and password for a session token `(token, expires_at)`.
+    /// Refuses plaintext `ws://` except to loopback, so a password never crosses a network
+    /// unencrypted.
+    pub async fn password_login(
+        url: &str,
+        trust: &ServerTrust,
+        username: &str,
+        password: &str,
+    ) -> Result<(String, u64)> {
+        if url.starts_with("ws://") && !is_loopback_url(url) {
+            bail!("refusing to send a password over plaintext ws://; use wss://");
+        }
+        let mut ws = open(url, trust).await?;
+        send_on(
+            &mut ws,
+            &ClientMessage::PasswordLogin {
+                protocol_version: PROTOCOL_VERSION,
+                username: username.to_owned(),
+                password: password.to_owned(),
+            },
+        )
+        .await?;
+        match recv_on(&mut ws).await? {
+            ServerMessage::LoginToken { token, expires_at } => Ok((token, expires_at)),
+            ServerMessage::Error { message, .. } => bail!("login failed: {message}"),
+            other => bail!("unexpected login reply: {other:?}"),
+        }
+    }
+
     async fn finish(mut ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<Self> {
         match recv_on(&mut ws).await? {
             ServerMessage::Welcome {
@@ -187,6 +216,15 @@ async fn open(
     } else {
         bail!("signaling URL must start with wss:// (or ws:// for local testing)");
     }
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let rest = url.trim_start_matches("ws://");
+    let host = rest.split(['/', ':']).next().unwrap_or("");
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn random_nonce() -> [u8; CHALLENGE_LEN] {

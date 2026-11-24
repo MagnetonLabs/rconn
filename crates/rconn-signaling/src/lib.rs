@@ -1,6 +1,7 @@
 //! rconn signaling server: authenticates hosts and operators over a WebSocket, brokers
 //! sessions between them, and relays SDP/ICE. Media never passes through here.
 
+pub mod accounts;
 pub mod audit;
 pub mod auth;
 pub mod fleet_auth;
@@ -305,6 +306,40 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                     Next::Close(Phase::New)
                 }
             }
+        }
+        (
+            Phase::New,
+            ClientMessage::PasswordLogin {
+                protocol_version,
+                username,
+                password,
+            },
+        ) => {
+            if !check_version(tx, protocol_version) {
+                return Next::Close(Phase::New);
+            }
+            // One attempt per connection: brute force has to pay a TLS handshake each try.
+            match auth.password_login(&username, &password).await {
+                Ok((who, token, expires_at)) => {
+                    state.audit(AuditEvent::OperatorLogin {
+                        org_id: who.org_id,
+                        operator_id: who.operator_id,
+                    });
+                    let _ = tx.send(ServerMessage::LoginToken { token, expires_at });
+                }
+                Err(e) => {
+                    state.audit(AuditEvent::AuthFailed {
+                        role: AuthRole::Operator,
+                        reason: format!("password login for {username:?}: {e}"),
+                    });
+                    send_err(
+                        tx,
+                        ErrorCode::Unauthenticated,
+                        "invalid username or password".into(),
+                    );
+                }
+            }
+            Next::Close(Phase::New)
         }
         (Phase::Ready(Peer::Operator(op)), ClientMessage::RequestSession { host_id }) => {
             request_session(state, tx, op, host_id).await;

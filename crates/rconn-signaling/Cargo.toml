@@ -28,6 +28,9 @@ turn = "0.17"
 util = { version = "0.17", package = "webrtc-util" }
 axum-server = { version = "0.9.2", features = ["tls-rustls-ring"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+argon2 = "0.6.0"
+hmac = "0.13"
+base64 = "0.23.1"
 
 [lints]
 workspace = true

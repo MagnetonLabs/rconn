@@ -13,6 +13,8 @@ pub enum AuthError {
     Invalid,
     #[error("credential revoked")]
     Revoked,
+    #[error("credential expired")]
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,15 @@ pub trait Authenticator: Send + Sync + 'static {
     async fn verify_host(&self, proof: HostProofInput<'_>) -> Result<HostIdentity, AuthError>;
 
     async fn verify_operator(&self, token: &str) -> Result<OperatorIdentity, AuthError>;
+
+    /// Exchange a username and password for a session token and its expiry (Unix seconds).
+    async fn password_login(
+        &self,
+        _username: &str,
+        _password: &str,
+    ) -> Result<(OperatorIdentity, String, u64), AuthError> {
+        Err(AuthError::Invalid)
+    }
 
     /// STUN/TURN servers (with short-lived credentials) for a member of `org`.
     async fn ice_servers(&self, org: OrgId) -> Vec<IceServer>;

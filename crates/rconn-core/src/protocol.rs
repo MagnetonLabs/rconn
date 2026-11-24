@@ -50,6 +50,14 @@ pub enum ClientMessage {
         protocol_version: u16,
         token: String,
     },
+    /// Exchange account credentials for a session token. Only sent over TLS. The server
+    /// answers [`ServerMessage::LoginToken`] (or an error) and closes the socket; the
+    /// viewer then reconnects with `OperatorHello { token }`.
+    PasswordLogin {
+        protocol_version: u16,
+        username: String,
+        password: String,
+    },
     /// Operator asks to open a session to a host.
     RequestSession { host_id: HostId },
     /// SDP / ICE relayed to the other side of a session.
@@ -80,6 +88,11 @@ pub enum ServerMessage {
         /// Optional features this server supports. See [`SERVER_CAPABILITIES`].
         #[serde(default)]
         capabilities: Vec<String>,
+    },
+    /// Answer to `PasswordLogin`: a session token and its expiry (Unix seconds).
+    LoginToken {
+        token: String,
+        expires_at: u64,
     },
     /// To a host: an operator wants a session. Carries the effective policy for it.
     IncomingSession {
