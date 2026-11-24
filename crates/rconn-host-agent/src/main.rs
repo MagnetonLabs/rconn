@@ -2,6 +2,8 @@
 //! sessions, streams the screen, and serves the data channel. Input and audio attach
 //! here in phases 4 and 7.
 
+mod hostkind;
+mod indicator;
 mod input;
 mod stream;
 
@@ -63,6 +65,12 @@ struct Cli {
     max_fps: u32,
     #[arg(long, default_value_t = 8000)]
     max_kbps: u32,
+    /// Host settings file (the service passes ProgramData\\rconn\\host.toml).
+    #[arg(long, env = "RCONN_SETTINGS")]
+    settings: Option<PathBuf>,
+    /// Directory for runtime state (the `session.active` marker that locks settings).
+    #[arg(long, env = "RCONN_STATE_DIR")]
+    state_dir: Option<PathBuf>,
     /// Largest streamed size; bigger desktops are halved to fit.
     #[arg(long, default_value = "1920x1080")]
     max_size: String,
@@ -142,6 +150,7 @@ async fn main() -> Result<()> {
         arch = std::env::consts::ARCH, openh264 = %openh264.display(), "host agent starting"
     );
 
+    let host_kind = hostkind::detect();
     let trust = ServerTrust::from_fingerprint(cli.fingerprint.as_deref());
     // Reconnect forever with capped backoff: an unattended host must come back by itself.
     let mut backoff = Duration::from_secs(1);
@@ -165,7 +174,7 @@ async fn main() -> Result<()> {
                 let handler: SessionHandler = Arc::new(move |session: HostSession| {
                     let (cli, openh264) = (cli2.clone(), openh264.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = serve_session(session, &cli, openh264).await {
+                        if let Err(e) = serve_session(session, &cli, openh264, host_kind).await {
                             tracing::warn!(error = %e, "session failed");
                         }
                     });
@@ -181,7 +190,45 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve_session(mut session: HostSession, cli: &Cli, openh264: PathBuf) -> Result<()> {
+/// Marks a session as active for its lifetime (settings writes are refused meanwhile).
+struct SessionMarker(Option<PathBuf>);
+
+impl SessionMarker {
+    fn new(state_dir: Option<&PathBuf>, session: &rconn_core::ids::SessionId) -> Self {
+        let path = state_dir.map(|d| d.join("session.active"));
+        if let Some(p) = &path
+            && let Err(e) = fs::write(p, session.to_string())
+        {
+            tracing::warn!(error = %e, path = %p.display(), "could not write session marker");
+        }
+        Self(path)
+    }
+}
+
+impl Drop for SessionMarker {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
+async fn serve_session(
+    mut session: HostSession,
+    cli: &Cli,
+    openh264: PathBuf,
+    host_kind: rconn_core::settings::HostKind,
+) -> Result<()> {
+    let settings =
+        rconn_core::settings::LoadedSettings::load(rconn_core::settings::SettingsLayers {
+            system_file: cli.settings.clone(),
+            ..Default::default()
+        })?;
+    let _marker = SessionMarker::new(cli.state_dir.as_ref(), &session.session_id);
+    let show_indicator =
+        settings.settings().shows_indicator(host_kind) || session.policy.show_indicator;
+    tracing::info!(?host_kind, show_indicator, "session policy resolved");
+    let _indicator = show_indicator.then(indicator::Indicator::show);
     let keyframes = KeyframeRequests::default();
     let stop = Arc::new(AtomicBool::new(false));
 

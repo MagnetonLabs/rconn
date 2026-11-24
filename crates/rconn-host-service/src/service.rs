@@ -33,11 +33,7 @@ pub const NAME: &str = "rconn-host";
 const DISPLAY: &str = "rconn host";
 const LOG_LIMIT: u64 = 10 * 1024 * 1024;
 
-pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramData")
-        .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from);
-    base.join("rconn")
-}
+pub use crate::paths::data_dir;
 
 /// Everything needed to launch the agent, read fresh each launch so config edits apply
 /// at the next (re)start without restarting the service.
@@ -72,6 +68,12 @@ fn agent_launch() -> Result<AgentLaunch> {
         "--max-kbps".into(),
         settings.settings().max_bitrate_kbps.to_string(),
     ];
+    args.extend([
+        "--settings".into(),
+        dir.join("host.toml").to_string_lossy().into_owned(),
+        "--state-dir".into(),
+        dir.to_string_lossy().into_owned(),
+    ]);
     if let Some(fp) = &server.fingerprint {
         args.extend(["--fingerprint".into(), fp.clone()]);
     }

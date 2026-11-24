@@ -19,11 +19,16 @@ type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const SID: &str = "wss://reload.test";
 
 async fn send(ws: &mut Ws, m: &ClientMessage) {
-    ws.send(Message::Text(m.to_json().unwrap().into())).await.unwrap();
+    ws.send(Message::Text(m.to_json().unwrap().into()))
+        .await
+        .unwrap();
 }
 async fn recv(ws: &mut Ws) -> Option<ServerMessage> {
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("timeout") {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timeout")
+        {
             Some(Ok(Message::Text(t))) => return Some(ServerMessage::from_json(&t).unwrap()),
             Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return None,
             Some(Ok(_)) => {}
@@ -31,12 +36,30 @@ async fn recv(ws: &mut Ws) -> Option<ServerMessage> {
     }
 }
 
-async fn host_hello(url: &str, id: HostId, key: &HostKey, cert: &str) -> (Ws, Option<ServerMessage>) {
+async fn host_hello(
+    url: &str,
+    id: HostId,
+    key: &HostKey,
+    cert: &str,
+) -> (Ws, Option<ServerMessage>) {
     let (mut ws, _) = connect_async(url).await.unwrap();
     let cn = vec![1u8; CHALLENGE_LEN];
-    send(&mut ws, &ClientMessage::HostHello { protocol_version: PROTOCOL_VERSION, host_id: id, cert_pem: cert.into(), client_nonce: cn.clone() }).await;
-    let Some(ServerMessage::Challenge { nonce }) = recv(&mut ws).await else { panic!("no challenge") };
-    let sig = key.sign(&host_proof_transcript(SID, id, cert, &cn, &nonce)).unwrap();
+    send(
+        &mut ws,
+        &ClientMessage::HostHello {
+            protocol_version: PROTOCOL_VERSION,
+            host_id: id,
+            cert_pem: cert.into(),
+            client_nonce: cn.clone(),
+        },
+    )
+    .await;
+    let Some(ServerMessage::Challenge { nonce }) = recv(&mut ws).await else {
+        panic!("no challenge")
+    };
+    let sig = key
+        .sign(&host_proof_transcript(SID, id, cert, &cn, &nonce))
+        .unwrap();
     send(&mut ws, &ClientMessage::HostProof { signature: sig }).await;
     let verdict = recv(&mut ws).await;
     (ws, verdict)
@@ -55,7 +78,9 @@ async fn revocation_evicts_and_new_accounts_apply_live() {
     );
     let state = AppState::new(auth.clone());
     let mut seen = Seen::default();
-    reload_once(&store, &auth, &state, org, &mut seen).await.unwrap();
+    reload_once(&store, &auth, &state, org, &mut seen)
+        .await
+        .unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/ws", listener.local_addr().unwrap());
@@ -72,16 +97,52 @@ async fn revocation_evicts_and_new_accounts_apply_live() {
 
     tokio::time::sleep(Duration::from_millis(20)).await; // distinct mtime
     store.revoke(id).unwrap();
-    reload_once(&store, &auth, &state, org, &mut seen).await.unwrap();
-    assert_eq!(state.online_hosts().await, 0, "revoked host must be evicted immediately");
-    assert!(matches!(recv(&mut ws).await, Some(ServerMessage::Error { code: ErrorCode::Forbidden, .. })));
+    reload_once(&store, &auth, &state, org, &mut seen)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.online_hosts().await,
+        0,
+        "revoked host must be evicted immediately"
+    );
+    assert!(matches!(
+        recv(&mut ws).await,
+        Some(ServerMessage::Error {
+            code: ErrorCode::Forbidden,
+            ..
+        })
+    ));
     let (_, again) = host_hello(&url, id, &key, &cert).await;
-    assert!(matches!(again, Some(ServerMessage::Error { code: ErrorCode::Unauthenticated, .. })), "{again:?}");
+    assert!(
+        matches!(
+            again,
+            Some(ServerMessage::Error {
+                code: ErrorCode::Unauthenticated,
+                ..
+            })
+        ),
+        "{again:?}"
+    );
 
     // An account added after startup works after the reload.
-    store.add_account("late", "a perfectly long password").unwrap();
-    reload_once(&store, &auth, &state, org, &mut seen).await.unwrap();
+    store
+        .add_account("late", "a perfectly long password")
+        .unwrap();
+    reload_once(&store, &auth, &state, org, &mut seen)
+        .await
+        .unwrap();
     let (mut ws, _) = connect_async(&url).await.unwrap();
-    send(&mut ws, &ClientMessage::PasswordLogin { protocol_version: PROTOCOL_VERSION, username: "late".into(), password: "a perfectly long password".into() }).await;
-    assert!(matches!(recv(&mut ws).await, Some(ServerMessage::LoginToken { .. })));
+    send(
+        &mut ws,
+        &ClientMessage::PasswordLogin {
+            protocol_version: PROTOCOL_VERSION,
+            username: "late".into(),
+            password: "a perfectly long password".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut ws).await,
+        Some(ServerMessage::LoginToken { .. })
+    ));
 }

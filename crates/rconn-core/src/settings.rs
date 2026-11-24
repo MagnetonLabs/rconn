@@ -20,6 +20,34 @@ pub enum HostKind {
     Physical,
 }
 
+/// Classify a machine from its SMBIOS strings and the hypervisor flag. Errs toward
+/// `Physical` when unsure, because that default shows the session indicator.
+pub fn classify_host(manufacturer: &str, product: &str, hypervisor_flag: bool) -> HostKind {
+    const VM_MARKERS: &[&str] = &[
+        "parallels",
+        "vmware",
+        "virtualbox",
+        "innotek",
+        "qemu",
+        "kvm",
+        "xen",
+        "bochs",
+        "amazon ec2",
+        "google compute engine",
+        "virtual machine",
+        "hvm domu",
+        "utm",
+        "apple virtualization",
+    ];
+    let text = format!("{manufacturer} {product}").to_ascii_lowercase();
+    // "Microsoft Corporation" + "Virtual Machine" is Hyper-V/Azure; a Surface is physical.
+    if hypervisor_flag || VM_MARKERS.iter().any(|m| text.contains(m)) {
+        HostKind::Vm
+    } else {
+        HostKind::Physical
+    }
+}
+
 /// Whether the app shows its own "session active" indicator on the host.
 /// OS privacy indicators are never affected by this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -252,6 +280,74 @@ impl LoadedSettings {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Error)]
+pub enum SetError {
+    #[error(transparent)]
+    Denied(#[from] WriteDenied),
+    #[error("invalid value: {0}")]
+    Invalid(String),
+    #[error("settings file: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Change one setting in `layers.system_file`, enforcing every lock: unknown keys,
+/// sessions in progress, fleet-policy locks and admin-only keys. The new file is
+/// validated before it replaces the old one, so a bad value never lands on disk.
+/// `value` is parsed as a bool, then an integer, else kept as a string.
+pub fn write_setting(
+    layers: SettingsLayers,
+    key: &str,
+    value: &str,
+    writer: Writer,
+    session_active: bool,
+) -> Result<(), SetError> {
+    let file = layers
+        .system_file
+        .clone()
+        .ok_or_else(|| SetError::Invalid("no system settings file".into()))?;
+    let loaded =
+        LoadedSettings::load(layers.clone()).map_err(|e| SetError::Invalid(e.to_string()))?;
+    loaded.check_write(key, writer, session_active)?;
+
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let mut table: toml::Table = text
+        .parse()
+        .map_err(|e: toml::de::Error| SetError::Invalid(e.to_string()))?;
+    let parsed = if let Ok(b) = value.parse::<bool>() {
+        toml::Value::Boolean(b)
+    } else if let Ok(i) = value.parse::<i64>() {
+        toml::Value::Integer(i)
+    } else {
+        toml::Value::String(value.to_owned())
+    };
+    let mut parts: Vec<&str> = key.split('.').collect();
+    let leaf = parts.pop().expect("split yields at least one part");
+    let mut node = &mut table;
+    for p in parts {
+        node = node
+            .entry(p)
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .ok_or_else(|| SetError::Invalid(format!("{p} is not a table")))?;
+    }
+    node.insert(leaf.to_owned(), parsed);
+    let new_text = toml::to_string(&table).map_err(|e| SetError::Invalid(e.to_string()))?;
+
+    // Validate the candidate exactly as it would be loaded.
+    let candidate = file.with_extension("toml.new");
+    std::fs::write(&candidate, &new_text)?;
+    let check = LoadedSettings::load(SettingsLayers {
+        system_file: Some(candidate.clone()),
+        ..layers
+    });
+    if let Err(e) = check {
+        let _ = std::fs::remove_file(&candidate);
+        return Err(SetError::Invalid(e.to_string()));
+    }
+    std::fs::rename(&candidate, &file)?;
+    Ok(())
 }
 
 /// True if one dotted path is equal to, an ancestor of, or a descendant of the other.
@@ -500,5 +596,111 @@ mod tests {
         fn shows_indicator_for_physical(&self) -> bool {
             self.settings().shows_indicator(HostKind::Physical)
         }
+    }
+
+    #[test]
+    fn host_classification() {
+        assert_eq!(
+            classify_host(
+                "Parallels International GmbH.",
+                "Parallels ARM Virtual Machine",
+                false
+            ),
+            HostKind::Vm
+        );
+        assert_eq!(
+            classify_host("Microsoft Corporation", "Virtual Machine", false),
+            HostKind::Vm
+        );
+        assert_eq!(classify_host("Amazon EC2", "t3.large", false), HostKind::Vm);
+        assert_eq!(
+            classify_host("Microsoft Corporation", "Surface Laptop 5", false),
+            HostKind::Physical
+        );
+        assert_eq!(
+            classify_host("Dell Inc.", "OptiPlex 7090", false),
+            HostKind::Physical
+        );
+        assert_eq!(
+            classify_host("Apple Inc.", "Mac17,6", false),
+            HostKind::Physical
+        );
+        assert_eq!(
+            classify_host("Apple Inc.", "VirtualMac2,1", true),
+            HostKind::Vm
+        );
+    }
+
+    #[test]
+    fn write_setting_enforces_locks_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("host.toml");
+        std::fs::write(&file, "[server]\nurl = \"wss://a\"\n").unwrap();
+        let layers = |policy: Option<serde_json::Value>| SettingsLayers {
+            system_file: Some(file.clone()),
+            fleet_policy: policy,
+            ..Default::default()
+        };
+
+        write_setting(
+            layers(None),
+            "max_bitrate_kbps",
+            "4000",
+            Writer::Admin,
+            false,
+        )
+        .unwrap();
+        write_setting(
+            layers(None),
+            "hidden_mode",
+            "indicator",
+            Writer::Admin,
+            false,
+        )
+        .unwrap();
+        let s = LoadedSettings::load(layers(None)).unwrap();
+        assert_eq!(s.settings().max_bitrate_kbps, 4000);
+        assert_eq!(s.settings().hidden_mode, HiddenMode::Indicator);
+        assert_eq!(
+            s.settings().server.as_ref().unwrap().url,
+            "wss://a",
+            "other keys survive"
+        );
+
+        assert!(matches!(
+            write_setting(layers(None), "log_level", "debug", Writer::Admin, true),
+            Err(SetError::Denied(WriteDenied::SessionActive))
+        ));
+        assert!(matches!(
+            write_setting(
+                layers(Some(json!({"clipboard": false}))),
+                "clipboard",
+                "true",
+                Writer::Admin,
+                false
+            ),
+            Err(SetError::Denied(WriteDenied::LockedByPolicy(_)))
+        ));
+        assert!(matches!(
+            write_setting(layers(None), "hidden_mode", "hidden", Writer::User, false),
+            Err(SetError::Denied(WriteDenied::AdminOnly(_)))
+        ));
+
+        let before = std::fs::read_to_string(&file).unwrap();
+        assert!(matches!(
+            write_setting(
+                layers(None),
+                "max_bitrate_kbps",
+                "lots",
+                Writer::Admin,
+                false
+            ),
+            Err(SetError::Invalid(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            before,
+            "a bad value must not touch the file"
+        );
     }
 }

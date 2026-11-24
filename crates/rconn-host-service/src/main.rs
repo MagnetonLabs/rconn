@@ -4,6 +4,7 @@
 
 #[cfg(windows)]
 mod console;
+mod paths;
 #[cfg(windows)]
 mod service;
 
@@ -19,6 +20,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Change one host setting (admin). Refused during a session, for keys locked by fleet
+    /// policy, and for invalid values. Example: `set hidden_mode indicator`.
+    Set { key: String, value: String },
     /// (Windows, admin) write host.toml + identity into ProgramData\rconn and lock it down.
     Configure {
         /// Signaling server URL (also the identity bound into host proofs).
@@ -78,6 +82,22 @@ fn main() -> Result<()> {
     );
     match cli.cmd {
         Cmd::LaunchInConsole { log, exe, args } => launch(&log, &exe, &args),
+        Cmd::Set { key, value } => {
+            let dir = paths::data_dir();
+            let session_active = dir.join("session.active").exists();
+            rconn_core::settings::write_setting(
+                rconn_core::settings::SettingsLayers {
+                    system_file: Some(dir.join("host.toml")),
+                    ..Default::default()
+                },
+                &key,
+                &value,
+                rconn_core::settings::Writer::Admin,
+                session_active,
+            )?;
+            println!("{key} = {value}");
+            Ok(())
+        }
         Cmd::Configure {
             server,
             fingerprint,
