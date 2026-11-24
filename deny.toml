@@ -43,6 +43,13 @@ allow-wildcard-paths = true
 
 [advisories]
 yanked = "deny"
+ignore = [
+  # Marvin: timing side channel in RSA *private-key* operations (decrypt/sign). We only
+  # verify IdP-signed OIDC ID tokens with RSA *public* keys and hold no RSA private key,
+  # so it isn't reachable. Pulled in by openidconnect 4.1 (pins rsa ^0.9; fix is rsa 0.10).
+  # Revisit when openidconnect moves to rsa 0.10.
+  { id = "RUSTSEC-2023-0071", reason = "RSA public-key verification only; no private-key operations" },
+]
 
 [sources]
 unknown-registry = "deny"

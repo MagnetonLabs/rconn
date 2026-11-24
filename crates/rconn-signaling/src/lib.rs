@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod audit;
 pub mod auth;
 pub mod fleet_auth;
+pub mod oidc;
 pub mod reload;
 pub mod store;
 pub mod turn_relay;
@@ -364,6 +365,45 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                         tx,
                         ErrorCode::Unauthenticated,
                         "invalid username or password".into(),
+                    );
+                }
+            }
+            Next::Close(Phase::New)
+        }
+        (Phase::New, ClientMessage::GetLoginOptions { protocol_version }) => {
+            if check_version(tx, protocol_version) {
+                let (password, oidc) = auth.login_options();
+                let _ = tx.send(ServerMessage::LoginOptions { password, oidc });
+            }
+            Next::Close(Phase::New)
+        }
+        (
+            Phase::New,
+            ClientMessage::OidcLogin {
+                protocol_version,
+                id_token,
+            },
+        ) => {
+            if !check_version(tx, protocol_version) {
+                return Next::Close(Phase::New);
+            }
+            match auth.oidc_login(&id_token).await {
+                Ok((who, token, expires_at)) => {
+                    state.audit(AuditEvent::OperatorLogin {
+                        org_id: who.org_id,
+                        operator_id: who.operator_id,
+                    });
+                    let _ = tx.send(ServerMessage::LoginToken { token, expires_at });
+                }
+                Err(e) => {
+                    state.audit(AuditEvent::AuthFailed {
+                        role: AuthRole::Operator,
+                        reason: format!("oidc login: {e}"),
+                    });
+                    send_err(
+                        tx,
+                        ErrorCode::Unauthenticated,
+                        "identity provider login was not accepted".into(),
                     );
                 }
             }

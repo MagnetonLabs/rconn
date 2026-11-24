@@ -58,6 +58,14 @@ pub enum ClientMessage {
         username: String,
         password: String,
     },
+    /// Ask how operators may log in here. Answered with [`ServerMessage::LoginOptions`].
+    GetLoginOptions { protocol_version: u16 },
+    /// Exchange an ID token from the server's IdP (obtained by the viewer with PKCE) for a
+    /// session token. Answered with [`ServerMessage::LoginToken`] or an error.
+    OidcLogin {
+        protocol_version: u16,
+        id_token: String,
+    },
     /// Operator asks to open a session to a host.
     RequestSession { host_id: HostId },
     /// SDP / ICE relayed to the other side of a session.
@@ -88,6 +96,11 @@ pub enum ServerMessage {
         /// Optional features this server supports. See [`SERVER_CAPABILITIES`].
         #[serde(default)]
         capabilities: Vec<String>,
+    },
+    /// Answer to `GetLoginOptions`.
+    LoginOptions {
+        password: bool,
+        oidc: Option<OidcLoginInfo>,
     },
     /// Answer to `PasswordLogin`: a session token and its expiry (Unix seconds).
     LoginToken {
@@ -120,6 +133,13 @@ pub enum ServerMessage {
     /// it; anything that changes auth or policy semantics bumps `PROTOCOL_VERSION` instead.
     #[serde(other)]
     Unknown,
+}
+
+/// Where and as whom the viewer runs the OIDC flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcLoginInfo {
+    pub issuer: String,
+    pub client_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -3,6 +3,7 @@
 
 mod gui;
 mod keymap;
+mod oidc_login;
 mod playback;
 mod watch;
 
@@ -70,8 +71,15 @@ enum Cmd {
     /// Log in with an account; saves a session token for this server.
     /// Password from RCONN_PASSWORD or the first line of stdin.
     Login {
+        /// Account name (password login). Omit with --oidc.
+        #[arg(long, required_unless_present = "oidc")]
+        username: Option<String>,
+        /// Sign in with the server's identity provider in your browser.
         #[arg(long)]
-        username: String,
+        oidc: bool,
+        /// Loopback port registered as the redirect URI with your IdP.
+        #[arg(long, default_value_t = 8765)]
+        redirect_port: u16,
     },
     /// Open a session to a host and measure data-channel round-trip time.
     Ping {
@@ -150,7 +158,20 @@ async fn main() -> Result<()> {
             // eframe must own the main thread (macOS requirement); it blocks until closed.
             return gui::run(args);
         }
-        Cmd::Login { username } => login(&cli.server, &trust(&cli), username).await,
+        Cmd::Login {
+            username,
+            oidc,
+            redirect_port,
+        } => {
+            login(
+                &cli.server,
+                &trust(&cli),
+                username.as_deref(),
+                *oidc,
+                *redirect_port,
+            )
+            .await
+        }
         Cmd::Ping {
             host,
             count,
@@ -289,10 +310,32 @@ fn token_for(cli: &Cli) -> Result<String> {
     Ok(saved.token)
 }
 
-async fn login(server: &str, trust: &ServerTrust, username: &str) -> Result<()> {
-    let password = read_password()?;
-    let (token, expires_at) =
-        SignalingClient::password_login(server, trust, username, &password).await?;
+async fn login(
+    server: &str,
+    trust: &ServerTrust,
+    username: Option<&str>,
+    oidc: bool,
+    port: u16,
+) -> Result<()> {
+    let (who, (token, expires_at)) = if oidc {
+        let info = SignalingClient::login_options(server, trust)
+            .await?
+            .1
+            .ok_or_else(|| anyhow::anyhow!("this server has no identity provider configured"))?;
+        let id_token = oidc_login::id_token(&info.issuer, &info.client_id, port).await?;
+        (
+            "your identity provider account".to_owned(),
+            SignalingClient::oidc_login(server, trust, &id_token).await?,
+        )
+    } else {
+        let username = username.ok_or_else(|| anyhow::anyhow!("--username is required"))?;
+        let password = read_password()?;
+        (
+            username.to_owned(),
+            SignalingClient::password_login(server, trust, username, &password).await?,
+        )
+    };
+    let username = who.as_str();
     let path = token_path()?;
     std::fs::create_dir_all(path.parent().expect("token path has a parent"))?;
     let saved = SavedToken {

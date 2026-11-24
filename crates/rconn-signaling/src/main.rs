@@ -29,6 +29,8 @@ struct Cli {
     cmd: Cmd,
 }
 
+// The CLI enum is built once per process, so the large `Serve` variant costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Create the org's fleet CA and the server TLS identity in the data dir.
@@ -53,39 +55,51 @@ enum Cmd {
     /// Refuse a host from its next connect onward (restart `serve` to apply).
     RevokeHost { host_id: uuid::Uuid },
     /// Run the server.
-    Serve {
-        #[arg(long, env = "RCONN_BIND", default_value = "0.0.0.0:8080")]
-        bind: String,
-        /// Identity hosts bind into their proofs: the exact URL in their server profile.
-        #[arg(long, env = "RCONN_SERVER_ID")]
-        server_id: String,
-        /// Extra STUN URLs handed to clients (comma-separated).
-        #[arg(long = "ice", env = "RCONN_ICE", value_delimiter = ',')]
-        ice: Vec<String>,
-        /// Run the built-in TURN relay, advertised at this public IP.
-        #[arg(long, env = "RCONN_TURN_PUBLIC_IP")]
-        turn_public_ip: Option<std::net::IpAddr>,
-        #[arg(long, env = "RCONN_TURN_LISTEN", default_value = "0.0.0.0:3478")]
-        turn_listen: std::net::SocketAddr,
-        /// Relay port range, `min-max`. Open it (UDP) in the firewall.
-        #[arg(long, env = "RCONN_TURN_PORTS", default_value = "49160-49260")]
-        turn_ports: String,
-        /// Use an external TURN server (e.g. coturn with `use-auth-secret`) instead of the
-        /// built-in one: its `turn:` URL. Credentials are minted with `--turn-secret`.
-        #[arg(long, env = "RCONN_TURN_URL", conflicts_with = "turn_public_ip")]
-        turn_url: Option<String>,
-        /// Shared secret for the external TURN server (coturn `static-auth-secret`).
-        #[arg(
-            long,
-            env = "RCONN_TURN_SECRET",
-            hide_env_values = true,
-            requires = "turn_url"
-        )]
-        turn_secret: Option<String>,
-        /// Serve plain HTTP/WebSocket (only behind a TLS-terminating proxy).
-        #[arg(long, env = "RCONN_PLAIN")]
-        plain: bool,
-    },
+    Serve(ServeArgs),
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    #[arg(long, env = "RCONN_BIND", default_value = "0.0.0.0:8080")]
+    bind: String,
+    /// Identity hosts bind into their proofs: the exact URL in their server profile.
+    #[arg(long, env = "RCONN_SERVER_ID")]
+    server_id: String,
+    /// Extra STUN URLs handed to clients (comma-separated).
+    #[arg(long = "ice", env = "RCONN_ICE", value_delimiter = ',')]
+    ice: Vec<String>,
+    /// Run the built-in TURN relay, advertised at this public IP.
+    #[arg(long, env = "RCONN_TURN_PUBLIC_IP")]
+    turn_public_ip: Option<std::net::IpAddr>,
+    #[arg(long, env = "RCONN_TURN_LISTEN", default_value = "0.0.0.0:3478")]
+    turn_listen: std::net::SocketAddr,
+    /// Relay port range, `min-max`. Open it (UDP) in the firewall.
+    #[arg(long, env = "RCONN_TURN_PORTS", default_value = "49160-49260")]
+    turn_ports: String,
+    /// Use an external TURN server (e.g. coturn with `use-auth-secret`) instead of the
+    /// built-in one: its `turn:` URL. Credentials are minted with `--turn-secret`.
+    #[arg(long, env = "RCONN_TURN_URL", conflicts_with = "turn_public_ip")]
+    turn_url: Option<String>,
+    /// Shared secret for the external TURN server (coturn `static-auth-secret`).
+    #[arg(
+        long,
+        env = "RCONN_TURN_SECRET",
+        hide_env_values = true,
+        requires = "turn_url"
+    )]
+    turn_secret: Option<String>,
+    /// OIDC issuer URL for operator login (e.g. https://login.example.com).
+    #[arg(long, env = "RCONN_OIDC_ISSUER", requires = "oidc_client_id")]
+    oidc_issuer: Option<String>,
+    /// OIDC client id registered for the viewer (public client, PKCE).
+    #[arg(long, env = "RCONN_OIDC_CLIENT_ID")]
+    oidc_client_id: Option<String>,
+    /// Also require a verified email in one of these domains (comma-separated).
+    #[arg(long, env = "RCONN_OIDC_ALLOWED_DOMAINS", value_delimiter = ',')]
+    oidc_allowed_domain: Vec<String>,
+    /// Serve plain HTTP/WebSocket (only behind a TLS-terminating proxy).
+    #[arg(long, env = "RCONN_PLAIN")]
+    plain: bool,
 }
 
 #[tokio::main]
@@ -134,37 +148,7 @@ async fn main() -> Result<()> {
             store.revoke(HostId(host_id))?;
             println!("host {host_id} revoked; restart serve to apply");
         }
-        Cmd::Serve {
-            bind,
-            server_id,
-            ice,
-            turn_public_ip,
-            turn_listen,
-            turn_ports,
-            turn_url,
-            turn_secret,
-            plain,
-        } => {
-            let turn = match turn_public_ip {
-                Some(ip) => Some(TurnConfig {
-                    listen: turn_listen,
-                    public_ip: ip,
-                    relay_ports: parse_ports(&turn_ports)?,
-                    shared_secret: store.turn_secret()?,
-                }),
-                None => None,
-            };
-            let external = match (turn_url, turn_secret) {
-                (Some(url), Some(secret)) => Some(TurnMinter {
-                    shared_secret: secret,
-                    turn_urls: vec![url],
-                    stun_urls: vec![],
-                }),
-                (Some(_), None) => anyhow::bail!("--turn-url needs --turn-secret"),
-                _ => None,
-            };
-            serve(&store, &bind, server_id, ice, turn, external, plain).await?
-        }
+        Cmd::Serve(args) => serve(&store, args).await?,
     }
     Ok(())
 }
@@ -178,15 +162,43 @@ fn parse_ports(s: &str) -> Result<(u16, u16)> {
     Ok((a, b))
 }
 
-async fn serve(
-    store: &DataDir,
-    bind: &str,
-    server_id: String,
-    ice: Vec<String>,
-    turn: Option<TurnConfig>,
-    external_turn: Option<TurnMinter>,
-    plain: bool,
-) -> Result<()> {
+async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
+    let ServeArgs {
+        bind,
+        server_id,
+        ice,
+        turn_public_ip,
+        turn_listen,
+        turn_ports,
+        turn_url,
+        turn_secret,
+        oidc_issuer,
+        oidc_client_id,
+        oidc_allowed_domain,
+        plain,
+    } = args;
+    let bind = bind.as_str();
+    let turn = match turn_public_ip {
+        Some(ip) => Some(TurnConfig {
+            listen: turn_listen,
+            public_ip: ip,
+            relay_ports: parse_ports(&turn_ports)?,
+            shared_secret: store.turn_secret()?,
+        }),
+        None => None,
+    };
+    let external_turn = match (turn_url, turn_secret) {
+        (Some(url), Some(secret)) => Some(TurnMinter {
+            shared_secret: secret,
+            turn_urls: vec![url],
+            stun_urls: vec![],
+        }),
+        (Some(_), None) => anyhow::bail!("--turn-url needs --turn-secret"),
+        _ => None,
+    };
+    let oidc = oidc_issuer
+        .zip(oidc_client_id)
+        .map(|(i, c)| (i, c, oidc_allowed_domain));
     let ca = store.load_ca()?;
     let org_id = ca.org_id();
     let mut auth = FleetAuthenticator::new(server_id.clone()).with_org_ca(org_id, ca.cert_pem());
@@ -226,6 +238,13 @@ async fn serve(
         accounts,
         rconn_signaling::accounts::SessionTokens::new(store.session_key()?),
     );
+    if let Some((issuer, client_id, domains)) = oidc {
+        let verifier =
+            rconn_signaling::oidc::OidcVerifier::discover(&issuer, &client_id, org_id, domains)
+                .await?;
+        tracing::info!(%issuer, %client_id, "OIDC login enabled");
+        auth = auth.with_oidc(verifier);
+    }
     if let Some(minter) = external_turn {
         tracing::info!(urls = ?minter.turn_urls, "using external TURN");
         auth = auth.with_turn(minter);

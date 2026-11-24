@@ -4,10 +4,12 @@
 
 use crate::accounts::{Accounts, SESSION_TOKEN_TTL, SessionTokens};
 use crate::auth::{AuthError, Authenticator, HostIdentity, HostProofInput, OperatorIdentity};
+use crate::oidc::OidcVerifier;
 use crate::turn_relay::TurnMinter;
 use async_trait::async_trait;
 use rconn_core::fleet::{self, FleetError};
 use rconn_core::ids::{HostId, OrgId};
+use rconn_core::protocol::OidcLoginInfo;
 use rconn_core::protocol::{IceServer, SessionPolicy};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -24,6 +26,7 @@ pub struct FleetAuthenticator {
     turn: Option<TurnMinter>,
     accounts: RwLock<Option<(Accounts, OrgId)>>,
     tokens: Option<SessionTokens>,
+    oidc: Option<OidcVerifier>,
     policy: SessionPolicy,
 }
 
@@ -38,6 +41,7 @@ impl FleetAuthenticator {
             turn: None,
             accounts: RwLock::default(),
             tokens: None,
+            oidc: None,
             policy: SessionPolicy {
                 show_indicator: false,
                 clipboard: true,
@@ -80,6 +84,12 @@ impl FleetAuthenticator {
     pub fn with_accounts(mut self, org: OrgId, accounts: Accounts, tokens: SessionTokens) -> Self {
         *self.accounts.get_mut().expect("auth lock") = Some((accounts, org));
         self.tokens = Some(tokens);
+        self
+    }
+
+    /// Accept ID tokens from this IdP (requires `with_accounts` for the token key).
+    pub fn with_oidc(mut self, verifier: OidcVerifier) -> Self {
+        self.oidc = Some(verifier);
         self
     }
 
@@ -192,6 +202,34 @@ impl Authenticator for FleetAuthenticator {
             operator_id: id,
             org_id: org,
         };
+        let (token, expires) = tokens
+            .issue(who, SESSION_TOKEN_TTL)
+            .map_err(|_| AuthError::Invalid)?;
+        Ok((who, token, expires))
+    }
+
+    fn login_options(&self) -> (bool, Option<OidcLoginInfo>) {
+        let password = self
+            .accounts
+            .read()
+            .expect("auth lock")
+            .as_ref()
+            .is_some_and(|(a, _)| !a.0.is_empty());
+        let oidc = self.oidc.as_ref().map(|v| OidcLoginInfo {
+            issuer: v.client_info().issuer.clone(),
+            client_id: v.client_info().client_id.clone(),
+        });
+        (password, oidc)
+    }
+
+    async fn oidc_login(
+        &self,
+        id_token: &str,
+    ) -> Result<(OperatorIdentity, String, u64), AuthError> {
+        let (Some(verifier), Some(tokens)) = (&self.oidc, &self.tokens) else {
+            return Err(AuthError::Invalid);
+        };
+        let who = verifier.verify(id_token)?;
         let (token, expires) = tokens
             .issue(who, SESSION_TOKEN_TTL)
             .map_err(|_| AuthError::Invalid)?;

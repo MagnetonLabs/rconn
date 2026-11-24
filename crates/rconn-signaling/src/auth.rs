@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use rconn_core::ids::{HostId, OperatorId, OrgId};
-use rconn_core::protocol::{IceServer, SessionPolicy};
+use rconn_core::protocol::{IceServer, OidcLoginInfo, SessionPolicy};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -52,6 +52,19 @@ pub trait Authenticator: Send + Sync + 'static {
         &self,
         _username: &str,
         _password: &str,
+    ) -> Result<(OperatorIdentity, String, u64), AuthError> {
+        Err(AuthError::Invalid)
+    }
+
+    /// Login methods offered to operators: (password accounts?, OIDC provider).
+    fn login_options(&self) -> (bool, Option<OidcLoginInfo>) {
+        (false, None)
+    }
+
+    /// Exchange a verified IdP ID token for a session token and its expiry.
+    async fn oidc_login(
+        &self,
+        _id_token: &str,
     ) -> Result<(OperatorIdentity, String, u64), AuthError> {
         Err(AuthError::Invalid)
     }

@@ -109,6 +109,48 @@ impl SignalingClient {
         }
     }
 
+    /// Which login methods the server offers: (password accounts?, OIDC provider).
+    pub async fn login_options(
+        url: &str,
+        trust: &ServerTrust,
+    ) -> Result<(bool, Option<rconn_core::protocol::OidcLoginInfo>)> {
+        let mut ws = open(url, trust).await?;
+        send_on(
+            &mut ws,
+            &ClientMessage::GetLoginOptions {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        )
+        .await?;
+        match recv_on(&mut ws).await? {
+            ServerMessage::LoginOptions { password, oidc } => Ok((password, oidc)),
+            ServerMessage::Error { message, .. } => bail!("{message}"),
+            other => bail!("unexpected reply: {other:?}"),
+        }
+    }
+
+    /// Exchange an ID token from the server's IdP for a session token `(token, expires_at)`.
+    pub async fn oidc_login(
+        url: &str,
+        trust: &ServerTrust,
+        id_token: &str,
+    ) -> Result<(String, u64)> {
+        let mut ws = open(url, trust).await?;
+        send_on(
+            &mut ws,
+            &ClientMessage::OidcLogin {
+                protocol_version: PROTOCOL_VERSION,
+                id_token: id_token.to_owned(),
+            },
+        )
+        .await?;
+        match recv_on(&mut ws).await? {
+            ServerMessage::LoginToken { token, expires_at } => Ok((token, expires_at)),
+            ServerMessage::Error { message, .. } => bail!("login failed: {message}"),
+            other => bail!("unexpected login reply: {other:?}"),
+        }
+    }
+
     async fn finish(mut ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<Self> {
         match recv_on(&mut ws).await? {
             ServerMessage::Welcome {
