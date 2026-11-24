@@ -1,0 +1,17 @@
+[package]
+name = "rconn-viewer"
+description = "rconn viewer."
+license = "LicenseRef-Proprietary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rconn-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

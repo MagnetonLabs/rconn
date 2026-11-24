@@ -1,0 +1,22 @@
+[package]
+name = "rconn-media"
+description = "Capture abstraction, H.264 (Cisco openh264) and Opus for rconn."
+license = "LicenseRef-Proprietary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+openh264.workspace = true
+opus.workspace = true
+thiserror.workspace = true
+
+# Windows ARM64: libopus 1.6.1's NEON code fails under clang-cl (MSVC-only `__emit` in
+# runtime CPU detection; missing declarations when NEON is presumed). Scalar build until
+# upstream fixes it. Found in the phase 1 cross-compile spike.
+[target.'cfg(all(windows, target_arch = "aarch64"))'.dependencies]
+opusic-sys = { workspace = true, features = ["no-simd"] }
+
+[lints]
+workspace = true

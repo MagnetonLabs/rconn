@@ -1,0 +1,18 @@
+[package]
+name = "rconn-host-agent"
+description = "rconn host-agent."
+license = "LicenseRef-Proprietary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rconn-core.workspace = true
+rconn-media.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
