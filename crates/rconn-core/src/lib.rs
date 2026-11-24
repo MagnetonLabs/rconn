@@ -2,6 +2,7 @@
 //! and layered host settings with fleet-policy locking.
 
 pub mod fleet;
+pub mod hid;
 pub mod ids;
 pub mod protocol;
 pub mod settings;

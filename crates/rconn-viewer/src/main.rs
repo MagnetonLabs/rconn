@@ -1,6 +1,8 @@
 //! Viewer client. The egui UI arrives with video in phase 3; today `ping` opens a real
 //! session to a host and measures data-channel round trips.
 
+mod gui;
+mod keymap;
 mod watch;
 
 use anyhow::{Result, bail};
@@ -32,6 +34,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open a window on the host's screen with mouse and keyboard control.
+    Connect {
+        host: uuid::Uuid,
+        #[arg(long, env = "RCONN_OPENH264")]
+        openh264: Option<std::path::PathBuf>,
+        #[arg(long, default_value = "0.0.0.0:0")]
+        udp: Vec<String>,
+        #[arg(long)]
+        relay_only: bool,
+    },
     /// Open a session and receive the host's screen (headless): print stream stats, and
     /// optionally save a PNG of the latest frame.
     Watch {
@@ -102,6 +114,30 @@ async fn main() -> Result<()> {
                 },
             )
             .await
+        }
+        Cmd::Connect {
+            host,
+            openh264,
+            udp,
+            relay_only,
+        } => {
+            let openh264 = match openh264 {
+                Some(p) => p.clone(),
+                None => default_openh264()?,
+            };
+            let args = gui::ConnectArgs {
+                server: cli.server.clone(),
+                trust: trust(&cli),
+                token: token_for(&cli)?,
+                host: HostId(*host),
+                openh264,
+                opts: PeerOptions {
+                    udp_addrs: udp.clone(),
+                    relay_only: *relay_only,
+                },
+            };
+            // eframe must own the main thread (macOS requirement); it blocks until closed.
+            return gui::run(args);
         }
         Cmd::Login { username } => login(&cli.server, &trust(&cli), username).await,
         Cmd::Ping {

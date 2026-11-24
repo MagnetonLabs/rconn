@@ -2,6 +2,7 @@
 //! sessions, streams the screen, and serves the data channel. Input and audio attach
 //! here in phases 4 and 7.
 
+mod input;
 mod stream;
 
 use anyhow::{Context, Result};
@@ -225,6 +226,7 @@ async fn serve_session(mut session: HostSession, cli: &Cli, openh264: PathBuf) -
 }
 
 async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests) {
+    let input = input::InputSink::start();
     match dc.protocol().await {
         Ok(p) if p == DATA_CHANNEL_PROTOCOL => {}
         other => {
@@ -242,6 +244,7 @@ async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests) {
                     }
                 }
                 Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
+                Ok(DataMessage::Input(ev)) => input.send(ev),
                 Ok(other) => tracing::debug!(?other, "data message (not handled yet)"),
                 Err(e) => tracing::warn!(error = %e, "bad data message"),
             },
