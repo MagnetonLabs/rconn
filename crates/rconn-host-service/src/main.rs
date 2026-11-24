@@ -4,6 +4,8 @@
 
 #[cfg(windows)]
 mod console;
+#[cfg(windows)]
+mod service;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -17,6 +19,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// (Windows, admin) write host.toml + identity into ProgramData\rconn and lock it down.
+    Configure {
+        /// Signaling server URL (also the identity bound into host proofs).
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        fingerprint: Option<String>,
+        /// Directory from `rconn-signaling enroll-host`.
+        #[arg(long)]
+        identity_from: std::path::PathBuf,
+    },
+    /// (Windows, admin) register and start the `rconn-host` service.
+    Install,
+    /// (Windows, admin) stop and remove the service.
+    Uninstall,
+    /// Entry point used by the Service Control Manager.
+    #[command(hide = true)]
+    RunService,
     /// (Windows, as SYSTEM) start a program in the active console session with the SYSTEM
     /// token, so it can reach the lock screen and UAC desktop. Output goes to --log.
     LaunchInConsole {
@@ -29,30 +49,82 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let cli = Cli::parse();
+    let filter =
+        || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    // Under the SCM there is no console: log to ProgramData\rconn\service.log.
+    #[cfg(windows)]
+    if matches!(cli.cmd, Cmd::RunService) {
+        let dir = service::data_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("service.log"))?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter()).init();
+    }
+    #[cfg(not(windows))]
+    tracing_subscriber::fmt().with_env_filter(filter()).init();
     tracing::info!(
         protocol = rconn_core::PROTOCOL_VERSION,
         os = std::env::consts::OS,
         "rconn-host-service"
     );
-    match Cli::parse().cmd {
+    match cli.cmd {
         Cmd::LaunchInConsole { log, exe, args } => launch(&log, &exe, &args),
+        Cmd::Configure {
+            server,
+            fingerprint,
+            identity_from,
+        } => windows_only(|| {
+            #[cfg(windows)]
+            service::configure(&server, fingerprint.as_deref(), &identity_from)?;
+            #[cfg(not(windows))]
+            let _ = (&server, &fingerprint, &identity_from);
+            Ok(())
+        }),
+        Cmd::Install => windows_only(|| {
+            #[cfg(windows)]
+            service::install()?;
+            Ok(())
+        }),
+        Cmd::Uninstall => windows_only(|| {
+            #[cfg(windows)]
+            service::uninstall()?;
+            Ok(())
+        }),
+        Cmd::RunService => windows_only(|| {
+            #[cfg(windows)]
+            service::run()?;
+            Ok(())
+        }),
     }
 }
 
 #[cfg(windows)]
 fn launch(log: &std::path::Path, exe: &std::path::Path, args: &[String]) -> Result<()> {
     let session = console::console_session()?;
-    let pid = console::launch_in_session(session, exe, args, log)?;
-    println!("started pid {pid} in console session {session}");
+    let child = console::launch_in_session(session, exe, args, log)?;
+    println!("started pid {} in console session {session}", child.pid);
+    std::mem::forget(child); // leave it running after we exit
     Ok(())
 }
 
 #[cfg(not(windows))]
 fn launch(_: &std::path::Path, _: &std::path::Path, _: &[String]) -> Result<()> {
     anyhow::bail!("launch-in-console is Windows-only")
+}
+
+fn windows_only(f: impl FnOnce() -> Result<()>) -> Result<()> {
+    if cfg!(windows) {
+        f()
+    } else {
+        anyhow::bail!("this command is Windows-only (macOS uses a LaunchDaemon)")
+    }
 }

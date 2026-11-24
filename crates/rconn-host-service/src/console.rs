@@ -30,7 +30,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR};
 
-struct Owned(HANDLE);
+/// An owned Win32 handle, closed on drop.
+pub struct Owned(HANDLE);
 impl Drop for Owned {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
@@ -82,9 +83,31 @@ pub fn console_session() -> Result<u32> {
     Ok(id)
 }
 
+/// A process started by [`launch_in_session`].
+pub struct Child {
+    pub pid: u32,
+    process: Owned,
+}
+
+impl Child {
+    /// Still running?
+    pub fn alive(&self) -> bool {
+        use windows::Win32::Foundation::WAIT_TIMEOUT;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        unsafe { WaitForSingleObject(self.process.0, 0) == WAIT_TIMEOUT }
+    }
+
+    pub fn kill(&self) {
+        use windows::Win32::System::Threading::TerminateProcess;
+        unsafe {
+            let _ = TerminateProcess(self.process.0, 1);
+        }
+    }
+}
+
 /// Start `exe args...` as SYSTEM in `session`, on `winsta0\default`, with stdout/stderr
-/// appended to `log`. Returns the process id.
-pub fn launch_in_session(session: u32, exe: &Path, args: &[String], log: &Path) -> Result<u32> {
+/// appended to `log`.
+pub fn launch_in_session(session: u32, exe: &Path, args: &[String], log: &Path) -> Result<Child> {
     unsafe {
         let mut own = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut own)
@@ -190,8 +213,10 @@ pub fn launch_in_session(session: u32, exe: &Path, args: &[String], log: &Path) 
         drop(attr_buf);
         created.context("CreateProcessAsUserW")?;
         let _ = Owned(pi.hThread);
-        let _ = Owned(pi.hProcess);
-        Ok(pi.dwProcessId)
+        Ok(Child {
+            pid: pi.dwProcessId,
+            process: Owned(pi.hProcess),
+        })
     }
 }
 
