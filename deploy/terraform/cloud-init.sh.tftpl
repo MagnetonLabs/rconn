@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# First-boot: run the rconn installer (embedded) and keep its summary for the admin.
+set -euo pipefail
+cat > /root/rconn-install.sh <<'RCONN_INSTALL_EOF'
+${install_sh}
+RCONN_INSTALL_EOF
+chmod +x /root/rconn-install.sh
+RCONN_HOSTNAME="${hostname}" /root/rconn-install.sh 2>&1 | tee /root/rconn-install.log
