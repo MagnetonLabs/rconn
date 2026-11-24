@@ -29,6 +29,62 @@ pub struct ConnectArgs {
     pub host: HostId,
     pub openh264: PathBuf,
     pub opts: PeerOptions,
+    /// Borderless, maximized window; the toolbar appears on the hotkey.
+    pub chromeless: bool,
+}
+
+/// The local hotkey that toggles the toolbar: Ctrl+Alt+Shift+M. Never sent to the host.
+pub const HOTKEY_HINT: &str = "Ctrl+Alt+Shift+M";
+
+/// Decides which key events reach the host, and tracks what the host thinks is held so it
+/// can be released when the toolbar takes over the keyboard.
+#[derive(Default)]
+pub struct KeyGate {
+    pub toolbar: bool,
+    held: std::collections::BTreeSet<u16>,
+}
+
+pub enum KeyAction {
+    /// Forward to the host.
+    Send(InputEvent),
+    /// Toolbar toggled; release these keys on the host first.
+    Toggled(Vec<InputEvent>),
+    /// Swallow (toolbar is open, or unmapped key).
+    Drop,
+}
+
+impl KeyGate {
+    pub fn key(
+        &mut self,
+        key: egui::Key,
+        pressed: bool,
+        repeat: bool,
+        mods: egui::Modifiers,
+    ) -> KeyAction {
+        if key == egui::Key::M && pressed && mods.ctrl && mods.alt && mods.shift {
+            self.toolbar = !self.toolbar;
+            let releases = std::mem::take(&mut self.held)
+                .into_iter()
+                .map(|hid_usage| InputEvent::Key {
+                    hid_usage,
+                    pressed: false,
+                })
+                .collect();
+            return KeyAction::Toggled(releases);
+        }
+        if self.toolbar || repeat {
+            return KeyAction::Drop;
+        }
+        let Some(hid_usage) = to_hid(key) else {
+            return KeyAction::Drop;
+        };
+        if pressed {
+            self.held.insert(hid_usage);
+        } else {
+            self.held.remove(&hid_usage);
+        }
+        KeyAction::Send(InputEvent::Key { hid_usage, pressed })
+    }
 }
 
 #[derive(Default)]
@@ -40,11 +96,13 @@ struct Shared {
 }
 
 pub fn run(args: ConnectArgs) -> Result<()> {
+    let chromeless = args.chromeless;
     let shared = Arc::new(Mutex::new(Shared {
         status: "connecting…".into(),
         ..Default::default()
     }));
     let (input_tx, input_rx) = mpsc::unbounded_channel::<InputEvent>();
+    let (kf_ui, kf_from_ui) = mpsc::unbounded_channel::<()>();
     let ctx_slot: Arc<Mutex<Option<egui::Context>>> = Arc::default();
 
     // Background session.
@@ -53,7 +111,13 @@ pub fn run(args: ConnectArgs) -> Result<()> {
         .name("rconn-session".into())
         .spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            let result = rt.block_on(session(args, sh.clone(), input_rx, ctx2.clone()));
+            let result = rt.block_on(session(
+                args,
+                sh.clone(),
+                input_rx,
+                kf_from_ui,
+                ctx2.clone(),
+            ));
             let mut s = sh.lock().expect("ui state");
             s.status = match result {
                 Ok(()) => "session ended".into(),
@@ -65,9 +129,16 @@ pub fn run(args: ConnectArgs) -> Result<()> {
         })?;
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_title("rconn"),
+        viewport: {
+            let v = egui::ViewportBuilder::default()
+                .with_inner_size([1280.0, 800.0])
+                .with_title("rconn");
+            if chromeless {
+                v.with_decorations(false).with_maximized(true)
+            } else {
+                v
+            }
+        },
         ..Default::default()
     };
     eframe::run_native(
@@ -78,8 +149,11 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             Ok(Box::new(ViewerApp {
                 shared,
                 input: input_tx,
+                keyframe: kf_ui,
                 texture: None,
                 last_pointer: None,
+                keys: KeyGate::default(),
+                fullscreen: false,
             }))
         }),
     )
@@ -90,6 +164,7 @@ async fn session(
     args: ConnectArgs,
     shared: Arc<Mutex<Shared>>,
     mut input: mpsc::UnboundedReceiver<InputEvent>,
+    mut kf_from_ui: mpsc::UnboundedReceiver<()>,
     ctx: Arc<Mutex<Option<egui::Context>>>,
 ) -> Result<()> {
     let repaint = || {
@@ -135,6 +210,9 @@ async fn session(
                     Some(ev) if open => send(dc.clone(), DataMessage::Input(ev)).await,
                     Some(_) => {}
                     None => break,
+                },
+                Some(()) = kf_from_ui.recv() => if open {
+                    send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
                 },
                 req = kf_rx.recv() => if req.is_some() && open {
                     send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
@@ -197,8 +275,11 @@ async fn session(
 struct ViewerApp {
     shared: Arc<Mutex<Shared>>,
     input: mpsc::UnboundedSender<InputEvent>,
+    keyframe: mpsc::UnboundedSender<()>,
     texture: Option<TextureHandle>,
     last_pointer: Option<(f32, f32)>,
+    keys: KeyGate,
+    fullscreen: bool,
 }
 
 impl ViewerApp {
@@ -211,6 +292,11 @@ impl ViewerApp {
         let events = ui.ctx().input(|i| i.events.clone());
         for ev in events {
             match ev {
+                // While the toolbar is open, the mouse belongs to the viewer.
+                egui::Event::PointerMoved(_)
+                | egui::Event::PointerButton { .. }
+                | egui::Event::MouseWheel { .. }
+                    if self.keys.toolbar => {}
                 egui::Event::PointerMoved(pos) => self.pointer_to(pos, image),
                 egui::Event::PointerButton {
                     pos,
@@ -239,16 +325,18 @@ impl ViewerApp {
                     physical_key,
                     pressed,
                     repeat,
+                    modifiers,
                     ..
                 } => {
-                    if let Some(hid) = to_hid(physical_key.unwrap_or(key)) {
-                        // Key repeat is the host's job; forward only transitions.
-                        if !repeat {
-                            self.send(InputEvent::Key {
-                                hid_usage: hid,
-                                pressed,
-                            });
+                    match self
+                        .keys
+                        .key(physical_key.unwrap_or(key), pressed, repeat, modifiers)
+                    {
+                        KeyAction::Send(ev) => self.send(ev),
+                        KeyAction::Toggled(releases) => {
+                            releases.into_iter().for_each(|ev| self.send(ev))
                         }
+                        KeyAction::Drop => {}
                     }
                 }
                 _ => {}
@@ -285,6 +373,40 @@ pub fn fit(area: Rect, size: Vec2) -> Rect {
     Rect::from_center_size(area.center(), size * scale)
 }
 
+impl ViewerApp {
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        egui::Area::new(egui::Id::unique("toolbar"))
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 8.0])
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(if self.fullscreen {
+                                "Exit full screen"
+                            } else {
+                                "Full screen"
+                            })
+                            .clicked()
+                        {
+                            self.fullscreen = !self.fullscreen;
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                                    self.fullscreen,
+                                ));
+                        }
+                        if ui.button("Refresh picture").clicked() {
+                            let _ = self.keyframe.send(());
+                        }
+                        if ui.button("Disconnect").clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        ui.label(format!("{HOTKEY_HINT} to return"));
+                    });
+                });
+            });
+    }
+}
+
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let (new_frame, status, fps, kbps) = {
@@ -315,6 +437,9 @@ impl eframe::App for ViewerApp {
                 Color32::WHITE,
             );
             self.forward_input(ui, image);
+            if self.keys.toolbar {
+                self.toolbar(ui);
+            }
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Title(format!(
                     "rconn — {w}x{h} · {fps:.0} fps · {kbps:.0} kbps"
@@ -343,5 +468,43 @@ mod tests {
         assert!((r.width() - 1000.0).abs() < 0.01);
         assert!((r.height() - 562.5).abs() < 0.01);
         assert!((r.center().y - 500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn hotkey_toggles_toolbar_releases_held_keys_and_is_never_forwarded() {
+        let mut g = KeyGate::default();
+        let none = egui::Modifiers::default();
+        let all = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            g.key(egui::Key::A, true, false, none),
+            KeyAction::Send(_)
+        ));
+        assert!(matches!(
+            g.key(egui::Key::ControlLeft, true, false, none),
+            KeyAction::Send(_)
+        ));
+        let KeyAction::Toggled(releases) = g.key(egui::Key::M, true, false, all) else {
+            panic!("hotkey not recognised")
+        };
+        assert_eq!(releases.len(), 2, "A and Ctrl were held on the host");
+        assert!(g.toolbar);
+        assert!(
+            matches!(g.key(egui::Key::B, true, false, none), KeyAction::Drop),
+            "toolbar owns the keyboard"
+        );
+        assert!(matches!(
+            g.key(egui::Key::M, true, false, all),
+            KeyAction::Toggled(_)
+        ));
+        assert!(!g.toolbar);
+        assert!(
+            matches!(g.key(egui::Key::B, true, true, none), KeyAction::Drop),
+            "repeats are the host's job"
+        );
     }
 }
