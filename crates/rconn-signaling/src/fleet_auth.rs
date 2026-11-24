@@ -19,10 +19,10 @@ pub struct FleetAuthenticator {
     /// Fleet CA certificate (PEM) per org.
     org_cas: HashMap<OrgId, String>,
     revoked: RwLock<HashSet<HostId>>,
-    operator_tokens: HashMap<[u8; 32], OperatorIdentity>,
+    operator_tokens: RwLock<HashMap<[u8; 32], OperatorIdentity>>,
     ice_servers: Vec<IceServer>,
     turn: Option<TurnMinter>,
-    accounts: Option<(Accounts, OrgId)>,
+    accounts: RwLock<Option<(Accounts, OrgId)>>,
     tokens: Option<SessionTokens>,
     policy: SessionPolicy,
 }
@@ -33,10 +33,10 @@ impl FleetAuthenticator {
             server_id: server_id.into(),
             org_cas: HashMap::new(),
             revoked: RwLock::default(),
-            operator_tokens: HashMap::new(),
+            operator_tokens: RwLock::default(),
             ice_servers: Vec::new(),
             turn: None,
-            accounts: None,
+            accounts: RwLock::default(),
             tokens: None,
             policy: SessionPolicy {
                 show_indicator: false,
@@ -51,7 +51,10 @@ impl FleetAuthenticator {
     }
 
     pub fn with_operator_token(mut self, token: &str, identity: OperatorIdentity) -> Self {
-        self.operator_tokens.insert(digest(token), identity);
+        self.operator_tokens
+            .get_mut()
+            .expect("auth lock")
+            .insert(digest(token), identity);
         self
     }
 
@@ -61,7 +64,10 @@ impl FleetAuthenticator {
         digest: [u8; 32],
         identity: OperatorIdentity,
     ) -> Self {
-        self.operator_tokens.insert(digest, identity);
+        self.operator_tokens
+            .get_mut()
+            .expect("auth lock")
+            .insert(digest, identity);
         self
     }
 
@@ -72,7 +78,7 @@ impl FleetAuthenticator {
 
     /// Enable password login for `org`'s accounts, issuing tokens signed with `tokens`.
     pub fn with_accounts(mut self, org: OrgId, accounts: Accounts, tokens: SessionTokens) -> Self {
-        self.accounts = Some((accounts, org));
+        *self.accounts.get_mut().expect("auth lock") = Some((accounts, org));
         self.tokens = Some(tokens);
         self
     }
@@ -81,6 +87,24 @@ impl FleetAuthenticator {
     pub fn with_turn(mut self, minter: TurnMinter) -> Self {
         self.turn = Some(minter);
         self
+    }
+
+    /// Replace the static operator tokens (by digest), e.g. after operators.json changed.
+    pub fn replace_operator_digests(&self, table: HashMap<[u8; 32], OperatorIdentity>) {
+        *self.operator_tokens.write().expect("auth lock") = table;
+    }
+
+    /// Replace the account table, e.g. after accounts.json changed.
+    pub fn replace_accounts(&self, org: OrgId, accounts: Accounts) {
+        *self.accounts.write().expect("auth lock") = Some((accounts, org));
+    }
+
+    /// Replace the revocation set. Returns hosts that are newly revoked.
+    pub fn replace_revoked(&self, set: HashSet<HostId>) -> Vec<HostId> {
+        let mut cur = self.revoked.write().expect("revocation lock poisoned");
+        let added = set.difference(&cur).copied().collect();
+        *cur = set;
+        added
     }
 
     /// Refuse this host from now on (takes effect at its next connect).
@@ -133,7 +157,12 @@ impl Authenticator for FleetAuthenticator {
     }
 
     async fn verify_operator(&self, token: &str) -> Result<OperatorIdentity, AuthError> {
-        if let Some(who) = self.operator_tokens.get(&digest(token)) {
+        if let Some(who) = self
+            .operator_tokens
+            .read()
+            .expect("auth lock")
+            .get(&digest(token))
+        {
             return Ok(*who);
         }
         match &self.tokens {
@@ -147,15 +176,13 @@ impl Authenticator for FleetAuthenticator {
         username: &str,
         password: &str,
     ) -> Result<(OperatorIdentity, String, u64), AuthError> {
-        let (Some((accounts, org)), Some(tokens)) = (&self.accounts, &self.tokens) else {
+        let Some(tokens) = &self.tokens else {
             return Err(AuthError::Invalid);
         };
-        let (accounts, org, username, password) = (
-            accounts.clone(),
-            *org,
-            username.to_owned(),
-            password.to_owned(),
-        );
+        let Some((accounts, org)) = self.accounts.read().expect("auth lock").clone() else {
+            return Err(AuthError::Invalid);
+        };
+        let (username, password) = (username.to_owned(), password.to_owned());
         // argon2 is deliberately slow; keep it off the async workers.
         let id = tokio::task::spawn_blocking(move || accounts.verify(&username, &password))
             .await

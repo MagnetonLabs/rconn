@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod audit;
 pub mod auth;
 pub mod fleet_auth;
+pub mod reload;
 pub mod store;
 pub mod turn_relay;
 
@@ -77,6 +78,33 @@ impl AppState {
 
     fn audit(&self, event: AuditEvent) {
         self.inner.audit.record(event);
+    }
+
+    /// Evict a host now (after revocation): it gets no new sessions and its open sessions
+    /// end with `Revoked`. Its next reconnect is refused by the authenticator.
+    pub async fn evict_host(&self, host_id: HostId) {
+        let mut reg = self.inner.registry.lock().await;
+        if let Some((h, tx)) = reg.hosts.remove(&host_id) {
+            self.audit(AuditEvent::HostOffline {
+                org_id: h.org_id,
+                host_id,
+            });
+            let _ = tx.send(ServerMessage::Error {
+                code: ErrorCode::Forbidden,
+                message: "host revoked".into(),
+            });
+        }
+        let gone: Vec<SessionId> = reg
+            .sessions
+            .iter()
+            .filter(|(_, e)| e.host.host_id == host_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in gone {
+            if let Some(e) = reg.sessions.remove(&id) {
+                notify_ended(self, &e, id, EndReason::Revoked);
+            }
+        }
     }
 
     /// Number of hosts currently online. For health checks and tests.

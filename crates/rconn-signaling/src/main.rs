@@ -238,7 +238,25 @@ async fn serve(
     let audit_path = store.path().join("audit.jsonl");
     let audit = rconn_signaling::audit::FileAudit::open(&audit_path)
         .with_context(|| format!("opening {}", audit_path.display()))?;
-    let app = router(AppState::with_audit(Arc::new(auth), Arc::new(audit)));
+    let auth = Arc::new(auth);
+    let state = AppState::with_audit(auth.clone(), Arc::new(audit));
+    // Live reload: operators, accounts and revocations apply without a restart.
+    {
+        let (store, auth, state) = (DataDir::new(store.path()), auth.clone(), state.clone());
+        tokio::spawn(async move {
+            let mut seen = rconn_signaling::reload::Seen::default();
+            loop {
+                if let Err(e) =
+                    rconn_signaling::reload::reload_once(&store, &auth, &state, org_id, &mut seen)
+                        .await
+                {
+                    tracing::error!(error = %format!("{e:#}"), "reload failed; keeping previous config");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+    let app = router(state);
     let addr: std::net::SocketAddr = bind.parse().with_context(|| format!("--bind {bind}"))?;
     let handle = axum_server::Handle::new();
     let h = handle.clone();

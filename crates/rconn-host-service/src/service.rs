@@ -251,7 +251,10 @@ pub fn configure(
     std::fs::create_dir_all(dir.join("identity"))?;
     // Re-running configure must work even if an earlier run left odd ACLs behind:
     // reset the contents to inherit from the (locked) directory before writing.
-    let _ = std::process::Command::new("icacls").arg(dir.join("*")).args(["/reset", "/T", "/Q"]).status();
+    let _ = std::process::Command::new("icacls")
+        .arg(dir.join("*"))
+        .args(["/reset", "/T", "/Q"])
+        .status();
     for f in ["host.id", "host.cert.pem", "host.key.pem"] {
         std::fs::copy(identity_from.join(f), dir.join("identity").join(f))
             .with_context(|| format!("copying {f}"))?;
