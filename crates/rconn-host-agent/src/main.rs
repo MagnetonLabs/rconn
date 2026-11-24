@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use stream::{KeyframeRequests, StreamConfig};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
+use webrtc::peer_connection::RTCPeerConnectionState;
 
 #[derive(Parser, Clone)]
 #[command(version, about = "rconn host agent")]
@@ -49,6 +50,9 @@ struct Cli {
     max_fps: u32,
     #[arg(long, default_value_t = 8000)]
     max_kbps: u32,
+    /// Largest streamed size; bigger desktops are halved to fit.
+    #[arg(long, default_value = "1920x1080")]
+    max_size: String,
     /// Local UDP sockets for ICE.
     #[arg(long, default_value = "0.0.0.0:0")]
     udp: Vec<String>,
@@ -171,21 +175,43 @@ async fn serve_session(mut session: HostSession, cli: &Cli, openh264: PathBuf) -
         }
     });
 
-    // Stop streaming when the peer connection closes or fails.
-    let watch_stop = stop.clone();
+    // Don't send media before the connection is secured: RTP written before DTLS
+    // completes is dropped, and a large first keyframe can starve the handshake.
     let mut states = std::mem::replace(
         &mut session.states,
         tokio::sync::mpsc::unbounded_channel().1,
     );
+    let connected = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(s) = states.recv().await {
+            match s {
+                RTCPeerConnectionState::Connected => return true,
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => return false,
+                _ => {}
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    if !connected {
+        anyhow::bail!("peer connection did not connect");
+    }
+    // Stop streaming when the peer connection closes or fails.
+    let watch_stop = stop.clone();
     tokio::spawn(async move {
         while states.recv().await.is_some() {}
         watch_stop.store(true, Ordering::Relaxed);
     });
 
+    let (mw, mh) = cli
+        .max_size
+        .split_once('x')
+        .context("--max-size must look like 1920x1080")?;
     let cfg = StreamConfig {
         openh264,
         max_fps: cli.max_fps,
         max_bitrate_bps: cli.max_kbps.saturating_mul(1000),
+        max_size: (mw.parse()?, mh.parse()?),
     };
     stream::run(
         cli.capturer_factory()?,

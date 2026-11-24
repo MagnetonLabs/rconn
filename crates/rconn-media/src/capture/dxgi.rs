@@ -22,6 +22,34 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::Interface;
 
+/// Attach the calling thread to the desktop currently receiving input: the user's
+/// desktop normally, Winlogon at the lock/login screen or during UAC. Only a process
+/// with access to that desktop (SYSTEM in the console session) can open Winlogon; for a
+/// normal user process this fails at the lock screen and capture waits.
+fn follow_input_desktop() -> Result<(), CaptureError> {
+    use windows::Win32::System::StationsAndDesktops::{
+        DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, OpenInputDesktop, SetThreadDesktop,
+    };
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    unsafe {
+        let desk = OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(GENERIC_ALL),
+        )
+        .map_err(|e| {
+            CaptureError::Backend(format!(
+                "OpenInputDesktop: {e} (no access to the active desktop)"
+            ))
+        })?;
+        // The previous desktop handle (if any) is deliberately leaked: closing a desktop
+        // still assigned to a thread fails, and switches are rare.
+        SetThreadDesktop(desk)
+            .map_err(|e| CaptureError::Backend(format!("SetThreadDesktop: {e}")))?;
+    }
+    Ok(())
+}
+
 fn backend(e: windows::core::Error) -> CaptureError {
     CaptureError::Backend(format!("{e} ({:#x})", e.code().0))
 }
@@ -86,6 +114,7 @@ impl DxgiCapturer {
 
     fn duplication(&mut self) -> Result<&IDXGIOutputDuplication, CaptureError> {
         if self.dup.is_none() {
+            follow_input_desktop()?;
             // Fails with E_ACCESSDENIED outside an interactive desktop (session 0, or the
             // secure desktop until phase 5's desktop switching).
             self.dup = Some(unsafe { self.output.DuplicateOutput(&self.device) }.map_err(backend)?);

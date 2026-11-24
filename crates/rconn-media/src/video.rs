@@ -26,6 +26,45 @@ impl Frame {
     }
 }
 
+impl Frame {
+    /// Halve the frame (2×2 box average) until it fits `max_w` × `max_h`. Halving keeps
+    /// text crisp and costs one pass per step; HiDPI desktops usually need one step.
+    pub fn fit_within(self, max_w: usize, max_h: usize) -> Frame {
+        let mut f = self;
+        while (f.width > max_w || f.height > max_h) && f.width >= 4 && f.height >= 4 {
+            f = f.half();
+        }
+        f
+    }
+
+    fn half(&self) -> Frame {
+        let (w, h) = (self.width / 2, self.height / 2);
+        let stride = self.width * 4;
+        let mut out = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let r0 = &self.bgra[(2 * y) * stride..(2 * y) * stride + stride];
+            let r1 = &self.bgra[(2 * y + 1) * stride..(2 * y + 1) * stride + stride];
+            let dst = &mut out[y * w * 4..(y + 1) * w * 4];
+            for x in 0..w {
+                for c in 0..4 {
+                    let i = 8 * x + c;
+                    let sum = u16::from(r0[i])
+                        + u16::from(r0[i + 4])
+                        + u16::from(r1[i])
+                        + u16::from(r1[i + 4]);
+                    dst[4 * x + c] = ((sum + 2) / 4) as u8;
+                }
+            }
+        }
+        Frame {
+            width: w,
+            height: h,
+            bgra: out,
+            captured_at: self.captured_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EncoderSettings {
     pub bitrate_bps: u32,
@@ -199,5 +238,29 @@ mod tests {
         assert!(should_retarget(4_000_000, 2_000_000));
         assert!(should_retarget(4_000_000, 6_000_000));
         assert!(!should_retarget(0, 1));
+    }
+
+    #[test]
+    fn fit_within_halves_until_it_fits() {
+        let f = Frame {
+            width: 2992,
+            height: 1878,
+            bgra: vec![200; 2992 * 1878 * 4],
+            captured_at: Instant::now(),
+        };
+        let g = f.fit_within(1920, 1080);
+        assert_eq!((g.width, g.height), (1496, 939));
+        assert!(g.bgra.iter().all(|&b| b == 200), "flat input stays flat");
+        let small = Frame {
+            width: 800,
+            height: 600,
+            bgra: vec![1; 800 * 600 * 4],
+            captured_at: Instant::now(),
+        };
+        assert_eq!(
+            small.fit_within(1920, 1080).width,
+            800,
+            "already fits: untouched"
+        );
     }
 }

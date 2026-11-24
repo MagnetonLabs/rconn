@@ -15,6 +15,8 @@ pub struct StreamConfig {
     pub openh264: PathBuf,
     pub max_fps: u32,
     pub max_bitrate_bps: u32,
+    /// Larger desktops are halved until they fit (HiDPI VMs report e.g. 2992×1878).
+    pub max_size: (usize, usize),
 }
 
 /// Asks the encoder for an IDR frame (viewer joined, decoder lost sync).
@@ -41,6 +43,7 @@ pub async fn run(
 
     // Capture runs on its own OS thread: DXGI calls block for up to their timeout.
     let cap_stop = stop.clone();
+    let max_size = cfg.max_size;
     let capture = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut capturer = make_capturer()?;
         let mut last_frame_at = Instant::now();
@@ -48,6 +51,7 @@ pub async fn run(
         while !cap_stop.load(Ordering::Relaxed) {
             match capturer.next_frame(frame_budget) {
                 Ok(Some(f)) => {
+                    let f = f.fit_within(max_size.0, max_size.1);
                     last_frame_at = Instant::now();
                     warned = false;
                     if tx.send(Some(Arc::new(f))).is_err() {
