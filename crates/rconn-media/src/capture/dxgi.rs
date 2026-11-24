@@ -124,10 +124,11 @@ impl DxgiCapturer {
     }
 
     fn staging(&mut self, desc: &D3D11_TEXTURE2D_DESC) -> Result<ID3D11Texture2D, CaptureError> {
-        if let Some((tex, w, h)) = &self.staging {
-            if *w == desc.Width && *h == desc.Height {
-                return Ok(tex.clone());
-            }
+        if let Some((tex, w, h)) = &self.staging
+            && *w == desc.Width
+            && *h == desc.Height
+        {
+            return Ok(tex.clone());
         }
         let sd = D3D11_TEXTURE2D_DESC {
             Width: desc.Width,
