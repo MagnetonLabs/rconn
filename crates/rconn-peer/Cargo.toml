@@ -1,0 +1,26 @@
+[package]
+name = "rconn-peer"
+description = "Client side of rconn sessions: signaling client and WebRTC peer, shared by viewer and host agent."
+license = "LicenseRef-Proprietary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rconn-core.workspace = true
+anyhow.workspace = true
+webrtc = "=0.21.1"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"
+async-trait = "0.1.92"
+bytes = "1.12.2"
+uuid = { workspace = true, features = ["v4"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+axum = "0.8.9"
+rconn-signaling = { path = "../rconn-signaling" }
