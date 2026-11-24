@@ -2,7 +2,8 @@
 //!
 //! * Windows: DXGI Desktop Duplication ([`dxgi`]): GPU-side copy of the desktop, works on
 //!   basic display adapters in VMs; only returns frames when something changed.
-//! * macOS: ScreenCaptureKit (later in phase 3).
+//! * macOS: ScreenCaptureKit ([`macos`]): an `SCStream` of the main display at native
+//!   pixel size; needs the Screen Recording permission. Also only sends changed frames.
 //! * [`TestPattern`]: synthetic moving content, for pipelines without a desktop.
 
 use crate::video::Frame;
@@ -11,6 +12,8 @@ use thiserror::Error;
 
 #[cfg(windows)]
 pub mod dxgi;
+#[cfg(target_os = "macos")]
+pub mod macos;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -33,7 +36,11 @@ pub fn primary_display() -> Result<Box<dyn Capturer>, CaptureError> {
     {
         Ok(Box::new(dxgi::DxgiCapturer::new(0)?))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(macos::MacCapturer::new()?))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Err(CaptureError::Backend(
             "no capture backend for this OS yet".into(),
