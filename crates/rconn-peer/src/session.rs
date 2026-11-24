@@ -7,7 +7,7 @@
 
 use crate::rtc::{CandidateSink, Peer, PeerEvent, PeerOptions, apply_remote};
 use crate::signaling::{SignalingClient, SignalingTx};
-use crate::video::{TargetBitrate, VideoSender};
+use crate::video::{AudioSender, TargetBitrate, VideoSender};
 use anyhow::{Result, bail};
 use rconn_core::ids::{HostId, SessionId};
 use rconn_core::protocol::{
@@ -84,6 +84,15 @@ pub async fn open_viewer_session(
             }),
         )
         .await?;
+    peer.pc
+        .add_transceiver_from_kind(
+            RtpCodecKind::Audio,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                ..Default::default()
+            }),
+        )
+        .await?;
     let offer = peer.offer().await?;
     tx.send(ClientMessage::Signal {
         session_id,
@@ -144,6 +153,8 @@ pub struct HostSession {
     pub policy: SessionPolicy,
     /// The screen track. Write encoded access units here.
     pub video: VideoSender,
+    /// Host sound track, if the viewer asked for audio.
+    pub audio: Option<AudioSender>,
     /// Congestion-control estimate to steer the encoder bitrate.
     pub target_bitrate: TargetBitrate,
     /// Data channels the viewer opens. Ends when the session closes.
@@ -205,7 +216,7 @@ pub async fn run_host(
                     opts.clone(),
                 )
                 .await?;
-                let (answer, video) = peer.answer_with_video(sdp).await?;
+                let (answer, video, audio) = peer.answer_with_video(sdp).await?;
                 tx.send(ClientMessage::Signal {
                     session_id: sid,
                     payload: answer,
@@ -243,6 +254,7 @@ pub async fn run_host(
                     session_id: sid,
                     policy,
                     video,
+                    audio,
                     target_bitrate: peer.target_bitrate.clone(),
                     channels,
                     states,

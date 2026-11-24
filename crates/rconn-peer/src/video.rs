@@ -10,7 +10,9 @@ use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::{
     CongestionFeedback, configure_congestion_control, register_default_interceptors,
 };
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::{
+    MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine,
+};
 use rtc::rtp::codec::h264::H264Packet;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
@@ -32,6 +34,18 @@ const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-
 pub const MIN_BITRATE_BPS: f64 = 300_000.0;
 pub const START_BITRATE_BPS: f64 = 2_500_000.0;
 pub const MAX_BITRATE_BPS: f64 = 20_000_000.0;
+
+pub const OPUS_PAYLOAD_TYPE: u8 = 111;
+
+fn opus() -> RTCRtpCodec {
+    RTCRtpCodec {
+        mime_type: MIME_TYPE_OPUS.to_owned(),
+        clock_rate: 48_000,
+        channels: 2,
+        sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1".to_owned(),
+        rtcp_feedback: vec![],
+    }
+}
 
 fn h264() -> RTCRtpCodec {
     RTCRtpCodec {
@@ -96,6 +110,13 @@ pub fn media_stack() -> Result<(MediaEngine, Registry, TargetBitrate)> {
         },
         RtpCodecKind::Video,
     )?;
+    engine.register_codec(
+        RTCRtpCodecParameters {
+            rtp_codec: opus(),
+            payload_type: OPUS_PAYLOAD_TYPE,
+        },
+        RtpCodecKind::Audio,
+    )?;
     let registry = register_default_interceptors(Registry::new(), &mut engine)?;
     let gcc = Gcc::new(START_BITRATE_BPS, MIN_BITRATE_BPS, MAX_BITRATE_BPS);
     let target = Arc::new(AtomicU64::new(gcc.target_bitrate().to_bits()));
@@ -109,6 +130,7 @@ pub fn media_stack() -> Result<(MediaEngine, Registry, TargetBitrate)> {
 }
 
 /// The host's outgoing H.264 track.
+/// A host-side outgoing media track (the screen's H.264, or the sound's Opus).
 pub struct VideoSender {
     track: Arc<TrackLocalStaticSample>,
     sender: Arc<dyn RtpSender>,
@@ -184,6 +206,70 @@ impl VideoSender {
 fn rand_u32() -> u32 {
     let b = *uuid::Uuid::new_v4().as_bytes();
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// The host's outgoing Opus track (host sound, phase 7).
+pub struct AudioSender {
+    track: Arc<TrackLocalStaticSample>,
+    sender: Arc<dyn RtpSender>,
+}
+
+impl AudioSender {
+    /// Attach after `set_remote_description`, before `create_answer` (binds to the
+    /// viewer's recv-only audio transceiver).
+    pub async fn attach(pc: &dyn PeerConnection) -> Result<Self> {
+        let ssrc: u32 = rand_u32();
+        let track = Arc::new(TrackLocalStaticSample::new(
+            Instant::now(),
+            MediaStreamTrack::new(
+                "rconn-sound".into(),
+                "rconn-sound-audio".into(),
+                "sound".into(),
+                RtpCodecKind::Audio,
+                vec![RTCRtpEncodingParameters {
+                    rtp_coding_parameters: RTCRtpCodingParameters {
+                        ssrc: Some(ssrc),
+                        ..Default::default()
+                    },
+                    codec: opus(),
+                    ..Default::default()
+                }],
+            ),
+        )?);
+        let sender = pc
+            .add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
+            .await
+            .context("adding audio track")?;
+        Ok(Self { track, sender })
+    }
+
+    /// Send one Opus packet covering `duration` (20 ms frames in practice).
+    pub async fn write(&self, packet: Vec<u8>, duration: Duration) -> Result<()> {
+        let pt = self
+            .sender
+            .get_parameters()
+            .await?
+            .rtp_parameters
+            .codecs
+            .first()
+            .map(|c| c.payload_type)
+            .ok_or_else(|| anyhow!("audio sender has no negotiated codec yet"))?;
+        let ssrc = *self
+            .track
+            .ssrcs()
+            .await
+            .first()
+            .ok_or_else(|| anyhow!("audio track has no SSRC"))?;
+        self.track
+            .sample_writer(ssrc, pt)
+            .write_sample(&Sample {
+                data: Bytes::from(packet),
+                duration,
+                ..Sample::new(Instant::now())
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 /// Reassembles RTP packets into H.264 access units on the viewer.

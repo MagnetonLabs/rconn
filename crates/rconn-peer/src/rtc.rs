@@ -2,7 +2,7 @@
 //! channel.
 
 use crate::signaling::SignalingTx;
-use crate::video::{TargetBitrate, VideoSender, media_stack};
+use crate::video::{AudioSender, TargetBitrate, VideoSender, media_stack};
 use anyhow::{Context, Result, anyhow, bail};
 use rconn_core::ids::SessionId;
 use rconn_core::protocol::{ClientMessage, IceServer, SdpType, SignalPayload};
@@ -155,11 +155,18 @@ impl Peer {
     pub async fn answer_with_video(
         &self,
         offer_sdp: String,
-    ) -> Result<(SignalPayload, VideoSender)> {
+    ) -> Result<(SignalPayload, VideoSender, Option<AudioSender>)> {
+        // Audio only if the viewer offered to receive it (older viewers may not).
+        let wants_audio = offer_sdp.contains("m=audio");
         self.pc
             .set_remote_description(RTCSessionDescription::offer(offer_sdp)?)
             .await?;
         let video = VideoSender::attach(&*self.pc).await?;
+        let audio = if wants_audio {
+            Some(AudioSender::attach(&*self.pc).await?)
+        } else {
+            None
+        };
         let answer = self.pc.create_answer(None).await?;
         let sdp = answer.sdp.clone();
         self.pc.set_local_description(answer).await?;
@@ -169,6 +176,7 @@ impl Peer {
                 sdp,
             },
             video,
+            audio,
         ))
     }
 
