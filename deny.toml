@@ -14,9 +14,23 @@ allow = [
   "Zlib",
   "Unicode-3.0",
   "CDLA-Permissive-2.0",
+  # Boost: permissive; attribution only required for source distributions.
+  "BSL-1.0",
 ]
 confidence-threshold = 0.9
 
+
+# egui's bundled UI fonts. Fonts may be embedded in software under OFL/Ubuntu Font terms;
+# ship their license texts with the viewer (packaging, phase 9). Scoped to this crate only.
+[[licenses.exceptions]]
+crate = "epaint_default_fonts"
+allow = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+# MPL-2.0 is file-level copyleft: fine unmodified in a closed app. Scoped so any new MPL
+# dependency gets reviewed. (via directories -> dirs-sys)
+[[licenses.exceptions]]
+crate = "option-ext"
+allow = ["MPL-2.0"]
 
 # Our own crates are publish = false, so their LicenseRef-Proprietary is skipped.
 [licenses.private]
