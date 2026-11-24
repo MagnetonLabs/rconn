@@ -22,6 +22,10 @@ impl DataDir {
         Self(path.into())
     }
 
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
     fn p(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }

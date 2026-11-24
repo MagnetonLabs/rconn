@@ -8,6 +8,7 @@ use rconn_core::protocol::{
     ClientMessage, EndReason, ErrorCode, IceServer, SdpType, ServerMessage, SessionPolicy,
     SignalPayload,
 };
+use rconn_signaling::audit::{AuditEvent, AuthRole, MemoryAudit};
 use rconn_signaling::auth::{
     AuthError, Authenticator, HostIdentity, HostProofInput, OperatorIdentity,
 };
@@ -393,4 +394,70 @@ async fn messages_out_of_order_close_the_socket() {
         })
     ));
     assert_eq!(recv(&mut ws).await, None);
+}
+
+#[tokio::test]
+async fn audit_trail_records_the_whole_lifecycle() {
+    let auth = TestAuth {
+        org_a: OrgId::new(),
+        org_b: OrgId::new(),
+        op_a: OperatorId::new(),
+        op_b: OperatorId::new(),
+    };
+    let (org_a, op_a) = (auth.org_a, auth.op_a);
+    let audit = Arc::new(MemoryAudit::default());
+    let state = AppState::with_audit(Arc::new(auth), audit.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/v1/ws", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+
+    let (mut host, host_id) = connect_host(&url).await;
+    let mut op = connect_operator(&url, "op-a").await;
+    let sid = open_session(&mut op, &mut host, host_id).await;
+    let (mut bad, _) = connect_async(&url).await.unwrap();
+    send(
+        &mut bad,
+        &ClientMessage::OperatorHello {
+            protocol_version: PROTOCOL_VERSION,
+            token: "nope".into(),
+        },
+    )
+    .await;
+    let _ = recv(&mut bad).await;
+    host.close(None).await.unwrap();
+    let _ = recv(&mut op).await; // SessionEnded
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let events = audit.0.lock().unwrap().clone();
+    assert_eq!(
+        events,
+        vec![
+            AuditEvent::HostOnline {
+                org_id: org_a,
+                host_id
+            },
+            AuditEvent::OperatorLogin {
+                org_id: org_a,
+                operator_id: op_a
+            },
+            AuditEvent::SessionOpened {
+                org_id: org_a,
+                session_id: sid,
+                host_id,
+                operator_id: op_a
+            },
+            AuditEvent::AuthFailed {
+                role: AuthRole::Operator,
+                reason: "invalid credentials".into()
+            },
+            AuditEvent::HostOffline {
+                org_id: org_a,
+                host_id
+            },
+            AuditEvent::SessionEnded {
+                session_id: sid,
+                reason: EndReason::HostOffline
+            },
+        ]
+    );
 }

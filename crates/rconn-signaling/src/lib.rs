@@ -1,11 +1,13 @@
 //! rconn signaling server: authenticates hosts and operators over a WebSocket, brokers
 //! sessions between them, and relays SDP/ICE. Media never passes through here.
 
+pub mod audit;
 pub mod auth;
 pub mod fleet_auth;
 pub mod store;
 pub mod turn_relay;
 
+use audit::{AuditEvent, AuditSink, AuthRole, NoAudit};
 use auth::{Authenticator, HostIdentity, HostProofInput, OperatorIdentity};
 use axum::Router;
 use axum::extract::State;
@@ -40,6 +42,7 @@ pub struct AppState {
 
 struct Inner {
     auth: Arc<dyn Authenticator>,
+    audit: Arc<dyn AuditSink>,
     registry: Mutex<Registry>,
 }
 
@@ -58,12 +61,21 @@ struct SessionEntry {
 
 impl AppState {
     pub fn new(auth: Arc<dyn Authenticator>) -> Self {
+        Self::with_audit(auth, Arc::new(NoAudit))
+    }
+
+    pub fn with_audit(auth: Arc<dyn Authenticator>, audit: Arc<dyn AuditSink>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 auth,
+                audit,
                 registry: Mutex::default(),
             }),
         }
+    }
+
+    fn audit(&self, event: AuditEvent) {
+        self.inner.audit.record(event);
     }
 
     /// Number of hosts currently online. For health checks and tests.
@@ -126,6 +138,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             match tokio::time::timeout_at(auth_deadline, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
+                    let role = if matches!(phase, Phase::AwaitingProof { .. }) {
+                        AuthRole::Host
+                    } else {
+                        AuthRole::Operator
+                    };
+                    state.audit(AuditEvent::AuthFailed {
+                        role,
+                        reason: "authentication timed out".into(),
+                    });
                     send_err(
                         &tx,
                         ErrorCode::Unauthenticated,
@@ -237,11 +258,19 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                         .await
                         .hosts
                         .insert(host_id, (identity, tx.clone()));
+                    state.audit(AuditEvent::HostOnline {
+                        org_id: identity.org_id,
+                        host_id,
+                    });
                     let _ = tx.send(welcome(identity.org_id, ice_servers));
                     tracing::info!(%host_id, org = %identity.org_id, "host online");
                     Next::Continue(Phase::Ready(Peer::Host(identity)))
                 }
                 Err(e) => {
+                    state.audit(AuditEvent::AuthFailed {
+                        role: AuthRole::Host,
+                        reason: format!("{host_id}: {e}"),
+                    });
                     send_err(tx, ErrorCode::Unauthenticated, e.to_string());
                     Next::Close(Phase::New)
                 }
@@ -260,10 +289,18 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
             match auth.verify_operator(&token).await {
                 Ok(identity) => {
                     let ice_servers = auth.ice_servers(identity.org_id).await;
+                    state.audit(AuditEvent::OperatorLogin {
+                        org_id: identity.org_id,
+                        operator_id: identity.operator_id,
+                    });
                     let _ = tx.send(welcome(identity.org_id, ice_servers));
                     Next::Continue(Phase::Ready(Peer::Operator(identity)))
                 }
                 Err(e) => {
+                    state.audit(AuditEvent::AuthFailed {
+                        role: AuthRole::Operator,
+                        reason: e.to_string(),
+                    });
                     send_err(tx, ErrorCode::Unauthenticated, e.to_string());
                     Next::Close(Phase::New)
                 }
@@ -333,6 +370,12 @@ async fn request_session(state: &AppState, tx: &Outbox, op: OperatorIdentity, ho
     );
     drop(reg);
 
+    state.audit(AuditEvent::SessionOpened {
+        org_id: op.org_id,
+        session_id,
+        host_id,
+        operator_id: op.operator_id,
+    });
     let policy = state.inner.auth.session_policy(host).await;
     let _ = host_tx.send(ServerMessage::IncomingSession {
         session_id,
@@ -386,11 +429,12 @@ async fn end_session(state: &AppState, tx: &Outbox, peer: Peer, session_id: Sess
         return;
     }
     if let Some(e) = reg.sessions.remove(&session_id) {
-        notify_ended(&e, session_id, EndReason::Normal);
+        notify_ended(state, &e, session_id, EndReason::Normal);
     }
 }
 
-fn notify_ended(e: &SessionEntry, session_id: SessionId, reason: EndReason) {
+fn notify_ended(state: &AppState, e: &SessionEntry, session_id: SessionId, reason: EndReason) {
+    state.audit(AuditEvent::SessionEnded { session_id, reason });
     let _ = e
         .host_tx
         .send(ServerMessage::SessionEnded { session_id, reason });
@@ -409,6 +453,10 @@ async fn disconnect(state: &AppState, peer: Peer, tx: &Outbox) {
             .is_some_and(|(_, t)| t.same_channel(tx))
         {
             reg.hosts.remove(&h.host_id);
+            state.audit(AuditEvent::HostOffline {
+                org_id: h.org_id,
+                host_id: h.host_id,
+            });
             tracing::info!(host_id = %h.host_id, "host offline");
         }
     }
@@ -425,7 +473,7 @@ async fn disconnect(state: &AppState, peer: Peer, tx: &Outbox) {
             } else {
                 EndReason::Normal
             };
-            notify_ended(&e, id, reason);
+            notify_ended(state, &e, id, reason);
         }
     }
 }

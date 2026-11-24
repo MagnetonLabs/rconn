@@ -216,7 +216,10 @@ async fn serve(
         auth.revoke(*h);
     }
 
-    let app = router(AppState::new(Arc::new(auth)));
+    let audit_path = store.path().join("audit.jsonl");
+    let audit = rconn_signaling::audit::FileAudit::open(&audit_path)
+        .with_context(|| format!("opening {}", audit_path.display()))?;
+    let app = router(AppState::with_audit(Arc::new(auth), Arc::new(audit)));
     let addr: std::net::SocketAddr = bind.parse().with_context(|| format!("--bind {bind}"))?;
     let handle = axum_server::Handle::new();
     let h = handle.clone();
