@@ -26,6 +26,7 @@ png = "0.18.1"
 rtc = "=0.21.1"
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 egui = "0.37.0"
+cpal = "0.18.2"
 
 [lints]
 workspace = true

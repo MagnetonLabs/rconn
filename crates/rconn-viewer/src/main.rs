@@ -3,6 +3,7 @@
 
 mod gui;
 mod keymap;
+mod playback;
 mod watch;
 
 use anyhow::{Result, bail};
@@ -46,6 +47,9 @@ enum Cmd {
         /// Borderless, maximized window; Ctrl+Alt+Shift+M shows the toolbar.
         #[arg(long)]
         chromeless: bool,
+        /// Don't play the host's sound.
+        #[arg(long)]
+        mute: bool,
     },
     /// Open a session and receive the host's screen (headless): print stream stats, and
     /// optionally save a PNG of the latest frame.
@@ -124,6 +128,7 @@ async fn main() -> Result<()> {
             udp,
             relay_only,
             chromeless,
+            mute,
         } => {
             let openh264 = match openh264 {
                 Some(p) => p.clone(),
@@ -140,6 +145,7 @@ async fn main() -> Result<()> {
                     relay_only: *relay_only,
                 },
                 chromeless: *chromeless,
+                mute: *mute,
             };
             // eframe must own the main thread (macOS requirement); it blocks until closed.
             return gui::run(args);

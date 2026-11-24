@@ -31,6 +31,8 @@ pub struct ConnectArgs {
     pub opts: PeerOptions,
     /// Borderless, maximized window; the toolbar appears on the hotkey.
     pub chromeless: bool,
+    /// Don't play the host's sound.
+    pub mute: bool,
 }
 
 /// The local hotkey that toggles the toolbar: Ctrl+Alt+Shift+M. Never sent to the host.
@@ -221,17 +223,44 @@ async fn session(
         }
     });
 
-    let track = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            match session.peer.events.recv().await {
-                Some(PeerEvent::Track(t)) => return Ok(t),
-                Some(_) => continue,
-                None => return Err(anyhow!("session closed before video arrived")),
+    // Route tracks: video to the decoder below, audio to the speakers (unless muted).
+    let (video_tx, mut video_rx) = mpsc::unbounded_channel();
+    let mute = args.mute;
+    let mut events = std::mem::replace(&mut session.peer.events, mpsc::unbounded_channel().1);
+    let router = tokio::spawn(async move {
+        while let Some(ev) = events.recv().await {
+            let PeerEvent::Track(t) = ev else { continue };
+            if t.kind().await == rtc::rtp_transceiver::rtp_sender::RtpCodecKind::Audio {
+                if mute {
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let player = match crate::playback::Player::start() {
+                        Ok(p) => p,
+                        Err(e) => return tracing::warn!(error = %e, "no audio playback"),
+                    };
+                    let Ok(mut dec) = rconn_media::codec::opus_decoder() else {
+                        return;
+                    };
+                    let mut pcm = vec![0f32; 960 * 2 * 6];
+                    while let Some(ev) = t.poll().await {
+                        let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
+                            continue;
+                        };
+                        if let Ok(n) = dec.decode_float(&pkt.payload, &mut pcm, false) {
+                            player.push(&pcm[..n * 2]);
+                        }
+                    }
+                });
+            } else {
+                let _ = video_tx.send(t);
             }
         }
-    })
-    .await
-    .map_err(|_| anyhow!("no video from the host within 20 s"))??;
+    });
+    let track = tokio::time::timeout(Duration::from_secs(20), video_rx.recv())
+        .await
+        .map_err(|_| anyhow!("no video from the host within 20 s"))?
+        .ok_or_else(|| anyhow!("session closed before video arrived"))?;
 
     let mut rx = VideoReceiver::default();
     let mut dec = VideoDecoder::new(&args.openh264)?;
@@ -268,6 +297,7 @@ async fn session(
         }
     }
     dc_task.abort();
+    router.abort();
     session.close().await;
     Ok(())
 }

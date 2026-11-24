@@ -3853,6 +3853,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "cpal",
  "directories",
  "eframe",
  "egui",
