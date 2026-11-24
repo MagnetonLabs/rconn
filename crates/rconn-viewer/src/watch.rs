@@ -55,17 +55,43 @@ pub async fn run(
         }
     });
 
-    let track = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            match session.peer.events.recv().await {
-                Some(PeerEvent::Track(t)) => return Ok(t),
-                Some(_) => continue,
-                None => return Err(anyhow!("session closed before video arrived")),
+    // Two tracks may arrive in either order: video feeds the decoder below, audio gets
+    // a headless meter (level + pitch), so tests can verify sound without playing it.
+    let (video_tx, mut video_rx) = tokio::sync::mpsc::unbounded_channel();
+    let audio_report = std::sync::Arc::new(std::sync::Mutex::new(AudioMeter::default()));
+    let meter = audio_report.clone();
+    let mut events = std::mem::replace(
+        &mut session.peer.events,
+        tokio::sync::mpsc::unbounded_channel().1,
+    );
+    let router = tokio::spawn(async move {
+        while let Some(ev) = events.recv().await {
+            let PeerEvent::Track(t) = ev else { continue };
+            if t.kind().await == rtc::rtp_transceiver::rtp_sender::RtpCodecKind::Audio {
+                let meter = meter.clone();
+                tokio::spawn(async move {
+                    let Ok(mut dec) = rconn_media::codec::opus_decoder() else {
+                        return;
+                    };
+                    let mut pcm = vec![0f32; 960 * 2];
+                    while let Some(ev) = t.poll().await {
+                        let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
+                            continue;
+                        };
+                        if let Ok(n) = dec.decode_float(&pkt.payload, &mut pcm, false) {
+                            meter.lock().expect("meter").add(&pcm[..n * 2]);
+                        }
+                    }
+                });
+            } else {
+                let _ = video_tx.send(t);
             }
         }
-    })
-    .await
-    .map_err(|_| anyhow!("no video from the host within 20 s (is it capturing?)"))??;
+    });
+    let track = tokio::time::timeout(Duration::from_secs(20), video_rx.recv())
+        .await
+        .map_err(|_| anyhow!("no video from the host within 20 s (is it capturing?)"))?
+        .ok_or_else(|| anyhow!("session closed before video arrived"))?;
     let mut rx = VideoReceiver::default();
     let mut dec = VideoDecoder::new(openh264)?;
     let deadline = Instant::now() + Duration::from_secs(seconds);
@@ -120,6 +146,16 @@ pub async fn run(
         );
     }
     println!("{total} frames decoded in {seconds} s");
+    let (frames, rms, hz) = {
+        let a = audio_report.lock().expect("meter");
+        (a.frames, a.rms(), a.hz())
+    };
+    if frames > 0 {
+        println!("audio: {frames} packets, rms {rms:.3}, ~{hz:.0} Hz");
+    } else {
+        println!("audio: none received");
+    }
+    router.abort();
     drop(kf_tx);
     dc_task.abort();
     session.close().await;
@@ -169,4 +205,34 @@ fn save_png(path: &Path, f: &DecodedFrame) -> Result<()> {
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header()?.write_image_data(&f.rgba)?;
     Ok(())
+}
+
+/// Headless audio meter over the left channel: RMS level and zero-crossing pitch.
+#[derive(Default)]
+struct AudioMeter {
+    frames: u64,
+    samples: u64,
+    sum_sq: f64,
+    crossings: u64,
+    last: f32,
+}
+
+impl AudioMeter {
+    fn add(&mut self, interleaved: &[f32]) {
+        self.frames += 1;
+        for &v in interleaved.iter().step_by(2) {
+            self.samples += 1;
+            self.sum_sq += f64::from(v * v);
+            if self.last <= 0.0 && v > 0.0 {
+                self.crossings += 1;
+            }
+            self.last = v;
+        }
+    }
+    fn rms(&self) -> f64 {
+        (self.sum_sq / self.samples.max(1) as f64).sqrt()
+    }
+    fn hz(&self) -> f64 {
+        self.crossings as f64 / (self.samples.max(1) as f64 / 48_000.0)
+    }
 }

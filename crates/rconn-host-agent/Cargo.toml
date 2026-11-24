@@ -19,6 +19,7 @@ clap = { version = "4.6.9", features = ["derive", "env"] }
 webrtc = "=0.21.1"
 bytes = "1.12.2"
 uuid.workspace = true
+cpal = "0.18.2"
 
 [lints]
 workspace = true

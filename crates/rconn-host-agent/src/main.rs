@@ -2,6 +2,7 @@
 //! sessions, streams the screen, and serves the data channel. Input and audio attach
 //! here in phases 4 and 7.
 
+mod audio;
 mod hostkind;
 mod indicator;
 mod input;
@@ -61,6 +62,12 @@ struct Cli {
     /// Stream a synthetic pattern of this size (e.g. 1280x720) instead of the screen.
     #[arg(long)]
     test_pattern: Option<String>,
+    /// Send a 440 Hz tone instead of the host's sound (tests, soundless setups).
+    #[arg(long)]
+    test_tone: bool,
+    /// Don't send host sound.
+    #[arg(long)]
+    no_audio: bool,
     #[arg(long, default_value_t = 30)]
     max_fps: u32,
     #[arg(long, default_value_t = 8000)]
@@ -283,6 +290,20 @@ async fn serve_session(
         max_bitrate_bps: cli.max_kbps.saturating_mul(1000),
         max_size: (mw.parse()?, mh.parse()?),
     };
+    // Host sound runs alongside the picture; losing it never ends the session.
+    if let (Some(audio_track), false) = (session.audio.take(), cli.no_audio) {
+        let source = if cli.test_tone {
+            audio::Source::TestTone
+        } else {
+            audio::Source::Loopback
+        };
+        let audio_stop = stop.clone();
+        tokio::spawn(async move {
+            if let Err(e) = audio::run(source, audio_track, audio_stop).await {
+                tracing::warn!(error = %format!("{e:#}"), "host audio unavailable; continuing without sound");
+            }
+        });
+    }
     stream::run(
         cli.capturer_factory()?,
         session.video,
