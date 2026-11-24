@@ -110,14 +110,13 @@ async fn run() {
             let mut tick = tokio::time::interval(Duration::from_millis(1000 / FPS));
             for t in 0..(4 * FPS as usize) {
                 tick.tick().await;
-                if let Some(au) = enc.encode(&frame(t % 40)).unwrap() {
-                    if s.video
+                if let Some(au) = enc.encode(&frame(t % 40)).unwrap()
+                    && s.video
                         .write(au, Duration::from_millis(1000 / FPS))
                         .await
                         .is_err()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
             }
             eprintln!(

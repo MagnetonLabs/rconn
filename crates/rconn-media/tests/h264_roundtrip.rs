@@ -34,7 +34,12 @@ fn synthetic(width: usize, height: usize, t: usize) -> Frame {
 fn psnr(src_bgra: &[u8], rgba: &[u8]) -> f64 {
     let mut se = 0f64;
     let mut n = 0f64;
-    for (s, d) in src_bgra.as_chunks::<4>().0.iter().zip(rgba.chunks_exact(4)) {
+    for (s, d) in src_bgra
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgba.as_chunks::<4>().0.iter())
+    {
         for (a, b) in [(s[2], d[0]), (s[1], d[1]), (s[0], d[2])] {
             let e = f64::from(a) - f64::from(b);
             se += e * e;

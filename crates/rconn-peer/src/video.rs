@@ -93,7 +93,6 @@ pub fn media_stack() -> Result<(MediaEngine, Registry, TargetBitrate)> {
         RTCRtpCodecParameters {
             rtp_codec: h264(),
             payload_type: H264_PAYLOAD_TYPE,
-            ..Default::default()
         },
         RtpCodecKind::Video,
     )?;
