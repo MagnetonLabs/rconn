@@ -1,6 +1,8 @@
 //! Viewer client. The egui UI arrives with video in phase 3; today `ping` opens a real
 //! session to a host and measures data-channel round trips.
 
+mod watch;
+
 use anyhow::{Result, bail};
 use bytes::BytesMut;
 use clap::{Parser, Subcommand};
@@ -30,6 +32,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open a session and receive the host's screen (headless): print stream stats, and
+    /// optionally save a PNG of the latest frame.
+    Watch {
+        host: uuid::Uuid,
+        #[arg(long, default_value_t = 15)]
+        seconds: u64,
+        #[arg(long)]
+        snapshot: Option<std::path::PathBuf>,
+        /// Cisco openh264 library. Default: next to this executable, else target/openh264.
+        #[arg(long, env = "RCONN_OPENH264")]
+        openh264: Option<std::path::PathBuf>,
+        #[arg(long, default_value = "0.0.0.0:0")]
+        udp: Vec<String>,
+        #[arg(long)]
+        relay_only: bool,
+    },
     /// Log in with an account; saves a session token for this server.
     /// Password from RCONN_PASSWORD or the first line of stdin.
     Login {
@@ -58,6 +76,33 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match &cli.cmd {
+        Cmd::Watch {
+            host,
+            seconds,
+            snapshot,
+            openh264,
+            udp,
+            relay_only,
+        } => {
+            let lib = match openh264 {
+                Some(p) => p.clone(),
+                None => default_openh264()?,
+            };
+            watch::run(
+                &cli.server,
+                &trust(&cli),
+                &token_for(&cli)?,
+                HostId(*host),
+                *seconds,
+                snapshot.clone(),
+                &lib,
+                PeerOptions {
+                    udp_addrs: udp.clone(),
+                    relay_only: *relay_only,
+                },
+            )
+            .await
+        }
         Cmd::Login { username } => login(&cli.server, &trust(&cli), username).await,
         Cmd::Ping {
             host,
@@ -225,4 +270,15 @@ fn read_password() -> Result<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn default_openh264() -> Result<std::path::PathBuf> {
+    let name = rconn_media::cisco::current_binary_name()
+        .ok_or_else(|| anyhow::anyhow!("no Cisco build for this platform"))?;
+    let beside = std::env::current_exe()?.with_file_name(name);
+    if beside.exists() {
+        return Ok(beside);
+    }
+    rconn_media::cisco::local_binary_path()
+        .ok_or_else(|| anyhow::anyhow!("openh264 not found; pass --openh264"))
 }

@@ -1,6 +1,8 @@
 //! Per-session host agent: connects to signaling with the host identity, answers
-//! sessions, and serves the data channel. Capture, input and audio attach here in
-//! phases 3, 4 and 7; today the data channel answers `Ping` with `Pong`.
+//! sessions, streams the screen, and serves the data channel. Input and audio attach
+//! here in phases 4 and 7.
+
+mod stream;
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;
@@ -8,6 +10,7 @@ use clap::Parser;
 use rconn_core::fleet::HostKey;
 use rconn_core::ids::HostId;
 use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage};
+use rconn_media::capture::{Capturer, TestPattern};
 use rconn_peer::rtc::PeerOptions;
 use rconn_peer::session::{HostSession, SessionHandler, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
@@ -15,13 +18,15 @@ use rconn_peer::trust::ServerTrust;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use stream::{KeyframeRequests, StreamConfig};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(version, about = "rconn host agent")]
 struct Cli {
-    /// Signaling WebSocket URL, e.g. ws://10.0.0.5:8080/v1/ws
+    /// Signaling WebSocket URL, e.g. wss://rconn.example.com/v1/ws
     #[arg(long, env = "RCONN_SERVER")]
     server: String,
     /// Server identity this host was enrolled for (bound into the auth proof).
@@ -34,9 +39,55 @@ struct Cli {
     /// Directory with host.id, host.cert.pem and host.key.pem from `enroll-host`.
     #[arg(long, env = "RCONN_IDENTITY_DIR")]
     identity: PathBuf,
+    /// Cisco openh264 library. Default: next to this executable.
+    #[arg(long, env = "RCONN_OPENH264")]
+    openh264: Option<PathBuf>,
+    /// Stream a synthetic pattern of this size (e.g. 1280x720) instead of the screen.
+    #[arg(long)]
+    test_pattern: Option<String>,
+    #[arg(long, default_value_t = 30)]
+    max_fps: u32,
+    #[arg(long, default_value_t = 8000)]
+    max_kbps: u32,
     /// Local UDP sockets for ICE.
     #[arg(long, default_value = "0.0.0.0:0")]
     udp: Vec<String>,
+}
+
+impl Cli {
+    fn openh264_path(&self) -> Result<PathBuf> {
+        if let Some(p) = &self.openh264 {
+            return Ok(p.clone());
+        }
+        let name = rconn_media::cisco::current_binary_name()
+            .context("no Cisco openh264 build for this platform")?;
+        let exe = std::env::current_exe()?;
+        Ok(exe
+            .parent()
+            .context("executable has no directory")?
+            .join(name))
+    }
+
+    fn capturer_factory(
+        &self,
+    ) -> Result<impl FnOnce() -> Result<Box<dyn Capturer>> + Send + 'static> {
+        let pattern = match &self.test_pattern {
+            Some(s) => {
+                let (w, h) = s
+                    .split_once('x')
+                    .context("--test-pattern must look like 1280x720")?;
+                Some((w.parse::<usize>()?, h.parse::<usize>()?))
+            }
+            None => None,
+        };
+        let fps = self.max_fps;
+        Ok(move || -> Result<Box<dyn Capturer>> {
+            Ok(match pattern {
+                Some((w, h)) => Box::new(TestPattern::new(w, h, fps)),
+                None => rconn_media::capture::primary_display()?,
+            })
+        })
+    }
 }
 
 #[tokio::main]
@@ -57,9 +108,12 @@ async fn main() -> Result<()> {
     );
     let cert = read("host.cert.pem")?;
     let key = HostKey::from_pem(&read("host.key.pem")?)?;
+    let openh264 = cli.openh264_path()?;
+    rconn_media::codec::load_openh264(&openh264)
+        .with_context(|| format!("loading {}", openh264.display()))?;
     tracing::info!(
-        %host_id, protocol = rconn_core::PROTOCOL_VERSION, os = std::env::consts::OS, arch = std::env::consts::ARCH,
-        openh264 = rconn_media::cisco::current_binary_name(), "host agent starting"
+        %host_id, protocol = rconn_core::PROTOCOL_VERSION, os = std::env::consts::OS,
+        arch = std::env::consts::ARCH, openh264 = %openh264.display(), "host agent starting"
     );
 
     let trust = ServerTrust::from_fingerprint(cli.fingerprint.as_deref());
@@ -80,10 +134,13 @@ async fn main() -> Result<()> {
                     udp_addrs: cli.udp.clone(),
                     relay_only: false,
                 };
-                let handler: SessionHandler = Arc::new(|mut session: HostSession| {
+                let cli2 = cli.clone();
+                let openh264 = openh264.clone();
+                let handler: SessionHandler = Arc::new(move |session: HostSession| {
+                    let (cli, openh264) = (cli2.clone(), openh264.clone());
                     tokio::spawn(async move {
-                        while let Some(dc) = session.channels.recv().await {
-                            tokio::spawn(serve_channel(dc));
+                        if let Err(e) = serve_session(session, &cli, openh264).await {
+                            tracing::warn!(error = %e, "session failed");
                         }
                     });
                 });
@@ -98,7 +155,50 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve_channel(dc: Arc<dyn DataChannel>) {
+async fn serve_session(mut session: HostSession, cli: &Cli, openh264: PathBuf) -> Result<()> {
+    let keyframes = KeyframeRequests::default();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Data channels: Ping/Pong and keyframe requests.
+    let kf = keyframes.clone();
+    let mut channels = std::mem::replace(
+        &mut session.channels,
+        tokio::sync::mpsc::unbounded_channel().1,
+    );
+    tokio::spawn(async move {
+        while let Some(dc) = channels.recv().await {
+            tokio::spawn(serve_channel(dc, kf.clone()));
+        }
+    });
+
+    // Stop streaming when the peer connection closes or fails.
+    let watch_stop = stop.clone();
+    let mut states = std::mem::replace(
+        &mut session.states,
+        tokio::sync::mpsc::unbounded_channel().1,
+    );
+    tokio::spawn(async move {
+        while states.recv().await.is_some() {}
+        watch_stop.store(true, Ordering::Relaxed);
+    });
+
+    let cfg = StreamConfig {
+        openh264,
+        max_fps: cli.max_fps,
+        max_bitrate_bps: cli.max_kbps.saturating_mul(1000),
+    };
+    stream::run(
+        cli.capturer_factory()?,
+        session.video,
+        session.target_bitrate,
+        keyframes,
+        cfg,
+        stop,
+    )
+    .await
+}
+
+async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests) {
     match dc.protocol().await {
         Ok(p) if p == DATA_CHANNEL_PROTOCOL => {}
         other => {
@@ -115,6 +215,7 @@ async fn serve_channel(dc: Arc<dyn DataChannel>) {
                         let _ = dc.send(BytesMut::from(&pong[..])).await;
                     }
                 }
+                Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
                 Ok(other) => tracing::debug!(?other, "data message (not handled yet)"),
                 Err(e) => tracing::warn!(error = %e, "bad data message"),
             },

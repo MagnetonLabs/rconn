@@ -1,0 +1,172 @@
+//! Headless viewer: receive and decode the host's screen, report stream health.
+
+use anyhow::{Context, Result, anyhow};
+use bytes::BytesMut;
+use rconn_core::ids::HostId;
+use rconn_core::protocol::{Control, DataMessage};
+use rconn_media::video::{DecodedFrame, VideoDecoder};
+use rconn_peer::rtc::{PeerEvent, PeerOptions};
+use rconn_peer::session::open_viewer_session;
+use rconn_peer::signaling::SignalingClient;
+use rconn_peer::trust::ServerTrust;
+use rconn_peer::video::VideoReceiver;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use webrtc::data_channel::DataChannelEvent;
+use webrtc::media_stream::track_remote::TrackRemoteEvent;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    server: &str,
+    trust: &ServerTrust,
+    token: &str,
+    host: HostId,
+    seconds: u64,
+    snapshot: Option<PathBuf>,
+    openh264: &Path,
+    opts: PeerOptions,
+) -> Result<()> {
+    let t0 = Instant::now();
+    let sig = SignalingClient::connect_operator(server, trust, token).await?;
+    let mut session = open_viewer_session(sig, host, opts).await?;
+
+    // Ask for a keyframe as soon as the data channel opens (the first IDR may have been
+    // sent before our decoder existed).
+    let dc = session.data.clone();
+    let (kf_tx, mut kf_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let dc_task = tokio::spawn(async move {
+        let send_kf = |dc: std::sync::Arc<dyn webrtc::data_channel::DataChannel>| async move {
+            if let Ok(b) = DataMessage::Control(Control::RequestKeyframe).encode() {
+                let _ = dc.send(BytesMut::from(&b[..])).await;
+            }
+        };
+        loop {
+            tokio::select! {
+                ev = dc.poll() => match ev {
+                    Some(DataChannelEvent::OnOpen) => send_kf(dc.clone()).await,
+                    Some(DataChannelEvent::OnClose) | None => break,
+                    _ => {}
+                },
+                req = kf_rx.recv() => match req {
+                    Some(()) => send_kf(dc.clone()).await,
+                    None => break,
+                },
+            }
+        }
+    });
+
+    let track = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match session.peer.events.recv().await {
+                Some(PeerEvent::Track(t)) => return Ok(t),
+                Some(_) => continue,
+                None => return Err(anyhow!("session closed before video arrived")),
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("no video from the host within 20 s (is it capturing?)"))??;
+    let mut rx = VideoReceiver::default();
+    let mut dec = VideoDecoder::new(openh264)?;
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut window = Window::default();
+    let mut last: Option<DecodedFrame> = None;
+    let mut first_frame = None;
+    let mut total = 0u32;
+
+    while Instant::now() < deadline {
+        let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), track.poll()).await else {
+            continue;
+        };
+        let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
+            continue;
+        };
+        for au in rx.push(pkt) {
+            window.bytes += au.len();
+            let d0 = Instant::now();
+            match dec.decode(&au) {
+                Ok(Some(f)) => {
+                    window.decode += d0.elapsed();
+                    window.frames += 1;
+                    total += 1;
+                    if first_frame.is_none() {
+                        first_frame = Some(t0.elapsed());
+                        println!(
+                            "first frame {}x{} after {:.0} ms",
+                            f.width,
+                            f.height,
+                            t0.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    last = Some(f);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "decode error; requesting keyframe");
+                    let _ = kf_tx.send(());
+                }
+            }
+        }
+        window.maybe_print(last.as_ref());
+    }
+
+    if let (Some(path), Some(f)) = (&snapshot, &last) {
+        save_png(path, f)?;
+        println!(
+            "snapshot {}x{} saved to {}",
+            f.width,
+            f.height,
+            path.display()
+        );
+    }
+    println!("{total} frames decoded in {seconds} s");
+    drop(kf_tx);
+    dc_task.abort();
+    session.close().await;
+    if total == 0 {
+        anyhow::bail!("no video frames decoded");
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Window {
+    frames: u32,
+    bytes: usize,
+    decode: Duration,
+    since: Option<Instant>,
+}
+
+impl Window {
+    fn maybe_print(&mut self, last: Option<&DecodedFrame>) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        let secs = since.elapsed().as_secs_f64();
+        if secs < 2.0 {
+            return;
+        }
+        let size = last
+            .map(|f| format!("{}x{}", f.width, f.height))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{size}  {:.1} fps  {:.0} kbps  decode {:.1} ms/frame",
+            f64::from(self.frames) / secs,
+            self.bytes as f64 * 8.0 / secs / 1000.0,
+            self.decode.as_secs_f64() * 1e3 / f64::from(self.frames.max(1))
+        );
+        *self = Self::default();
+    }
+}
+
+fn save_png(path: &Path, f: &DecodedFrame) -> Result<()> {
+    let file =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut enc = png::Encoder::new(
+        std::io::BufWriter::new(file),
+        f.width as u32,
+        f.height as u32,
+    );
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(&f.rgba)?;
+    Ok(())
+}
