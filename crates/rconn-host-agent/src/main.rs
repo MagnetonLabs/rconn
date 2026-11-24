@@ -12,6 +12,7 @@ use rconn_core::fleet::HostKey;
 use rconn_core::ids::HostId;
 use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage};
 use rconn_media::capture::{Capturer, TestPattern};
+use rconn_peer::clipboard::ClipboardSync;
 use rconn_peer::rtc::PeerOptions;
 use rconn_peer::session::{HostSession, SessionHandler, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
@@ -184,7 +185,8 @@ async fn serve_session(mut session: HostSession, cli: &Cli, openh264: PathBuf) -
     let keyframes = KeyframeRequests::default();
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Data channels: Ping/Pong and keyframe requests.
+    // Data channels: Ping/Pong, keyframe requests, input, clipboard (if policy allows).
+    let clipboard = session.policy.clipboard;
     let kf = keyframes.clone();
     let mut channels = std::mem::replace(
         &mut session.channels,
@@ -192,7 +194,7 @@ async fn serve_session(mut session: HostSession, cli: &Cli, openh264: PathBuf) -
     );
     tokio::spawn(async move {
         while let Some(dc) = channels.recv().await {
-            tokio::spawn(serve_channel(dc, kf.clone()));
+            tokio::spawn(serve_channel(dc, kf.clone(), clipboard));
         }
     });
 
@@ -245,8 +247,7 @@ async fn serve_session(mut session: HostSession, cli: &Cli, openh264: PathBuf) -
     .await
 }
 
-async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests) {
-    let input = input::InputSink::start();
+async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests, clipboard: bool) {
     match dc.protocol().await {
         Ok(p) if p == DATA_CHANNEL_PROTOCOL => {}
         other => {
@@ -255,21 +256,39 @@ async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests) {
             return;
         }
     }
-    while let Some(ev) = dc.poll().await {
-        match ev {
-            DataChannelEvent::OnMessage(msg) => match DataMessage::decode(&msg.data) {
-                Ok(DataMessage::Control(Control::Ping(n))) => {
-                    if let Ok(pong) = DataMessage::Control(Control::Pong(n)).encode() {
-                        let _ = dc.send(BytesMut::from(&pong[..])).await;
-                    }
-                }
-                Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
-                Ok(DataMessage::Input(ev)) => input.send(ev),
-                Ok(other) => tracing::debug!(?other, "data message (not handled yet)"),
-                Err(e) => tracing::warn!(error = %e, "bad data message"),
+    let input = input::InputSink::start();
+    let (clip, mut local_clip) = if clipboard {
+        let (c, rx) = ClipboardSync::start();
+        (Some(c), rx)
+    } else {
+        (None, tokio::sync::mpsc::unbounded_channel().1)
+    };
+    let send = |m: DataMessage| {
+        let dc = dc.clone();
+        async move {
+            if let Ok(b) = m.encode() {
+                let _ = dc.send(BytesMut::from(&b[..])).await;
+            }
+        }
+    };
+    loop {
+        tokio::select! {
+            ev = dc.poll() => match ev {
+                Some(DataChannelEvent::OnMessage(msg)) => match DataMessage::decode(&msg.data) {
+                    Ok(DataMessage::Control(Control::Ping(n))) => send(DataMessage::Control(Control::Pong(n))).await,
+                    Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
+                    Ok(DataMessage::Input(ev)) => input.send(ev),
+                    Ok(DataMessage::Clipboard(text)) => match &clip {
+                        Some(c) => c.apply_remote(text),
+                        None => tracing::debug!("clipboard disabled by policy; ignoring"),
+                    },
+                    Ok(other) => tracing::debug!(?other, "data message (not handled)"),
+                    Err(e) => tracing::warn!(error = %e, "bad data message"),
+                },
+                Some(DataChannelEvent::OnClose) | None => break,
+                _ => {}
             },
-            DataChannelEvent::OnClose => break,
-            _ => {}
+            Some(text) = local_clip.recv() => send(DataMessage::Clipboard(text)).await,
         }
     }
 }

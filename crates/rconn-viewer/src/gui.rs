@@ -112,12 +112,21 @@ async fn session(
             }
         };
         let mut open = false;
+        let (clip, mut local_clip) = rconn_peer::clipboard::ClipboardSync::start();
         loop {
             tokio::select! {
+                Some(text) = local_clip.recv() => if open {
+                    send(dc.clone(), DataMessage::Clipboard(text)).await;
+                },
                 ev = dc.poll() => match ev {
                     Some(DataChannelEvent::OnOpen) => {
                         open = true;
                         send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
+                    }
+                    Some(DataChannelEvent::OnMessage(msg)) => {
+                        if let Ok(DataMessage::Clipboard(text)) = DataMessage::decode(&msg.data) {
+                            clip.apply_remote(text);
+                        }
                     }
                     Some(DataChannelEvent::OnClose) | None => break,
                     _ => {}
