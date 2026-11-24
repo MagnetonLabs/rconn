@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 rconn-core.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
 webrtc = "=0.21.1"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-tungstenite = "0.30.0"
@@ -24,3 +25,4 @@ workspace = true
 [dev-dependencies]
 axum = "0.8.9"
 rconn-signaling = { path = "../rconn-signaling" }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

@@ -8,6 +8,7 @@ use rconn_core::protocol::IceServer;
 use rconn_signaling::auth::OperatorIdentity;
 use rconn_signaling::fleet_auth::FleetAuthenticator;
 use rconn_signaling::store::{DataDir, unhex32, write_private};
+use rconn_signaling::turn_relay::{TurnConfig, TurnMinter, TurnRelay};
 use rconn_signaling::{AppState, router};
 use std::fs;
 use std::path::PathBuf;
@@ -49,9 +50,29 @@ enum Cmd {
         /// Identity hosts bind into their proofs: the exact URL in their server profile.
         #[arg(long, env = "RCONN_SERVER_ID")]
         server_id: String,
-        /// STUN/TURN URLs handed to clients (repeatable).
+        /// Extra STUN URLs handed to clients (comma-separated).
         #[arg(long = "ice", env = "RCONN_ICE", value_delimiter = ',')]
         ice: Vec<String>,
+        /// Run the built-in TURN relay, advertised at this public IP.
+        #[arg(long, env = "RCONN_TURN_PUBLIC_IP")]
+        turn_public_ip: Option<std::net::IpAddr>,
+        #[arg(long, env = "RCONN_TURN_LISTEN", default_value = "0.0.0.0:3478")]
+        turn_listen: std::net::SocketAddr,
+        /// Relay port range, `min-max`. Open it (UDP) in the firewall.
+        #[arg(long, env = "RCONN_TURN_PORTS", default_value = "49160-49260")]
+        turn_ports: String,
+        /// Use an external TURN server (e.g. coturn with `use-auth-secret`) instead of the
+        /// built-in one: its `turn:` URL. Credentials are minted with `--turn-secret`.
+        #[arg(long, env = "RCONN_TURN_URL", conflicts_with = "turn_public_ip")]
+        turn_url: Option<String>,
+        /// Shared secret for the external TURN server (coturn `static-auth-secret`).
+        #[arg(
+            long,
+            env = "RCONN_TURN_SECRET",
+            hide_env_values = true,
+            requires = "turn_url"
+        )]
+        turn_secret: Option<String>,
     },
 }
 
@@ -97,12 +118,53 @@ async fn main() -> Result<()> {
             bind,
             server_id,
             ice,
-        } => serve(&store, &bind, server_id, ice).await?,
+            turn_public_ip,
+            turn_listen,
+            turn_ports,
+            turn_url,
+            turn_secret,
+        } => {
+            let turn = match turn_public_ip {
+                Some(ip) => Some(TurnConfig {
+                    listen: turn_listen,
+                    public_ip: ip,
+                    relay_ports: parse_ports(&turn_ports)?,
+                    shared_secret: store.turn_secret()?,
+                }),
+                None => None,
+            };
+            let external = match (turn_url, turn_secret) {
+                (Some(url), Some(secret)) => Some(TurnMinter {
+                    shared_secret: secret,
+                    turn_urls: vec![url],
+                    stun_urls: vec![],
+                }),
+                (Some(_), None) => anyhow::bail!("--turn-url needs --turn-secret"),
+                _ => None,
+            };
+            serve(&store, &bind, server_id, ice, turn, external).await?
+        }
     }
     Ok(())
 }
 
-async fn serve(store: &DataDir, bind: &str, server_id: String, ice: Vec<String>) -> Result<()> {
+fn parse_ports(s: &str) -> Result<(u16, u16)> {
+    let (a, b) = s
+        .split_once('-')
+        .context("--turn-ports must look like 49160-49260")?;
+    let (a, b): (u16, u16) = (a.trim().parse()?, b.trim().parse()?);
+    anyhow::ensure!(a <= b, "--turn-ports: min must not exceed max");
+    Ok((a, b))
+}
+
+async fn serve(
+    store: &DataDir,
+    bind: &str,
+    server_id: String,
+    ice: Vec<String>,
+    turn: Option<TurnConfig>,
+    external_turn: Option<TurnMinter>,
+) -> Result<()> {
     let ca = store.load_ca()?;
     let org_id = ca.org_id();
     let mut auth = FleetAuthenticator::new(server_id.clone()).with_org_ca(org_id, ca.cert_pem());
@@ -123,6 +185,20 @@ async fn serve(store: &DataDir, bind: &str, server_id: String, ice: Vec<String>)
             credential: None,
         }]);
     }
+    let relay = match &turn {
+        Some(cfg) => {
+            let relay = TurnRelay::start(cfg).await?;
+            let public = std::net::SocketAddr::new(cfg.public_ip, relay.local_addr.port());
+            auth = auth.with_turn(TurnMinter::for_relay(public, cfg.shared_secret.clone()));
+            tracing::info!(listen = %relay.local_addr, %public, ports = ?cfg.relay_ports, "TURN relay up");
+            Some(relay)
+        }
+        None => None,
+    };
+    if let Some(minter) = external_turn {
+        tracing::info!(urls = ?minter.turn_urls, "using external TURN");
+        auth = auth.with_turn(minter);
+    }
     let revoked = store.revoked()?;
     for h in &revoked {
         auth.revoke(*h);
@@ -137,5 +213,8 @@ async fn serve(store: &DataDir, bind: &str, server_id: String, ice: Vec<String>)
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    if let Some(relay) = relay {
+        relay.close().await?;
+    }
     Ok(())
 }

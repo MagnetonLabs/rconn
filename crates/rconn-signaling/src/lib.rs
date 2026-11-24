@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod fleet_auth;
 pub mod store;
+pub mod turn_relay;
 
 use auth::{Authenticator, HostIdentity, HostProofInput, OperatorIdentity};
 use axum::Router;

@@ -64,6 +64,17 @@ impl DataDir {
         Ok((id, token))
     }
 
+    /// Shared secret between signaling and the TURN relay, created on first use.
+    pub fn turn_secret(&self) -> Result<String> {
+        let path = self.p("turn.secret");
+        if let Ok(s) = fs::read_to_string(&path) {
+            return Ok(s.trim().to_owned());
+        }
+        let secret = hex(&rand::random::<[u8; 32]>());
+        write_private(&path, &secret)?;
+        Ok(secret)
+    }
+
     pub fn revoked(&self) -> Result<Vec<HostId>> {
         read_json(&self.p("revoked.json"))
     }

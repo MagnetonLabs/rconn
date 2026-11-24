@@ -1,42 +1,68 @@
 //! Phase 2 acceptance: a viewer and a host, both authenticated against a live signaling
-//! server, negotiate WebRTC through it and exchange `DataMessage`s over a real data channel.
+//! server, negotiate WebRTC through it and exchange `DataMessage`s over a real data
+//! channel: once with any path allowed, once forced through the built-in TURN relay.
 
 use bytes::BytesMut;
 use rconn_core::fleet::{FleetCa, HostKey};
 use rconn_core::ids::{HostId, OperatorId, OrgId};
-use rconn_core::protocol::{
-    ClientMessage, Control, DATA_CHANNEL_PROTOCOL, DataMessage, SdpType, ServerMessage,
-    SignalPayload,
-};
-use rconn_peer::rtc::{Peer, PeerEvent};
+use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage};
+use rconn_peer::rtc::PeerOptions;
+use rconn_peer::session::{ChannelHandler, open_viewer_session, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
 use rconn_signaling::auth::OperatorIdentity;
 use rconn_signaling::fleet_auth::FleetAuthenticator;
+use rconn_signaling::turn_relay::{TurnConfig, TurnMinter, TurnRelay};
 use rconn_signaling::{AppState, router};
 use std::sync::Arc;
-use std::time::Duration;
-use webrtc::data_channel::{DataChannelEvent, RTCDataChannelInit};
+use std::time::{Duration, Instant};
+use webrtc::data_channel::DataChannelEvent;
 
 const SERVER_ID: &str = "wss://fleet.test";
 const LOOPBACK: &str = "127.0.0.1:0";
 
 #[tokio::test]
 async fn viewer_and_host_echo_over_a_real_data_channel() {
-    tokio::time::timeout(Duration::from_secs(30), run())
+    tokio::time::timeout(Duration::from_secs(30), run(false))
         .await
         .expect("test timed out");
 }
 
-async fn run() {
-    // Signaling server with one org, one host, one operator.
+/// Relay-only ICE: the only candidates are allocations on our built-in TURN relay, so
+/// the channel can only open if the relay and the minted credentials work.
+#[tokio::test]
+async fn echo_works_relay_only_through_builtin_turn() {
+    tokio::time::timeout(Duration::from_secs(30), run(true))
+        .await
+        .expect("test timed out");
+}
+
+async fn run(relay_only: bool) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let ca = FleetCa::generate(OrgId::new()).unwrap();
     let op = OperatorIdentity {
         operator_id: OperatorId::new(),
         org_id: ca.org_id(),
     };
-    let auth = FleetAuthenticator::new(SERVER_ID)
+    let mut auth = FleetAuthenticator::new(SERVER_ID)
         .with_org_ca(ca.org_id(), ca.cert_pem())
         .with_operator_token("tok", op);
+
+    let secret = "turn-test-secret".to_string();
+    let relay = TurnRelay::start(&TurnConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        public_ip: "127.0.0.1".parse().unwrap(),
+        relay_ports: (50000, 50100),
+        shared_secret: secret.clone(),
+    })
+    .await
+    .unwrap();
+    if relay_only {
+        auth = auth.with_turn(TurnMinter::for_relay(relay.local_addr, secret));
+    }
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/ws", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -48,8 +74,11 @@ async fn run() {
     let host_id = HostId::new();
     let key = HostKey::generate().unwrap();
     let cert = ca.issue_host_cert(host_id, &key).unwrap();
-
-    let mut host_sig = SignalingClient::connect_host(
+    let opts = PeerOptions {
+        udp_addrs: vec![LOOPBACK.into()],
+        relay_only,
+    };
+    let host_sig = SignalingClient::connect_host(
         &url,
         HostCredentials {
             server_id: SERVER_ID,
@@ -60,110 +89,54 @@ async fn run() {
     )
     .await
     .unwrap();
-    let mut viewer_sig = SignalingClient::connect_operator(&url, "tok")
+    let viewer_sig = SignalingClient::connect_operator(&url, "tok")
         .await
         .unwrap();
-
-    // Host side: answer an offer, then echo Ping -> Pong on whatever channel opens.
-    let host_task = tokio::spawn(async move {
-        let ServerMessage::IncomingSession { session_id, .. } = host_sig.recv().await.unwrap()
-        else {
-            panic!("host: expected incoming session")
-        };
-        let ServerMessage::Signal {
-            payload:
-                SignalPayload::Sdp {
-                    sdp_type: SdpType::Offer,
-                    sdp,
-                },
-            ..
-        } = host_sig.recv().await.unwrap()
-        else {
-            panic!("host: expected offer")
-        };
-        let mut peer = Peer::new(&host_sig.ice_servers, vec![LOOPBACK.into()])
-            .await
-            .unwrap();
-        let answer = peer.answer(sdp).await.unwrap();
-        host_sig
-            .send(&ClientMessage::Signal {
-                session_id,
-                payload: answer,
-            })
-            .await
-            .unwrap();
-
-        let dc = loop {
-            if let Some(PeerEvent::DataChannel(dc)) = peer.events.recv().await {
-                break dc;
-            }
-        };
-        assert_eq!(
-            dc.protocol().await.unwrap(),
-            DATA_CHANNEL_PROTOCOL,
-            "host must check the data protocol"
+    if relay_only {
+        assert!(
+            viewer_sig
+                .ice_servers
+                .iter()
+                .any(|s| s.credential.is_some()),
+            "Welcome must carry TURN credentials"
         );
-        while let Some(ev) = dc.poll().await {
-            if let DataChannelEvent::OnMessage(msg) = ev {
-                let DataMessage::Control(Control::Ping(n)) =
-                    DataMessage::decode(&msg.data).unwrap()
-                else {
-                    panic!("host: expected ping")
-                };
-                let pong = DataMessage::Control(Control::Pong(n)).encode().unwrap();
-                dc.send(BytesMut::from(&pong[..])).await.unwrap();
-                break;
+    }
+
+    // Host: echo Ping -> Pong on every channel, after checking its protocol.
+    let echo: ChannelHandler = Arc::new(|dc, policy| {
+        assert!(policy.clipboard);
+        tokio::spawn(async move {
+            assert_eq!(
+                dc.protocol().await.unwrap(),
+                DATA_CHANNEL_PROTOCOL,
+                "host must check the data protocol"
+            );
+            while let Some(ev) = dc.poll().await {
+                if let DataChannelEvent::OnMessage(msg) = ev
+                    && let Ok(DataMessage::Control(Control::Ping(n))) =
+                        DataMessage::decode(&msg.data)
+                {
+                    let pong = DataMessage::Control(Control::Pong(n)).encode().unwrap();
+                    dc.send(BytesMut::from(&pong[..])).await.unwrap();
+                }
             }
-        }
-        peer // keep the connection alive until the viewer has its reply
+        });
     });
+    let host_task = tokio::spawn(run_host(host_sig, opts.clone(), echo));
 
-    // Viewer side: request a session, offer with a data channel, ping, expect pong.
-    viewer_sig
-        .send(&ClientMessage::RequestSession { host_id })
+    let started = Instant::now();
+    let session = open_viewer_session(viewer_sig, host_id, opts)
         .await
         .unwrap();
-    let ServerMessage::SessionReady { session_id } = viewer_sig.recv().await.unwrap() else {
-        panic!("viewer: expected session ready")
-    };
-    let mut peer = Peer::new(&viewer_sig.ice_servers, vec![LOOPBACK.into()])
-        .await
-        .unwrap();
-    let init = RTCDataChannelInit {
-        ordered: true,
-        protocol: DATA_CHANNEL_PROTOCOL.into(),
-        ..Default::default()
-    };
-    let dc = peer
-        .pc
-        .create_data_channel("rconn", Some(init))
-        .await
-        .unwrap();
-    let offer = peer.offer().await.unwrap();
-    viewer_sig
-        .send(&ClientMessage::Signal {
-            session_id,
-            payload: offer,
-        })
-        .await
-        .unwrap();
-    let ServerMessage::Signal {
-        payload:
-            SignalPayload::Sdp {
-                sdp_type: SdpType::Answer,
-                sdp,
-            },
-        ..
-    } = viewer_sig.recv().await.unwrap()
-    else {
-        panic!("viewer: expected answer")
-    };
-    peer.accept_answer(sdp).await.unwrap();
-
+    let dc = session.data.clone();
     let mut got_pong = false;
     while let Some(ev) = dc.poll().await {
         match ev {
             DataChannelEvent::OnOpen => {
+                eprintln!(
+                    "relay_only={relay_only}: channel open after {:?}",
+                    started.elapsed()
+                );
                 let ping = DataMessage::Control(Control::Ping(42)).encode().unwrap();
                 dc.send(BytesMut::from(&ping[..])).await.unwrap();
             }
@@ -179,7 +152,20 @@ async fn run() {
         }
     }
     assert!(got_pong, "viewer never received the pong");
-    let host_peer = host_task.await.unwrap();
-    let _ = peer.pc.close().await;
-    let _ = host_peer.pc.close().await;
+    // Trickle ICE: no gathering wait, so the direct path opens fast. The relayed path is
+    // slower (~6 s): webrtc-rs drops early STUN on the relayed socket ("unhandled STUN
+    // packet") and recovers by retransmission. Tracked in PLAN.md; budget it, don't hide it.
+    let budget = if relay_only {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(3)
+    };
+    assert!(
+        started.elapsed() < budget,
+        "slow connect: {:?} (budget {budget:?})",
+        started.elapsed()
+    );
+    session.close().await;
+    host_task.abort();
+    let _ = relay.close().await;
 }

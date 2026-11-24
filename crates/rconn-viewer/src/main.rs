@@ -5,14 +5,12 @@ use anyhow::{Result, bail};
 use bytes::BytesMut;
 use clap::{Parser, Subcommand};
 use rconn_core::ids::HostId;
-use rconn_core::protocol::{
-    ClientMessage, Control, DATA_CHANNEL_PROTOCOL, DataMessage, SdpType, ServerMessage,
-    SignalPayload,
-};
-use rconn_peer::rtc::{Peer, PeerEvent};
+use rconn_core::protocol::{Control, DataMessage};
+use rconn_peer::rtc::PeerOptions;
+use rconn_peer::session::open_viewer_session;
 use rconn_peer::signaling::SignalingClient;
 use std::time::{Duration, Instant};
-use webrtc::data_channel::{DataChannelEvent, RTCDataChannelInit};
+use webrtc::data_channel::DataChannelEvent;
 
 #[derive(Parser)]
 #[command(version, about = "rconn viewer")]
@@ -34,6 +32,9 @@ enum Cmd {
         count: u32,
         #[arg(long, default_value = "0.0.0.0:0")]
         udp: Vec<String>,
+        /// Force the TURN relay path.
+        #[arg(long)]
+        relay_only: bool,
     },
 }
 
@@ -46,56 +47,45 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Ping { host, count, udp } => {
-            ping(&cli.server, &cli.token, HostId(host), count, udp).await
+        Cmd::Ping {
+            host,
+            count,
+            udp,
+            relay_only,
+        } => {
+            ping(
+                &cli.server,
+                &cli.token,
+                HostId(host),
+                count,
+                udp,
+                relay_only,
+            )
+            .await
         }
     }
 }
 
-async fn ping(server: &str, token: &str, host: HostId, count: u32, udp: Vec<String>) -> Result<()> {
+async fn ping(
+    server: &str,
+    token: &str,
+    host: HostId,
+    count: u32,
+    udp: Vec<String>,
+    relay_only: bool,
+) -> Result<()> {
     let t0 = Instant::now();
-    let mut sig = SignalingClient::connect_operator(server, token).await?;
-    sig.send(&ClientMessage::RequestSession { host_id: host })
-        .await?;
-    let session_id = match sig.recv().await? {
-        ServerMessage::SessionReady { session_id } => session_id,
-        ServerMessage::Error { code, message } => bail!("session refused: {code:?}: {message}"),
-        other => bail!("unexpected: {other:?}"),
-    };
-
-    let mut peer = Peer::new(&sig.ice_servers, udp).await?;
-    let init = RTCDataChannelInit {
-        ordered: true,
-        protocol: DATA_CHANNEL_PROTOCOL.into(),
-        ..Default::default()
-    };
-    let dc = peer.pc.create_data_channel("rconn", Some(init)).await?;
-    let offer = peer.offer().await?;
-    sig.send(&ClientMessage::Signal {
-        session_id,
-        payload: offer,
-    })
+    let sig = SignalingClient::connect_operator(server, token).await?;
+    let session = open_viewer_session(
+        sig,
+        host,
+        PeerOptions {
+            udp_addrs: udp,
+            relay_only,
+        },
+    )
     .await?;
-    let ServerMessage::Signal {
-        payload:
-            SignalPayload::Sdp {
-                sdp_type: SdpType::Answer,
-                sdp,
-            },
-        ..
-    } = sig.recv().await?
-    else {
-        bail!("expected answer");
-    };
-    peer.accept_answer(sdp).await?;
-    tokio::spawn(async move {
-        while let Some(ev) = peer.events.recv().await {
-            if let PeerEvent::State(s) = ev {
-                tracing::info!(state = %s, "peer connection");
-            }
-        }
-    });
-
+    let dc = session.data.clone();
     let mut rtts = Vec::new();
     let mut sent_at = Instant::now();
     let mut seq = 0u64;
@@ -134,7 +124,7 @@ async fn ping(server: &str, token: &str, host: HostId, count: u32, udp: Vec<Stri
         Ok(r) => r?,
         Err(_) => bail!("timed out after {} of {count} pongs", rtts.len()),
     }
-    let _ = sig.send(&ClientMessage::EndSession { session_id }).await;
+    session.close().await;
 
     rtts.sort();
     let ms = |d: Duration| d.as_secs_f64() * 1e3;

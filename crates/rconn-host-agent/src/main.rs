@@ -2,16 +2,14 @@
 //! sessions, and serves the data channel. Capture, input and audio attach here in
 //! phases 3, 4 and 7; today the data channel answers `Ping` with `Pong`.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use bytes::BytesMut;
 use clap::Parser;
 use rconn_core::fleet::HostKey;
-use rconn_core::ids::{HostId, SessionId};
-use rconn_core::protocol::{
-    ClientMessage, Control, DATA_CHANNEL_PROTOCOL, DataMessage, SdpType, ServerMessage,
-    SignalPayload,
-};
-use rconn_peer::rtc::{Peer, PeerEvent};
+use rconn_core::ids::HostId;
+use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage};
+use rconn_peer::rtc::PeerOptions;
+use rconn_peer::session::{ChannelHandler, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
 use std::fs;
 use std::path::PathBuf;
@@ -72,7 +70,14 @@ async fn main() -> Result<()> {
             Ok(sig) => {
                 backoff = Duration::from_secs(1);
                 tracing::info!("connected to signaling");
-                if let Err(e) = run(sig, &cli.udp).await {
+                let opts = PeerOptions {
+                    udp_addrs: cli.udp.clone(),
+                    relay_only: false,
+                };
+                let handler: ChannelHandler = Arc::new(|dc, _policy| {
+                    tokio::spawn(serve_channel(dc));
+                });
+                if let Err(e) = run_host(sig, opts, handler).await {
                     tracing::warn!(error = %e, "signaling session ended");
                 }
             }
@@ -81,78 +86,6 @@ async fn main() -> Result<()> {
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
-}
-
-async fn run(mut sig: SignalingClient, udp: &[String]) -> Result<()> {
-    // One session at a time in v1; a new IncomingSession replaces the previous peer.
-    let mut current: Option<(SessionId, Peer)> = None;
-    loop {
-        match sig.recv().await? {
-            ServerMessage::IncomingSession {
-                session_id,
-                operator_id,
-                policy,
-            } => {
-                tracing::info!(%session_id, %operator_id, ?policy, "incoming session");
-                if let Some((_, old)) = current.take() {
-                    let _ = old.pc.close().await;
-                }
-                let ServerMessage::Signal {
-                    payload:
-                        SignalPayload::Sdp {
-                            sdp_type: SdpType::Offer,
-                            sdp,
-                        },
-                    ..
-                } = sig.recv().await?
-                else {
-                    bail!("expected offer after IncomingSession");
-                };
-                let mut peer = Peer::new(&sig.ice_servers, udp.to_vec()).await?;
-                let answer = peer.answer(sdp).await?;
-                sig.send(&ClientMessage::Signal {
-                    session_id,
-                    payload: answer,
-                })
-                .await?;
-                current = Some((session_id, peer));
-                if let Some((_, peer)) = current.as_mut() {
-                    spawn_channel_watch(peer);
-                }
-            }
-            ServerMessage::SessionEnded { session_id, reason } => {
-                tracing::info!(%session_id, ?reason, "session ended");
-                if current.as_ref().is_some_and(|(id, _)| *id == session_id)
-                    && let Some((_, peer)) = current.take() {
-                        let _ = peer.pc.close().await;
-                    }
-            }
-            other => tracing::debug!(?other, "ignored signaling message"),
-        }
-    }
-}
-
-/// Hand each data channel the remote opens to its own task.
-fn spawn_channel_watch(peer: &mut Peer) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    // Move event draining off the signaling loop: forward channels as they appear.
-    let mut events = std::mem::replace(&mut peer.events, tokio::sync::mpsc::unbounded_channel().1);
-    tokio::spawn(async move {
-        while let Some(ev) = events.recv().await {
-            match ev {
-                PeerEvent::DataChannel(dc) => {
-                    let _ = tx.send(dc);
-                }
-                PeerEvent::State(s) => tracing::info!(state = %s, "peer connection"),
-                PeerEvent::GatheringComplete => {}
-            }
-        }
-    });
-    tokio::spawn(async move {
-        while let Some(dc) = rx.recv().await {
-            tokio::spawn(serve_channel(dc));
-        }
-    });
 }
 
 async fn serve_channel(dc: Arc<dyn DataChannel>) {

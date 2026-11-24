@@ -1,0 +1,28 @@
+# Self-hosted rconn on one Linux VM.
+#
+#   1. export RCONN_SERVER_ID=wss://rconn.example.com/v1/ws RCONN_TURN_PUBLIC_IP=<vm public ip>
+#   2. docker compose run --rm signaling init
+#   3. docker compose run --rm signaling add-operator          # prints a token once
+#   4. docker compose run --rm -v ./host1:/out signaling enroll-host --out /out
+#   5. docker compose up -d
+#
+# Host networking: TURN needs its UDP relay ports reachable on the VM's own address.
+# Put a TLS reverse proxy (Caddy, a cloud load balancer, Cloudflare) in front of 8080
+# so clients connect with wss://.
+services:
+  signaling:
+    image: ghcr.io/rconn/signaling:latest
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      RCONN_SERVER_ID: ${RCONN_SERVER_ID:?set RCONN_SERVER_ID to the wss:// URL hosts use}
+      RCONN_TURN_PUBLIC_IP: ${RCONN_TURN_PUBLIC_IP:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - rconn-data:/data
+
+volumes:
+  rconn-data:

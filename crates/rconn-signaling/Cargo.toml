@@ -24,6 +24,8 @@ figment = { workspace = true, features = ["toml", "env"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 uuid.workspace = true
+turn = "0.17"
+util = { version = "0.17", package = "webrtc-util" }
 
 [lints]
 workspace = true

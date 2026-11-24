@@ -3,6 +3,7 @@
 //! accounts/passkey/OIDC store lands; tokens are compared by SHA-256 digest.
 
 use crate::auth::{AuthError, Authenticator, HostIdentity, HostProofInput, OperatorIdentity};
+use crate::turn_relay::TurnMinter;
 use async_trait::async_trait;
 use rconn_core::fleet::{self, FleetError};
 use rconn_core::ids::{HostId, OrgId};
@@ -19,6 +20,7 @@ pub struct FleetAuthenticator {
     revoked: RwLock<HashSet<HostId>>,
     operator_tokens: HashMap<[u8; 32], OperatorIdentity>,
     ice_servers: Vec<IceServer>,
+    turn: Option<TurnMinter>,
     policy: SessionPolicy,
 }
 
@@ -30,6 +32,7 @@ impl FleetAuthenticator {
             revoked: RwLock::default(),
             operator_tokens: HashMap::new(),
             ice_servers: Vec::new(),
+            turn: None,
             policy: SessionPolicy {
                 show_indicator: false,
                 clipboard: true,
@@ -59,6 +62,12 @@ impl FleetAuthenticator {
 
     pub fn with_ice_servers(mut self, servers: Vec<IceServer>) -> Self {
         self.ice_servers = servers;
+        self
+    }
+
+    /// Mint TURN credentials into every `Welcome`.
+    pub fn with_turn(mut self, minter: TurnMinter) -> Self {
+        self.turn = Some(minter);
         self
     }
 
@@ -119,7 +128,11 @@ impl Authenticator for FleetAuthenticator {
     }
 
     async fn ice_servers(&self, _org: OrgId) -> Vec<IceServer> {
-        self.ice_servers.clone()
+        let mut servers = self.ice_servers.clone();
+        if let Some(turn) = &self.turn {
+            servers.extend(turn.mint());
+        }
+        servers
     }
 
     async fn session_policy(&self, _host: HostIdentity) -> SessionPolicy {

@@ -109,6 +109,56 @@ impl SignalingClient {
     }
 }
 
+/// Cloneable sending half of a split [`SignalingClient`].
+#[derive(Clone)]
+pub struct SignalingTx(tokio::sync::mpsc::UnboundedSender<ClientMessage>);
+
+impl SignalingTx {
+    pub fn send(&self, msg: ClientMessage) -> Result<()> {
+        self.0
+            .send(msg)
+            .map_err(|_| anyhow::anyhow!("signaling connection closed"))
+    }
+}
+
+impl SignalingClient {
+    /// Hand the socket to a background task. Returns a cloneable sender and the stream of
+    /// server messages (unknown ones already dropped). The stream ends when the socket does.
+    pub fn split(
+        self,
+    ) -> (
+        SignalingTx,
+        tokio::sync::mpsc::UnboundedReceiver<ServerMessage>,
+    ) {
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
+        let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+        let (mut sink, mut stream) = self.ws.split();
+        tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                let Ok(text) = msg.to_json() else { continue };
+                if sink.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = stream.next().await {
+                let Message::Text(t) = frame else { continue };
+                match ServerMessage::from_json(&t) {
+                    Ok(ServerMessage::Unknown) => {}
+                    Ok(m) => {
+                        if in_tx.send(m).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "bad server message"),
+                }
+            }
+        });
+        (SignalingTx(out_tx), in_rx)
+    }
+}
+
 fn random_nonce() -> [u8; CHALLENGE_LEN] {
     // Two v4 UUIDs = 32 bytes from the OS RNG (uuid uses getrandom).
     let mut n = [0u8; CHALLENGE_LEN];
