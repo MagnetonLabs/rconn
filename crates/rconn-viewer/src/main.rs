@@ -60,6 +60,10 @@ enum Cmd {
         seconds: u64,
         #[arg(long)]
         snapshot: Option<std::path::PathBuf>,
+        /// Test aid: tap one key `SECONDS:HID` (HID usage, hex ok) after connecting,
+        /// e.g. `5:0x29` for Escape.
+        #[arg(long, value_parser = parse_tap)]
+        tap_key: Option<(u64, u16)>,
         /// Cisco openh264 library. Default: next to this executable, else target/openh264.
         #[arg(long, env = "RCONN_OPENH264")]
         openh264: Option<std::path::PathBuf>,
@@ -107,6 +111,7 @@ async fn main() -> Result<()> {
             host,
             seconds,
             snapshot,
+            tap_key,
             openh264,
             udp,
             relay_only,
@@ -127,6 +132,7 @@ async fn main() -> Result<()> {
                     udp_addrs: udp.clone(),
                     relay_only: *relay_only,
                 },
+                *tap_key,
             )
             .await
         }
@@ -371,4 +377,13 @@ fn default_openh264() -> Result<std::path::PathBuf> {
     }
     rconn_media::cisco::local_binary_path()
         .ok_or_else(|| anyhow::anyhow!("openh264 not found; pass --openh264"))
+}
+
+fn parse_tap(s: &str) -> Result<(u64, u16), String> {
+    let (secs, hid) = s.split_once(':').ok_or("expected SECONDS:HID")?;
+    let hid = hid.trim_start_matches("0x");
+    Ok((
+        secs.parse().map_err(|e| format!("{e}"))?,
+        u16::from_str_radix(hid, 16).map_err(|e| format!("{e}"))?,
+    ))
 }

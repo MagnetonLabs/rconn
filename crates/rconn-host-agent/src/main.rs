@@ -100,9 +100,7 @@ impl Cli {
             .join(name))
     }
 
-    fn capturer_factory(
-        &self,
-    ) -> Result<impl FnOnce() -> Result<Box<dyn Capturer>> + Send + 'static> {
+    fn capturer_factory(&self) -> Result<stream::CapturerFactory> {
         let pattern = match &self.test_pattern {
             Some(s) => {
                 let (w, h) = s
@@ -113,12 +111,12 @@ impl Cli {
             None => None,
         };
         let fps = self.max_fps;
-        Ok(move || -> Result<Box<dyn Capturer>> {
+        Ok(Arc::new(move || -> Result<Box<dyn Capturer>> {
             Ok(match pattern {
                 Some((w, h)) => Box::new(TestPattern::new(w, h, fps)),
                 None => rconn_media::capture::primary_display()?,
             })
-        })
+        }))
     }
 }
 

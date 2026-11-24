@@ -71,6 +71,9 @@ unsafe impl Send for DxgiCapturer {}
 impl DxgiCapturer {
     /// Capture output `index` (0 = primary) of the first adapter that has it.
     pub fn new(index: u32) -> Result<Self, CaptureError> {
+        // Bind this (fresh) thread to the active desktop before any D3D object exists:
+        // afterwards the thread may own hidden windows and can no longer switch.
+        follow_input_desktop()?;
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(backend)?;
             let mut a = 0;
@@ -114,7 +117,9 @@ impl DxgiCapturer {
 
     fn duplication(&mut self) -> Result<&IDXGIOutputDuplication, CaptureError> {
         if self.dup.is_none() {
-            follow_input_desktop()?;
+            if let Err(e) = follow_input_desktop() {
+                tracing::debug!(error = %e, "re-attach to input desktop failed; trying duplication anyway");
+            }
             // Fails with E_ACCESSDENIED outside an interactive desktop (session 0, or the
             // secure desktop until phase 5's desktop switching).
             self.dup = Some(unsafe { self.output.DuplicateOutput(&self.device) }.map_err(backend)?);

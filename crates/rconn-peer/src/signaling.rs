@@ -184,6 +184,9 @@ impl SignalingClient {
     }
 }
 
+/// How often an idle signaling connection pings the server.
+pub const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Cloneable sending half of a split [`SignalingClient`].
 #[derive(Clone)]
 pub struct SignalingTx(tokio::sync::mpsc::UnboundedSender<ClientMessage>);
@@ -207,28 +210,47 @@ impl SignalingClient {
     ) {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
         let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
-        let (mut sink, mut stream) = self.ws.split();
+        let mut ws = self.ws;
+        // One task owns both directions: if either fails, the whole connection ends (both
+        // channels close together), so callers notice immediately and reconnect, instead of
+        // a dead writer surfacing only at the next send. Pings keep NAT mappings alive and
+        // detect silently dead connections.
         tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                let Ok(text) = msg.to_json() else { continue };
-                if sink.send(Message::Text(text.into())).await.is_err() {
-                    break;
-                }
-            }
-        });
-        tokio::spawn(async move {
-            while let Some(Ok(frame)) = stream.next().await {
-                let Message::Text(t) = frame else { continue };
-                match ServerMessage::from_json(&t) {
-                    Ok(ServerMessage::Unknown) => {}
-                    Ok(m) => {
-                        if in_tx.send(m).is_err() {
-                            break;
+            let mut ping = tokio::time::interval(KEEPALIVE);
+            ping.tick().await; // first tick is immediate
+            let reason: String = loop {
+                tokio::select! {
+                    out = out_rx.recv() => {
+                        let Some(msg) = out else { break "client closed".into() };
+                        let Ok(text) = msg.to_json() else { continue };
+                        if let Err(e) = ws.send(Message::Text(text.into())).await {
+                            break format!("send failed: {e}");
                         }
                     }
-                    Err(e) => tracing::warn!(error = %e, "bad server message"),
+                    frame = ws.next() => match frame {
+                        Some(Ok(Message::Text(t))) => match ServerMessage::from_json(&t) {
+                            Ok(ServerMessage::Unknown) => {}
+                            Ok(m) => {
+                                if in_tx.send(m).is_err() {
+                                    break "receiver dropped".into();
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "bad server message"),
+                        },
+                        Some(Ok(Message::Close(c))) => break format!("server closed: {c:?}"),
+                        Some(Ok(_)) => {} // ping/pong/binary
+                        Some(Err(e)) => break format!("receive failed: {e}"),
+                        None => break "connection ended".into(),
+                    },
+                    _ = ping.tick() => {
+                        if let Err(e) = ws.send(Message::Ping(Vec::new().into())).await {
+                            break format!("keepalive failed: {e}");
+                        }
+                    }
                 }
-            }
+            };
+            tracing::info!(%reason, "signaling connection closed");
+            let _ = ws.close(None).await;
         });
         (SignalingTx(out_tx), in_rx)
     }

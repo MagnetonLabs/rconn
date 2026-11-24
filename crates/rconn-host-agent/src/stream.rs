@@ -31,7 +31,7 @@ impl KeyframeRequests {
 
 /// Stream until the video track stops accepting writes or `stop` is set.
 pub async fn run(
-    make_capturer: impl FnOnce() -> Result<Box<dyn Capturer>> + Send + 'static,
+    make_capturer: CapturerFactory,
     video: VideoSender,
     target: TargetBitrate,
     keyframes: KeyframeRequests,
@@ -41,37 +41,37 @@ pub async fn run(
     let (tx, mut rx) = watch::channel::<Option<Arc<Frame>>>(None);
     let frame_budget = Duration::from_secs(1) / cfg.max_fps.max(1);
 
-    // Capture runs on its own OS thread: DXGI calls block for up to their timeout.
+    // Capture supervisor. Each capturer "generation" lives on a fresh OS thread: after a
+    // desktop switch (lock screen, UAC, login) the old D3D device and the thread's desktop
+    // binding are stale, and a thread that has created D3D objects can't reliably move to
+    // another desktop. So on any capture error the generation ends and a new one starts.
     let cap_stop = stop.clone();
     let max_size = cfg.max_size;
+    let tx = Arc::new(tx);
     let capture = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut capturer = make_capturer()?;
-        let mut last_frame_at = Instant::now();
-        let mut warned = false;
+        let mut backoff = Duration::from_millis(250);
+        let mut generation = 0u32;
         while !cap_stop.load(Ordering::Relaxed) {
-            match capturer.next_frame(frame_budget) {
-                Ok(Some(f)) => {
-                    let f = f.fit_within(max_size.0, max_size.1);
-                    last_frame_at = Instant::now();
-                    warned = false;
-                    if tx.send(Some(Arc::new(f))).is_err() {
-                        break;
-                    }
+            generation += 1;
+            let (factory, stop, gen_tx) = (make_capturer.clone(), cap_stop.clone(), tx.clone());
+            let worker = std::thread::Builder::new()
+                .name(format!("rconn-capture-{generation}"))
+                .spawn(move || {
+                    capture_generation(&*factory, &stop, &gen_tx, frame_budget, max_size)
+                })?;
+            match worker.join() {
+                Ok(Ok(true)) => backoff = Duration::from_millis(250), // produced frames before failing
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %format!("{e:#}"), generation, "capture restarting")
                 }
-                Ok(None) => {
-                    // An idle desktop is normal; never getting a first frame is not.
-                    if !warned && last_frame_at.elapsed() > Duration::from_secs(5) {
-                        warned = true;
-                        tracing::warn!(
-                            "no screen update for 5 s (idle desktop, or no access to the interactive desktop)"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "capture failed");
-                    return Err(e.into());
-                }
+                Err(_) => tracing::error!(generation, "capture thread panicked; restarting"),
             }
+            if cap_stop.load(Ordering::Relaxed) || tx.receiver_count() == 0 {
+                break;
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_secs(2));
         }
         Ok(())
     });
@@ -149,6 +149,55 @@ pub async fn run(
     stop.store(true, Ordering::Relaxed);
     let _ = capture.await;
     Ok(())
+}
+
+/// Builds a capturer; called again for every capture generation.
+pub type CapturerFactory = Arc<dyn Fn() -> Result<Box<dyn Capturer>> + Send + Sync>;
+
+/// One capturer's lifetime. Returns `Ok(true)` if it produced frames before ending
+/// (so the supervisor resets its backoff), or the error that ended it.
+fn capture_generation(
+    make: &(dyn Fn() -> Result<Box<dyn Capturer>> + Send + Sync),
+    stop: &AtomicBool,
+    tx: &watch::Sender<Option<Arc<Frame>>>,
+    frame_budget: Duration,
+    max_size: (usize, usize),
+) -> Result<bool> {
+    let mut capturer = make()?;
+    let mut produced = false;
+    let mut last_frame_at = Instant::now();
+    let mut warned = false;
+    while !stop.load(Ordering::Relaxed) {
+        match capturer.next_frame(frame_budget) {
+            Ok(Some(f)) => {
+                produced = true;
+                last_frame_at = Instant::now();
+                warned = false;
+                if tx
+                    .send(Some(Arc::new(f.fit_within(max_size.0, max_size.1))))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(None) => {
+                // An idle desktop is normal; never getting a first frame is not.
+                if !warned && last_frame_at.elapsed() > Duration::from_secs(5) {
+                    warned = true;
+                    tracing::warn!(
+                        "no screen update for 5 s (idle desktop, or no access to the interactive desktop)"
+                    );
+                }
+            }
+            Err(e) if produced => {
+                // A capturer that worked and then failed: typically a desktop switch.
+                tracing::info!(error = %e, "capture lost (desktop switch?); restarting");
+                return Ok(true);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(produced)
 }
 
 #[derive(Default)]

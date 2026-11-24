@@ -25,6 +25,7 @@ pub async fn run(
     snapshot: Option<PathBuf>,
     openh264: &Path,
     opts: PeerOptions,
+    tap_key: Option<(u64, u16)>,
 ) -> Result<()> {
     let t0 = Instant::now();
     let sig = SignalingClient::connect_operator(server, trust, token).await?;
@@ -34,6 +35,23 @@ pub async fn run(
     // sent before our decoder existed).
     let dc = session.data.clone();
     let (kf_tx, mut kf_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // Test aid: tap one key (HID usage) N seconds after the channel opens.
+    if let Some((after, hid_usage)) = tap_key {
+        let dc = session.data.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(after)).await;
+            for pressed in [true, false] {
+                if let Ok(b) =
+                    DataMessage::Input(rconn_core::protocol::InputEvent::Key { hid_usage, pressed })
+                        .encode()
+                {
+                    let _ = dc.send(BytesMut::from(&b[..])).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            println!("tapped key {hid_usage:#04x} at +{after} s");
+        });
+    }
     let dc_task = tokio::spawn(async move {
         let send_kf = |dc: std::sync::Arc<dyn webrtc::data_channel::DataChannel>| async move {
             if let Ok(b) = DataMessage::Control(Control::RequestKeyframe).encode() {
