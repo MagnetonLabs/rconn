@@ -122,11 +122,10 @@ async fn run(mut sig: SignalingClient, udp: &[String]) -> Result<()> {
             }
             ServerMessage::SessionEnded { session_id, reason } => {
                 tracing::info!(%session_id, ?reason, "session ended");
-                if current.as_ref().is_some_and(|(id, _)| *id == session_id) {
-                    if let Some((_, peer)) = current.take() {
+                if current.as_ref().is_some_and(|(id, _)| *id == session_id)
+                    && let Some((_, peer)) = current.take() {
                         let _ = peer.pc.close().await;
                     }
-                }
             }
             other => tracing::debug!(?other, "ignored signaling message"),
         }
