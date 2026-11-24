@@ -9,7 +9,7 @@ use rconn_core::fleet::HostKey;
 use rconn_core::ids::HostId;
 use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage};
 use rconn_peer::rtc::PeerOptions;
-use rconn_peer::session::{ChannelHandler, run_host};
+use rconn_peer::session::{HostSession, SessionHandler, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
 use rconn_peer::trust::ServerTrust;
 use std::fs;
@@ -80,8 +80,12 @@ async fn main() -> Result<()> {
                     udp_addrs: cli.udp.clone(),
                     relay_only: false,
                 };
-                let handler: ChannelHandler = Arc::new(|dc, _policy| {
-                    tokio::spawn(serve_channel(dc));
+                let handler: SessionHandler = Arc::new(|mut session: HostSession| {
+                    tokio::spawn(async move {
+                        while let Some(dc) = session.channels.recv().await {
+                            tokio::spawn(serve_channel(dc));
+                        }
+                    });
                 });
                 if let Err(e) = run_host(sig, opts, handler).await {
                     tracing::warn!(error = %e, "signaling session ended");

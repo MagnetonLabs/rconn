@@ -29,11 +29,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin, openh264: mac-arm64 }
           - { os: macos-latest, target: x86_64-apple-darwin, build_only: true }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc }
-          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, openh264: win64 }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, openh264: win-arm64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, openh264: linux64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +45,10 @@ jobs:
           tool: cargo-nextest
       - name: Build
         run: cargo build --workspace --release --target ${{ matrix.target }}
+      - name: Fetch Cisco openh264
+        if: ${{ !matrix.build_only }}
+        shell: bash
+        run: cargo fetch && scripts/fetch-openh264.sh ${{ matrix.openh264 }}
       - name: Test
         if: ${{ !matrix.build_only }}
         run: cargo nextest run --workspace --target ${{ matrix.target }}

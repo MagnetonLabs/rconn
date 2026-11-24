@@ -7,7 +7,7 @@ use rconn_core::fleet::{FleetCa, HostKey};
 use rconn_core::ids::{HostId, OperatorId, OrgId};
 use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage};
 use rconn_peer::rtc::PeerOptions;
-use rconn_peer::session::{ChannelHandler, open_viewer_session, run_host};
+use rconn_peer::session::{HostSession, SessionHandler, open_viewer_session, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
 use rconn_peer::trust::ServerTrust;
 use rconn_signaling::auth::OperatorIdentity;
@@ -105,9 +105,12 @@ async fn run(relay_only: bool) {
     }
 
     // Host: echo Ping -> Pong on every channel, after checking its protocol.
-    let echo: ChannelHandler = Arc::new(|dc, policy| {
-        assert!(policy.clipboard);
+    let echo: SessionHandler = Arc::new(|mut session: HostSession| {
+        assert!(session.policy.clipboard);
         tokio::spawn(async move {
+            let Some(dc) = session.channels.recv().await else {
+                return;
+            };
             assert_eq!(
                 dc.protocol().await.unwrap(),
                 DATA_CHANNEL_PROTOCOL,

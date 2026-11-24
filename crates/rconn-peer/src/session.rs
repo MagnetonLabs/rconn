@@ -1,18 +1,23 @@
 //! Session negotiation for both roles, over a split [`SignalingClient`].
 //!
-//! * Viewer: [`open_viewer_session`] requests a session, offers with a data channel, and
-//!   pumps the answer and trickled candidates in the background.
-//! * Host: [`run_host`] answers sessions forever, applying trickled candidates and handing
-//!   each data channel the viewer opens to a callback.
+//! * Viewer: [`open_viewer_session`] requests a session, offers a data channel plus a
+//!   recv-only video transceiver, and pumps the answer and trickled candidates.
+//! * Host: [`run_host`] answers sessions forever, attaching the screen track, applying
+//!   trickled candidates, and handing each session to a callback as a [`HostSession`].
 
 use crate::rtc::{CandidateSink, Peer, PeerEvent, PeerOptions, apply_remote};
 use crate::signaling::{SignalingClient, SignalingTx};
+use crate::video::{TargetBitrate, VideoSender};
 use anyhow::{Result, bail};
 use rconn_core::ids::{HostId, SessionId};
 use rconn_core::protocol::{
     ClientMessage, DATA_CHANNEL_PROTOCOL, SdpType, ServerMessage, SessionPolicy, SignalPayload,
 };
+use rtc::rtp_transceiver::RTCRtpTransceiverDirection;
+use rtc::rtp_transceiver::RTCRtpTransceiverInit;
+use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use webrtc::data_channel::{DataChannel, RTCDataChannelInit};
 use webrtc::peer_connection::RTCPeerConnectionState;
@@ -70,6 +75,15 @@ pub async fn open_viewer_session(
         ..Default::default()
     };
     let data = peer.pc.create_data_channel("rconn", Some(init)).await?;
+    peer.pc
+        .add_transceiver_from_kind(
+            RtpCodecKind::Video,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                ..Default::default()
+            }),
+        )
+        .await?;
     let offer = peer.offer().await?;
     tx.send(ClientMessage::Signal {
         session_id,
@@ -124,15 +138,29 @@ pub async fn open_viewer_session(
     })
 }
 
-/// Called for each data channel a viewer opens, with that session's policy.
-pub type ChannelHandler = Arc<dyn Fn(Arc<dyn DataChannel>, SessionPolicy) + Send + Sync>;
+/// One accepted session, as the host agent sees it.
+pub struct HostSession {
+    pub session_id: SessionId,
+    pub policy: SessionPolicy,
+    /// The screen track. Write encoded access units here.
+    pub video: VideoSender,
+    /// Congestion-control estimate to steer the encoder bitrate.
+    pub target_bitrate: TargetBitrate,
+    /// Data channels the viewer opens. Ends when the session closes.
+    pub channels: mpsc::UnboundedReceiver<Arc<dyn DataChannel>>,
+    /// Peer-connection states, ending with `Closed` or `Failed`.
+    pub states: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
+}
+
+/// Called once per accepted session. Spawn the session's work; return quickly.
+pub type SessionHandler = Arc<dyn Fn(HostSession) + Send + Sync>;
 
 /// Serve sessions until the signaling connection drops. One active session at a time:
 /// a new session replaces the previous one.
 pub async fn run_host(
     sig: SignalingClient,
     opts: PeerOptions,
-    on_channel: ChannelHandler,
+    on_session: SessionHandler,
 ) -> Result<()> {
     let ice = sig.ice_servers.clone();
     let (tx, mut rx) = sig.split();
@@ -177,7 +205,7 @@ pub async fn run_host(
                     opts.clone(),
                 )
                 .await?;
-                let answer = peer.answer(sdp).await?;
+                let (answer, video) = peer.answer_with_video(sdp).await?;
                 tx.send(ClientMessage::Signal {
                     session_id: sid,
                     payload: answer,
@@ -187,24 +215,37 @@ pub async fn run_host(
                         tracing::warn!(error = %e, "could not apply early candidate");
                     }
                 }
-                let mut events =
-                    std::mem::replace(&mut peer.events, tokio::sync::mpsc::unbounded_channel().1);
-                let handler = on_channel.clone();
+
+                let (ch_tx, channels) = mpsc::unbounded_channel();
+                let (st_tx, states) = mpsc::unbounded_channel();
+                let mut events = std::mem::replace(&mut peer.events, mpsc::unbounded_channel().1);
                 tokio::spawn(async move {
                     while let Some(ev) = events.recv().await {
                         match ev {
-                            PeerEvent::DataChannel(dc) => handler(dc, policy),
+                            PeerEvent::DataChannel(dc) => {
+                                let _ = ch_tx.send(dc);
+                            }
                             PeerEvent::State(s) => {
                                 tracing::info!(state = %s, "peer connection");
+                                let _ = st_tx.send(s);
                                 if matches!(
                                     s,
                                     RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed
                                 ) {
-                                    break;
+                                    break; // drops ch_tx/st_tx: the session's receivers end
                                 }
                             }
+                            PeerEvent::Track(_) => {} // hosts don't receive media in v1
                         }
                     }
+                });
+                on_session(HostSession {
+                    session_id: sid,
+                    policy,
+                    video,
+                    target_bitrate: peer.target_bitrate.clone(),
+                    channels,
+                    states,
                 });
                 current = Some((sid, peer));
             }

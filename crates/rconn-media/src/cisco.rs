@@ -32,6 +32,19 @@ pub fn current_download_url() -> Option<String> {
     current_binary_name().map(|n| format!("{CISCO_BASE_URL}/{n}.bz2"))
 }
 
+/// Where the Cisco binary lives for local runs and tests: `$RCONN_OPENH264`, else
+/// `target/openh264/<name>` as written by `scripts/fetch-openh264.sh`.
+pub fn local_binary_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("RCONN_OPENH264") {
+        return Some(p.into());
+    }
+    let name = current_binary_name()?;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/openh264")
+        .join(name);
+    Some(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
