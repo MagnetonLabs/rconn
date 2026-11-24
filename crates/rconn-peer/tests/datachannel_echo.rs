@@ -157,13 +157,12 @@ async fn run(relay_only: bool) {
         }
     }
     assert!(got_pong, "viewer never received the pong");
-    // Trickle ICE: no gathering wait, so the direct path opens fast. The relayed path is
-    // slower (~6 s): webrtc-rs drops early STUN on the relayed socket ("unhandled STUN
-    // packet") and recovers by retransmission. Tracked in PLAN.md; budget it, don't hide it.
+    // Budgets guard the vendored webrtc relay-driver fix (vendor/README.md): relayed
+    // setup took ~6.7 s here before it, ~2.9 s after; direct ~0.2 s.
     let budget = if relay_only {
-        Duration::from_secs(15)
+        Duration::from_secs(6)
     } else {
-        Duration::from_secs(3)
+        Duration::from_secs(2)
     };
     assert!(
         started.elapsed() < budget,

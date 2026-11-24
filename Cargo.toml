@@ -34,3 +34,7 @@ all = { level = "warn", priority = -1 }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# webrtc 0.21.1 with a relay-driver fix; see vendor/README.md.
+[patch.crates-io]
+webrtc = { path = "vendor/webrtc" }
