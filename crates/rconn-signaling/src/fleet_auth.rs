@@ -47,6 +47,16 @@ impl FleetAuthenticator {
         self
     }
 
+    /// Register an operator by the SHA-256 of its token (as stored on disk).
+    pub fn with_operator_token_digest(
+        mut self,
+        digest: [u8; 32],
+        identity: OperatorIdentity,
+    ) -> Self {
+        self.operator_tokens.insert(digest, identity);
+        self
+    }
+
     pub fn with_ice_servers(mut self, servers: Vec<IceServer>) -> Self {
         self.ice_servers = servers;
         self

@@ -12,6 +12,12 @@ rconn-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rconn-peer = { version = "0.1.0", path = "../rconn-peer" }
+tokio = { version = "1.54.1", features = ["full"] }
+clap = { version = "4.6.9", features = ["derive", "env"] }
+webrtc = "=0.21.1"
+bytes = "1.12.2"
+uuid.workspace = true
 
 [lints]
 workspace = true

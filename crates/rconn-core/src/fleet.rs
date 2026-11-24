@@ -77,8 +77,8 @@ impl HostKey {
 /// An org's certificate authority.
 pub struct FleetCa {
     org_id: OrgId,
-    params: CertificateParams,
-    key: KeyPair,
+    issuer: Issuer<'static, KeyPair>,
+    key_pem: String,
     cert_pem: String,
 }
 
@@ -98,11 +98,24 @@ impl FleetCa {
         params.not_before = now - time::Duration::minutes(5);
         params.not_after = now + time::Duration::days(3650);
         let cert_pem = params.self_signed(&key)?.pem();
+        let key_pem = key.serialize_pem();
         Ok(Self {
             org_id,
-            params,
-            key,
+            issuer: Issuer::new(params, key),
+            key_pem,
             cert_pem,
+        })
+    }
+
+    /// Reload a CA saved with [`cert_pem`](Self::cert_pem) and [`key_pem`](Self::key_pem).
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, FleetError> {
+        let org_id = claimed_org(cert_pem)?;
+        let issuer = Issuer::from_ca_cert_pem(cert_pem, KeyPair::from_pem(key_pem)?)?;
+        Ok(Self {
+            org_id,
+            issuer,
+            key_pem: key_pem.to_owned(),
+            cert_pem: cert_pem.to_owned(),
         })
     }
 
@@ -112,6 +125,11 @@ impl FleetCa {
 
     pub fn cert_pem(&self) -> &str {
         &self.cert_pem
+    }
+
+    /// The CA private key. Store it admin-only; anyone holding it can enroll hosts.
+    pub fn key_pem(&self) -> &str {
+        &self.key_pem
     }
 
     /// Issue a host certificate for `host_key`'s public half.
@@ -141,8 +159,7 @@ impl FleetCa {
         let now = OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::minutes(5);
         params.not_after = now + life;
-        let issuer = Issuer::from_params(&self.params, &self.key);
-        Ok(params.signed_by(&host_key.0, &issuer)?.pem())
+        Ok(params.signed_by(&host_key.0, &self.issuer)?.pem())
     }
 }
 
@@ -339,5 +356,16 @@ mod tests {
         let key = HostKey::generate().unwrap();
         let again = HostKey::from_pem(&key.to_pem()).unwrap();
         assert_eq!(key.to_pem(), again.to_pem());
+    }
+
+    #[test]
+    fn reloaded_ca_issues_certs_that_verify_against_the_original() {
+        let ca = FleetCa::generate(OrgId::new()).unwrap();
+        let again = FleetCa::from_pem(ca.cert_pem(), ca.key_pem()).unwrap();
+        assert_eq!(again.org_id(), ca.org_id());
+        let key = HostKey::generate().unwrap();
+        let id = HostId::new();
+        let cert = again.issue_host_cert(id, &key).unwrap();
+        assert_eq!(verify_host_cert(ca.cert_pem(), &cert).unwrap().host_id, id);
     }
 }

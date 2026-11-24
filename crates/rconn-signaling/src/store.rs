@@ -1,0 +1,148 @@
+//! File-backed state for a self-hosted server (single org).
+//!
+//! ```text
+//! <data-dir>/ca.pem          fleet CA certificate
+//! <data-dir>/ca.key.pem      fleet CA private key (0600)
+//! <data-dir>/operators.json  { "<sha256(token) hex>": "<operator id>" }
+//! <data-dir>/revoked.json    [ "<host id>", ... ]
+//! ```
+
+use anyhow::{Context, Result, bail};
+use rconn_core::fleet::FleetCa;
+use rconn_core::ids::{HostId, OperatorId};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub struct DataDir(PathBuf);
+
+impl DataDir {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+
+    fn p(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+
+    /// Create the org CA. Refuses to overwrite an existing one.
+    pub fn init(&self) -> Result<FleetCa> {
+        if self.p("ca.pem").exists() {
+            bail!("{} already holds a fleet CA", self.0.display());
+        }
+        fs::create_dir_all(&self.0).with_context(|| format!("creating {}", self.0.display()))?;
+        let ca = FleetCa::generate(rconn_core::ids::OrgId::new())?;
+        fs::write(self.p("ca.pem"), ca.cert_pem())?;
+        write_private(&self.p("ca.key.pem"), ca.key_pem())?;
+        fs::write(self.p("operators.json"), "{}")?;
+        fs::write(self.p("revoked.json"), "[]")?;
+        Ok(ca)
+    }
+
+    pub fn load_ca(&self) -> Result<FleetCa> {
+        let cert =
+            fs::read_to_string(self.p("ca.pem")).context("reading ca.pem (run `init` first?)")?;
+        let key = fs::read_to_string(self.p("ca.key.pem")).context("reading ca.key.pem")?;
+        Ok(FleetCa::from_pem(&cert, &key)?)
+    }
+
+    pub fn operators(&self) -> Result<BTreeMap<String, OperatorId>> {
+        read_json(&self.p("operators.json"))
+    }
+
+    /// Create an operator and return its one-time-visible token.
+    pub fn add_operator(&self) -> Result<(OperatorId, String)> {
+        let mut ops = self.operators()?;
+        let token = hex(&rand::random::<[u8; 32]>());
+        let id = OperatorId::new();
+        ops.insert(hex(&Sha256::digest(token.as_bytes())), id);
+        write_private(
+            &self.p("operators.json"),
+            &serde_json::to_string_pretty(&ops)?,
+        )?;
+        Ok((id, token))
+    }
+
+    pub fn revoked(&self) -> Result<Vec<HostId>> {
+        read_json(&self.p("revoked.json"))
+    }
+
+    pub fn revoke(&self, host: HostId) -> Result<()> {
+        let mut list = self.revoked()?;
+        if !list.contains(&host) {
+            list.push(host);
+        }
+        fs::write(self.p("revoked.json"), serde_json::to_string_pretty(&list)?)?;
+        Ok(())
+    }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Write a file readable only by its owner (on Unix; on Windows the data dir's ACL applies).
+pub fn write_private(path: &Path, contents: &str) -> Result<()> {
+    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn unhex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_then_reload_and_manage_operators_and_revocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataDir::new(dir.path());
+        let ca = store.init().unwrap();
+        assert!(
+            store.init().is_err(),
+            "init must not overwrite an existing CA"
+        );
+        assert_eq!(store.load_ca().unwrap().org_id(), ca.org_id());
+
+        let (id, token) = store.add_operator().unwrap();
+        let ops = store.operators().unwrap();
+        let digest = hex(&Sha256::digest(token.as_bytes()));
+        assert_eq!(ops.get(&digest), Some(&id));
+        assert!(
+            !ops.keys().any(|k| k == &token),
+            "plaintext token must not be stored"
+        );
+
+        let h = HostId::new();
+        store.revoke(h).unwrap();
+        store.revoke(h).unwrap();
+        assert_eq!(store.revoked().unwrap(), vec![h]);
+    }
+
+    #[test]
+    fn hex_round_trip() {
+        let b = [0xab_u8; 32];
+        assert_eq!(unhex32(&hex(&b)), Some(b));
+        assert_eq!(unhex32("zz"), None);
+    }
+}
