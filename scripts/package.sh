@@ -6,7 +6,7 @@ LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || true)"
 export PATH="$LLVM_PREFIX/bin:$PATH"
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 # Only remove what this script builds: dist/ also holds local server credentials.
-mkdir -p dist && rm -rf dist/rconn-windows-* dist/rconn-macos* dist/rconn-host-setup-* dist/rconn-*.dmg dist/SHA256SUMS
+mkdir -p dist && rm -rf dist/rconn-windows-* dist/rconn-macos* dist/rconn-host-setup-* dist/rconn-*.dmg dist/rconn_*.deb dist/SHA256SUMS
 
 for arch in x64 arm64; do
   case $arch in
@@ -39,5 +39,14 @@ cp deploy/README-package.txt "$stage/README.txt"
 (cd dist && zip -qr "rconn-macos-$VERSION.zip" rconn-macos)
 deploy/macos/make-dmg.sh "$stage" "$VERSION" "dist/Rconn-$VERSION.dmg" >/dev/null
 
-(cd dist && shasum -a 256 ./*.zip ./*.exe ./*.dmg > SHA256SUMS)
-ls -lh dist/*.zip dist/*.exe dist/*.dmg
+# Linux (Ubuntu 24.04+): built in the Docker image from deploy/linux/Dockerfile.build.
+if docker image inspect rconn-linux-build >/dev/null 2>&1; then
+  lib="$(scripts/fetch-openh264.sh linux-arm64)"
+  docker run --rm -v "$PWD":/src -v rconn-cargo:/usr/local/cargo/registry \
+    -v rconn-rustup:/usr/local/rustup -v rconn-linux-target:/target rconn-linux-build sh -c \
+    "cargo build -q --release -p rconn-app -p rconn-viewer -p rconn-host-agent &&
+     deploy/linux/make-deb.sh /target/release $lib $VERSION arm64 dist/rconn_${VERSION}_arm64.deb"
+fi
+
+(cd dist && shasum -a 256 ./*.zip ./*.exe ./*.dmg ./*.deb > SHA256SUMS)
+ls -lh dist/*.zip dist/*.exe dist/*.dmg dist/*.deb

@@ -3,13 +3,15 @@
 //! Injection runs on one dedicated OS thread per session. On Windows that thread attaches
 //! to the input desktop, so input reaches the lock screen and UAC prompts too (the agent
 //! runs as SYSTEM in the console session). On macOS it posts CGEvents at the HID tap,
-//! which needs the Accessibility permission. When the session ends, every key and button
+//! which needs the Accessibility permission. On Linux (X11) it sends XTest events. When the session ends, every key and button
 //! still held is released, so a dropped connection can't leave Ctrl stuck down.
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
 mod windows;
+#[cfg(target_os = "linux")]
+mod x11;
 
 /// Inject a pointer move and check the OS cursor followed. Windows only.
 pub fn selftest() -> anyhow::Result<String> {
@@ -129,7 +131,17 @@ fn platform_injector() -> Option<Box<dyn Injector>> {
     {
         Some(Box::new(macos::CgInjector::new()))
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        match x11::XTestInjector::new() {
+            Ok(inj) => Some(Box::new(inj)),
+            Err(e) => {
+                tracing::warn!(error = %e, "X11 input injection unavailable");
+                None
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         None
     }
