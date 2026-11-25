@@ -7,6 +7,7 @@
 //! * [`TestPattern`]: synthetic moving content, for pipelines without a desktop.
 
 use crate::video::Frame;
+use crate::yuv::I420;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -28,6 +29,55 @@ pub enum CaptureError {
 pub trait Capturer: Send {
     /// Wait up to `timeout` for a changed frame. `Ok(None)` means nothing changed.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError>;
+
+    /// Wait up to `timeout` for a change and apply it to `picture`, which holds the
+    /// previous picture this method produced (or `None`: it is allocated at the right
+    /// size, as it is after a size change). Frames larger than `max` are halved until
+    /// they fit. Backends that know which areas changed convert only those.
+    fn next_into(
+        &mut self,
+        timeout: Duration,
+        picture: &mut Option<I420>,
+        max: (usize, usize),
+    ) -> Result<Option<Captured>, CaptureError> {
+        let Some(frame) = self.next_frame(timeout)? else {
+            return Ok(None);
+        };
+        Ok(convert_whole(frame, picture, max))
+    }
+}
+
+/// What [`Capturer::next_into`] changed.
+#[derive(Clone, Copy, Debug)]
+pub struct Captured {
+    /// The even row range of `picture` that changed.
+    pub rows: (usize, usize),
+    /// Share of the picture's area that changed (0..=1; overlapping areas may add up).
+    pub changed: f32,
+    pub captured_at: Instant,
+}
+
+/// Convert a whole frame (halved to fit `max`) into `picture`.
+pub fn convert_whole(
+    frame: Frame,
+    picture: &mut Option<I420>,
+    max: (usize, usize),
+) -> Option<Captured> {
+    let frame = frame.fit_within(max.0, max.1);
+    let (w, h) = (frame.width & !1, frame.height & !1);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let pic = match picture {
+        Some(p) if p.dimensions() == (w, h) => p,
+        _ => picture.insert(I420::new(w, h)),
+    };
+    pic.fill_from_bgra(&frame.bgra, frame.width);
+    Some(Captured {
+        rows: (0, h),
+        changed: 1.0,
+        captured_at: frame.captured_at,
+    })
 }
 
 /// The platform's default capturer for the primary display.

@@ -373,7 +373,10 @@ async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests, cl
                     Ok(DataMessage::Control(Control::Ping(n))) => send(DataMessage::Control(Control::Pong(n))).await,
                     Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
                     Ok(DataMessage::Control(Control::Action(action))) => host_action(action),
-                    Ok(DataMessage::Input(ev)) => input.send(ev),
+                    Ok(DataMessage::Input(ev)) => {
+                        stream::note_input(); // someone is interacting: full frame rate
+                        input.send(ev)
+                    }
                     Ok(DataMessage::Clipboard(text)) => match &clip {
                         Some(c) => c.apply_remote(text),
                         None => tracing::debug!("clipboard disabled by policy; ignoring"),

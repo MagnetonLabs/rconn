@@ -142,17 +142,31 @@ impl I420 {
 
 /// Convert rows into one band of the Y/U/V planes (`y.len() / w` rows, even).
 fn convert_band(src: &[u8], src_width: usize, w: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
-    let stride = src_width * 4;
+    convert_rows(src, src_width * 4, w, 0..w, y, u, v);
+}
+
+/// Convert columns `xs` (even bounds) of rows into the Y/U/V planes. `src` starts at the
+/// first source row (`pitch` bytes per row); `y` starts at the matching picture row
+/// (`w` bytes per row, `y.len() / w` rows, even), `u`/`v` at the matching chroma row.
+fn convert_rows(
+    src: &[u8],
+    pitch: usize,
+    w: usize,
+    xs: std::ops::Range<usize>,
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+) {
     let luma = |b: i32, g: i32, r: i32| (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
     for pair in 0..y.len() / w / 2 {
-        let r0 = &src[(2 * pair) * stride..];
-        let r1 = &src[(2 * pair + 1) * stride..];
+        let r0 = &src[(2 * pair) * pitch..];
+        let r1 = &src[(2 * pair + 1) * pitch..];
         let (y0, y1) = y[2 * pair * w..(2 * pair + 2) * w].split_at_mut(w);
         let (ur, vr) = (
             &mut u[pair * (w / 2)..(pair + 1) * (w / 2)],
             &mut v[pair * (w / 2)..(pair + 1) * (w / 2)],
         );
-        for x in 0..w / 2 {
+        for x in xs.start / 2..xs.end / 2 {
             let px = |row: &[u8], i: usize| {
                 (
                     i32::from(row[4 * i]),
@@ -177,6 +191,103 @@ fn convert_band(src: &[u8], src_width: usize, w: usize, y: &mut [u8], u: &mut [u
             );
             ur[x] = (((-38 * rr - 74 * gg + 112 * bb + 128) >> 8) + 128) as u8;
             vr[x] = (((112 * rr - 94 * gg - 18 * bb + 128) >> 8) + 128) as u8;
+        }
+    }
+}
+
+/// A rectangle of changed pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+impl Rect {
+    /// Widened to even coordinates (4:2:0 chroma covers 2x2 pixels) and clipped to
+    /// `width` x `height` (both even). `None` if nothing is left.
+    pub fn even_within(self, width: usize, height: usize) -> Option<Rect> {
+        let (x0, y0) = (self.x & !1, self.y & !1);
+        let x1 = (self.x + self.w).next_multiple_of(2).min(width);
+        let y1 = (self.y + self.h).next_multiple_of(2).min(height);
+        (x1 > x0 && y1 > y0).then(|| Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        })
+    }
+}
+
+impl I420 {
+    /// Convert only `rects` of a BGRA image of this picture's size or larger (`pitch`
+    /// bytes per row); the rest of the picture keeps its previous content.
+    pub fn fill_rects_from_bgra(&mut self, bgra: &[u8], pitch: usize, rects: &[Rect]) {
+        let (w, h) = (self.width, self.height);
+        let (y_plane, uv) = self.data.split_at_mut(w * h);
+        let (u_plane, v_plane) = uv.split_at_mut(w * h / 4);
+        for r in rects.iter().filter_map(|r| r.even_within(w, h)) {
+            assert!(bgra.len() >= (r.y + r.h - 1) * pitch + (r.x + r.w) * 4);
+            let xs = r.x..r.x + r.w;
+            let y = &mut y_plane[r.y * w..(r.y + r.h) * w];
+            let u = &mut u_plane[r.y / 2 * (w / 2)..(r.y + r.h) / 2 * (w / 2)];
+            let v = &mut v_plane[r.y / 2 * (w / 2)..(r.y + r.h) / 2 * (w / 2)];
+            let src = &bgra[r.y * pitch..];
+            // Big areas (scrolling, video) split across cores; small ones stay here.
+            let bands = if r.w * r.h >= 256 * 1024 {
+                threads().min(r.h / MIN_BAND_ROWS).max(1)
+            } else {
+                1
+            };
+            if bands == 1 {
+                convert_rows(src, pitch, w, xs, y, u, v);
+                continue;
+            }
+            let band_rows = (r.h / bands).next_multiple_of(2).max(2);
+            std::thread::scope(|s| {
+                for (i, ((y, u), v)) in y
+                    .chunks_mut(band_rows * w)
+                    .zip(u.chunks_mut(band_rows / 2 * (w / 2)))
+                    .zip(v.chunks_mut(band_rows / 2 * (w / 2)))
+                    .enumerate()
+                {
+                    let src = &src[i * band_rows * pitch..];
+                    let xs = xs.clone();
+                    s.spawn(move || convert_rows(src, pitch, w, xs, y, u, v));
+                }
+            });
+        }
+    }
+
+    /// Update `out` to this picture as NV12. With `rows` (an even range), only those rows
+    /// are rewritten; `out` must then hold the previous NV12 of this same-size picture.
+    pub fn write_nv12(&self, out: &mut Vec<u8>, rows: Option<(usize, usize)>) {
+        let (w, h) = (self.width, self.height);
+        let (r0, r1) = match rows {
+            Some(r) if out.len() == self.data.len() => r,
+            _ => {
+                out.resize(self.data.len(), 0);
+                (0, h)
+            }
+        };
+        let (r0, r1) = (r0 & !1, r1.next_multiple_of(2).min(h));
+        if r1 <= r0 {
+            return;
+        }
+        out[r0 * w..r1 * w].copy_from_slice(&self.y()[r0 * w..r1 * w]);
+        let half = w / 2;
+        let (u, v) = (self.u(), self.v());
+        let uv = &mut out[w * h..];
+        for cy in r0 / 2..r1 / 2 {
+            let dst = &mut uv[cy * w..(cy + 1) * w];
+            let (ur, vr) = (
+                &u[cy * half..(cy + 1) * half],
+                &v[cy * half..(cy + 1) * half],
+            );
+            for (x, pair) in dst.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                *pair = [ur[x], vr[x]];
+            }
         }
     }
 }
@@ -365,6 +476,66 @@ mod tests {
             (148..=152).contains(&row.iter().position(|&v| v > 128).unwrap()),
             "edge in the middle"
         );
+    }
+
+    #[test]
+    fn changed_rects_give_the_same_picture_as_a_full_conversion() {
+        let (w, h) = (1280, 720);
+        let (old, new) = (sample(w, h), {
+            let mut n = sample(w, h);
+            for (i, b) in n.iter_mut().enumerate() {
+                *b = b.wrapping_add((i / 7) as u8);
+            }
+            n
+        });
+        // Changed areas of `new` relative to `old`: odd edges, overlap, a big one.
+        let rects = [
+            Rect {
+                x: 3,
+                y: 5,
+                w: 17,
+                h: 9,
+            },
+            Rect {
+                x: 10,
+                y: 8,
+                w: 40,
+                h: 3,
+            },
+            Rect {
+                x: 0,
+                y: 100,
+                w: 1280,
+                h: 301,
+            }, // big: converted on several cores
+            Rect {
+                x: 1270,
+                y: 710,
+                w: 50,
+                h: 50,
+            }, // runs off the edge
+        ];
+        let mut patched_src = old.clone();
+        for r in rects.iter().filter_map(|r| r.even_within(w, h)) {
+            for y in r.y..r.y + r.h {
+                let a = (y * w + r.x) * 4;
+                patched_src[a..a + r.w * 4].copy_from_slice(&new[a..a + r.w * 4]);
+            }
+        }
+        let mut full = I420::new(w, h);
+        full.fill_from_bgra(&patched_src, w);
+        let mut inc = I420::new(w, h);
+        inc.fill_from_bgra(&old, w);
+        inc.fill_rects_from_bgra(&new, w * 4, &rects);
+        assert!(inc.data == full.data, "incremental conversion differs");
+
+        let mut nv12 = full.to_nv12();
+        let mut before = I420::new(w, h);
+        before.fill_from_bgra(&old, w);
+        let mut nv12_inc = before.to_nv12();
+        inc.write_nv12(&mut nv12_inc, Some((0, h)));
+        full.write_nv12(&mut nv12, None);
+        assert_eq!(nv12_inc, nv12);
     }
 
     #[test]

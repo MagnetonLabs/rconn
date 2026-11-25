@@ -5,20 +5,22 @@
 //! memory access is the mapped staging texture, read strictly within `RowPitch * Height`.
 #![allow(unsafe_code)]
 
-use super::{CaptureError, Capturer};
+use super::{CaptureError, Captured, Capturer, convert_whole};
 use crate::video::Frame;
+use crate::yuv::{I420, Rect};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    IDXGIAdapter, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_OUTDUPL_MOVE_RECT, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+    IDXGIResource,
 };
 use windows::core::Interface;
 
@@ -271,16 +273,33 @@ impl DxgiCapturer {
     }
 }
 
+/// A frame held from DXGI; released when dropped.
+struct Held {
+    dup: IDXGIOutputDuplication,
+    info: DXGI_OUTDUPL_FRAME_INFO,
+    resource: Option<IDXGIResource>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = unsafe { self.dup.ReleaseFrame() };
+    }
+}
+
 impl DxgiCapturer {
-    /// One DXGI attempt: `Ok(None)` when nothing new is available.
-    fn acquire(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+    /// Wait for DXGI's next frame: `Ok(None)` on timeout or a lost duplication.
+    fn hold(&mut self, timeout: Duration) -> Result<Option<Held>, CaptureError> {
         let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
         let dup = self.duplication()?.clone();
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
         match unsafe { dup.AcquireNextFrame(ms, &mut info, &mut resource) } {
-            Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+            Ok(()) => Ok(Some(Held {
+                dup,
+                info,
+                resource,
+            })),
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => Ok(None),
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                 // Desktop switch, resolution change, full-screen app, or a display that
                 // isn't being presented: start over, without spinning.
@@ -293,22 +312,209 @@ impl DxgiCapturer {
                 }
                 self.dup = None;
                 std::thread::sleep(Duration::from_millis(50));
-                return Ok(None);
+                Ok(None)
             }
-            Err(e) => return Err(backend(e)),
+            Err(e) => Err(backend(e)),
         }
-        let result = match resource {
-            // LastPresentTime == 0 means only the cursor moved, except for the first image
-            // after duplication starts, which we always take.
-            Some(r) if info.LastPresentTime != 0 || self.want_full => self.copy_out(r).map(Some),
-            _ => Ok(None),
+    }
+
+    /// The new image, or `None` if only the pointer moved. LastPresentTime == 0 means
+    /// only the cursor moved, except for the first image after duplication starts,
+    /// which we always take.
+    fn image(&self, held: &Held) -> Option<IDXGIResource> {
+        held.resource
+            .clone()
+            .filter(|_| held.info.LastPresentTime != 0 || self.want_full)
+    }
+
+    /// One DXGI attempt: `Ok(None)` when nothing new is available.
+    fn acquire(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        let Some(held) = self.hold(timeout)? else {
+            return Ok(None);
         };
-        let _ = unsafe { dup.ReleaseFrame() };
-        result
+        match self.image(&held) {
+            Some(r) => self.copy_out(r).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The areas DXGI says changed in `held` (moved areas count as changed), or `None`
+    /// if it can't say.
+    fn changed_rects(held: &Held) -> Option<Vec<Rect>> {
+        let size = held.info.TotalMetadataBufferSize as usize;
+        if size == 0 {
+            return None;
+        }
+        let to_rect = |r: RECT| {
+            let (x0, y0) = (r.left.max(0) as usize, r.top.max(0) as usize);
+            let (x1, y1) = (r.right.max(0) as usize, r.bottom.max(0) as usize);
+            (x1 > x0 && y1 > y0).then_some(Rect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            })
+        };
+        let mut rects = Vec::new();
+        let move_size = std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+        let mut moves = vec![DXGI_OUTDUPL_MOVE_RECT::default(); size / move_size + 1];
+        let mut used = 0u32;
+        unsafe {
+            held.dup.GetFrameMoveRects(
+                (moves.len() * move_size) as u32,
+                moves.as_mut_ptr(),
+                &mut used,
+            )
+        }
+        .ok()?;
+        moves.truncate(used as usize / move_size);
+        rects.extend(moves.iter().filter_map(|m| to_rect(m.DestinationRect)));
+        let rect_size = std::mem::size_of::<RECT>();
+        let mut dirty = vec![RECT::default(); size / rect_size + 1];
+        unsafe {
+            held.dup.GetFrameDirtyRects(
+                (dirty.len() * rect_size) as u32,
+                dirty.as_mut_ptr(),
+                &mut used,
+            )
+        }
+        .ok()?;
+        dirty.truncate(used as usize / rect_size);
+        rects.extend(dirty.into_iter().filter_map(to_rect));
+        Some(rects)
+    }
+
+    /// Bring `picture` up to date with `image`, touching only the changed areas.
+    fn apply(
+        &mut self,
+        held: &Held,
+        image: IDXGIResource,
+        picture: &mut Option<I420>,
+        max: (usize, usize),
+    ) -> Result<Option<Captured>, CaptureError> {
+        let tex: ID3D11Texture2D = image.cast().map_err(backend)?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { tex.GetDesc(&mut desc) };
+        if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            return Err(CaptureError::UnsupportedFormat(desc.Format.0 as u32));
+        }
+        let (w, h) = (desc.Width as usize, desc.Height as usize);
+        if w > max.0 || h > max.1 {
+            // Halved to fit: no partial updates on this (rare) path.
+            return Ok(convert_whole(self.copy_out(image)?, picture, max));
+        }
+        let (ew, eh) = (w & !1, h & !1);
+        if ew == 0 || eh == 0 {
+            return Ok(None);
+        }
+        let new_staging = self
+            .staging
+            .as_ref()
+            .is_none_or(|(_, sw, sh)| (*sw, *sh) != (desc.Width, desc.Height));
+        let staging = self.staging(&desc)?;
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: ew,
+            h: eh,
+        };
+        let fresh = self.want_full
+            || new_staging
+            || picture.as_ref().is_none_or(|p| p.dimensions() != (ew, eh));
+        let rects: Vec<Rect> = if fresh {
+            vec![whole]
+        } else {
+            Self::changed_rects(held)
+                .unwrap_or_else(|| vec![whole])
+                .into_iter()
+                .filter_map(|r| r.even_within(ew, eh))
+                .collect()
+        };
+        if rects.is_empty() {
+            return Ok(None);
+        }
+        let pic = match picture {
+            Some(p) if p.dimensions() == (ew, eh) => p,
+            _ => picture.insert(I420::new(ew, eh)),
+        };
+        unsafe {
+            // The staging texture mirrors the desktop: every change since the full copy
+            // is copied into it, so only changed areas cross from the GPU.
+            if fresh {
+                self.context.CopyResource(&staging, &tex);
+            } else {
+                for r in &rects {
+                    let b = D3D11_BOX {
+                        left: r.x as u32,
+                        top: r.y as u32,
+                        front: 0,
+                        right: (r.x + r.w) as u32,
+                        bottom: (r.y + r.h) as u32,
+                        back: 1,
+                    };
+                    self.context.CopySubresourceRegion(
+                        &staging,
+                        0,
+                        r.x as u32,
+                        r.y as u32,
+                        0,
+                        &tex,
+                        0,
+                        Some(&b),
+                    );
+                }
+            }
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(backend)?;
+            let pitch = mapped.RowPitch as usize;
+            let src = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * h);
+            pic.fill_rects_from_bgra(src, pitch, &rects);
+            self.context.Unmap(&staging, 0);
+        }
+        let area: usize = rects.iter().map(|r| r.w * r.h).sum();
+        let top = rects.iter().map(|r| r.y).min().unwrap_or(0);
+        let bottom = rects.iter().map(|r| r.y + r.h).max().unwrap_or(eh);
+        Ok(Some(Captured {
+            rows: (top, bottom),
+            changed: (area as f32 / (ew * eh) as f32).min(1.0),
+            captured_at: Instant::now(),
+        }))
     }
 }
 
 impl Capturer for DxgiCapturer {
+    fn next_into(
+        &mut self,
+        timeout: Duration,
+        picture: &mut Option<I420>,
+        max: (usize, usize),
+    ) -> Result<Option<Captured>, CaptureError> {
+        let result = match self.hold(timeout)? {
+            Some(held) => match self.image(&held) {
+                Some(image) => self.apply(&held, image, picture, max),
+                None => Ok(None),
+            },
+            None if self.want_full && self.started.elapsed() > FIRST_FRAME_FALLBACK => {
+                // No first image from DXGI (idle desktop; a VM whose window is hidden
+                // presents nothing): read the desktop directly once.
+                let frame = self.gdi_snapshot()?;
+                tracing::info!(
+                    w = frame.width,
+                    h = frame.height,
+                    "first picture taken via GDI (DXGI had none)"
+                );
+                Ok(convert_whole(frame, picture, max))
+            }
+            None => Ok(None),
+        };
+        if matches!(result, Ok(Some(_))) {
+            self.want_full = false;
+        }
+        result
+    }
+
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
         let frame = self.acquire(timeout)?;
         if frame.is_some() {

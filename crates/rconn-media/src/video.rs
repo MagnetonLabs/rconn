@@ -119,6 +119,8 @@ pub struct VideoEncoder {
     /// Name of the engine last built (for logs).
     engine_name: String,
     yuv: Option<I420>,
+    /// The NV12 copy of the last picture (Media Foundation input), updated row-wise.
+    nv12: Vec<u8>,
     /// Fraction of the captured size to encode (1.0 = full); lowered when the CPU is busy.
     scale: f32,
     last_was_key: bool,
@@ -140,6 +142,7 @@ impl VideoEncoder {
             encoder: None,
             engine_name: String::new(),
             yuv: None,
+            nv12: Vec::new(),
             scale: 1.0,
             last_was_key: false,
             force_key: false,
@@ -245,14 +248,30 @@ impl VideoEncoder {
         if w == 0 || h == 0 {
             return Ok(None);
         }
-        if self.dims != Some((w, h)) || self.encoder.is_none() {
-            self.encoder = Some(self.build(w, h)?);
-            self.yuv = Some(I420::new(w, h));
-            self.dims = Some((w, h));
-        }
-        let yuv = self.yuv.as_mut().expect("allocated above");
+        let mut yuv = match self.yuv.take() {
+            Some(y) if y.dimensions() == (w, h) => y,
+            _ => I420::new(w, h),
+        };
         // Odd edges are cropped by converting only the even-sized top-left region.
         yuv.fill_from_bgra_scaled(&frame.bgra, frame.width, frame.height);
+        let out = self.encode_yuv(&yuv, None);
+        self.yuv = Some(yuv);
+        out
+    }
+
+    /// Encode an already converted picture. `changed_rows` (an even range) are the only
+    /// rows that differ from the previous picture given here; `None` means "any".
+    pub fn encode_yuv(
+        &mut self,
+        yuv: &I420,
+        changed_rows: Option<(usize, usize)>,
+    ) -> Result<Option<Vec<u8>>, CodecError> {
+        let (w, h) = yuv.dimensions();
+        if self.dims != Some((w, h)) || self.encoder.is_none() {
+            self.encoder = Some(self.build(w, h)?);
+            self.dims = Some((w, h));
+            self.nv12.clear(); // forces a full NV12 rewrite
+        }
         let force_key = std::mem::take(&mut self.force_key);
         let out = match self.encoder.as_mut().expect("built above") {
             Engine::OpenH264(encoder) => {
@@ -260,7 +279,7 @@ impl VideoEncoder {
                     encoder.force_intra_frame();
                 }
                 let bits = encoder
-                    .encode(&*yuv)
+                    .encode(yuv)
                     .map_err(|e| CodecError::OpenH264(e.to_string()))?;
                 self.last_was_key = matches!(
                     bits.frame_type(),
@@ -273,11 +292,13 @@ impl VideoEncoder {
                 if force_key {
                     mf.force_keyframe();
                 }
-                let out = mf.encode(&yuv.to_nv12())?;
+                yuv.write_nv12(&mut self.nv12, changed_rows);
+                let out = mf.encode(&self.nv12)?;
                 self.last_was_key = has_idr(&out);
                 out
             }
         };
+        let _ = changed_rows; // only the NV12 path can use it
         Ok(if out.is_empty() { None } else { Some(out) })
     }
 
