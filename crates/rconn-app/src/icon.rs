@@ -29,3 +29,9 @@ pub fn app() -> Rgba {
 pub fn tray() -> Rgba {
     decode(include_bytes!("../assets/tray-32.png"))
 }
+
+/// macOS menu-bar icon: a black glyph on transparent, drawn by macOS as a template
+/// (white or black to match the menu bar, like other menu-bar icons).
+pub fn tray_template() -> Rgba {
+    decode(include_bytes!("../assets/tray-template.png"))
+}

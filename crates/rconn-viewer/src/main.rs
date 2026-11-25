@@ -51,6 +51,9 @@ enum Cmd {
         /// Don't play the host's sound.
         #[arg(long)]
         mute: bool,
+        /// Name shown in the toolbar (default: the computer's ID).
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Open a session and receive the host's screen (headless): print stream stats, and
     /// optionally save a PNG of the latest frame.
@@ -145,6 +148,7 @@ async fn main() -> Result<()> {
             relay_only,
             chromeless,
             mute,
+            name,
         } => {
             let openh264 = match openh264 {
                 Some(p) => p.clone(),
@@ -162,6 +166,7 @@ async fn main() -> Result<()> {
                 },
                 chromeless: *chromeless,
                 mute: *mute,
+                name: name.clone().unwrap_or_else(|| HostId(*host).short_code()),
             };
             // eframe must own the main thread (macOS requirement); it blocks until closed.
             return gui::run(args);

@@ -14,6 +14,31 @@ use tokio::sync::mpsc;
 
 pub type Shared = Arc<Mutex<Home>>;
 
+/// Process ids of open session windows (so quitting rconn closes them too).
+static SESSIONS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Close every session window this app opened.
+pub fn end_all_sessions() {
+    for pid in SESSIONS
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+    {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .creation_flags(0x0800_0000)
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Paths {
     /// Per-user app config (profile, token, viewer log).
@@ -304,7 +329,14 @@ impl Worker {
             Err(e) => return self.notice(format!("Couldn't open the session window: {e}"), true),
         };
         self.notice(format!("Session window opened for {name}"), false);
+        let pid = child.id();
+        if let Ok(mut v) = SESSIONS.lock() {
+            v.push(pid);
+        }
         let status = tokio::task::spawn_blocking(move || child.wait()).await;
+        if let Ok(mut v) = SESSIONS.lock() {
+            v.retain(|p| *p != pid);
+        }
         if let Ok(Ok(s)) = status
             && !s.success()
         {

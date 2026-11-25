@@ -31,8 +31,10 @@ pub struct ConnectArgs {
     pub opts: PeerOptions,
     /// Borderless, maximized window; the toolbar appears on the hotkey.
     pub chromeless: bool,
-    /// Don't play the host's sound.
+    /// Don't play the host's sound (can be switched in the toolbar).
     pub mute: bool,
+    /// Shown in the toolbar and title (the computer's name or ID).
+    pub name: String,
 }
 
 /// The local hotkey that toggles the toolbar: Ctrl+Alt+Shift+M. Never sent to the host.
@@ -160,6 +162,9 @@ struct Shared {
 
 pub fn run(args: ConnectArgs) -> Result<()> {
     let chromeless = args.chromeless;
+    let name = args.name.clone();
+    let muted = Arc::new(std::sync::atomic::AtomicBool::new(args.mute));
+    let muted_audio = muted.clone();
     let shared = Arc::new(Mutex::new(Shared {
         status: "connecting…".into(),
         ..Default::default()
@@ -176,6 +181,7 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             let result = rt.block_on(session(
                 args,
+                muted_audio,
                 sh.clone(),
                 input_rx,
                 kf_from_ui,
@@ -195,7 +201,7 @@ pub fn run(args: ConnectArgs) -> Result<()> {
         viewport: {
             let v = egui::ViewportBuilder::default()
                 .with_inner_size([1280.0, 800.0])
-                .with_title("rconn");
+                .with_title(format!("rconn — {name}"));
             if chromeless {
                 v.with_decorations(false).with_maximized(true)
             } else {
@@ -218,6 +224,10 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 keys: KeyGate::default(),
                 fullscreen: false,
                 chromeless,
+                name,
+                muted,
+                chrome: None,
+                reveal_until: None,
             }))
         }),
     )
@@ -226,6 +236,7 @@ pub fn run(args: ConnectArgs) -> Result<()> {
 
 async fn session(
     args: ConnectArgs,
+    muted: Arc<std::sync::atomic::AtomicBool>,
     shared: Arc<Mutex<Shared>>,
     mut input: mpsc::UnboundedReceiver<InputEvent>,
     mut kf_from_ui: mpsc::UnboundedReceiver<()>,
@@ -287,15 +298,12 @@ async fn session(
 
     // Route tracks: video to the decoder below, audio to the speakers (unless muted).
     let (video_tx, mut video_rx) = mpsc::unbounded_channel();
-    let mute = args.mute;
     let mut events = std::mem::replace(&mut session.peer.events, mpsc::unbounded_channel().1);
     let router = tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
             let PeerEvent::Track(t) = ev else { continue };
             if t.kind().await == rtc::rtp_transceiver::rtp_sender::RtpCodecKind::Audio {
-                if mute {
-                    continue;
-                }
+                let muted = muted.clone();
                 tokio::spawn(async move {
                     let player = match crate::playback::Player::start() {
                         Ok(p) => p,
@@ -309,6 +317,9 @@ async fn session(
                         let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
                             continue;
                         };
+                        if muted.load(std::sync::atomic::Ordering::Relaxed) {
+                            continue;
+                        }
                         if let Ok(n) = dec.decode_float(&pkt.payload, &mut pcm, false) {
                             player.push(&pcm[..n * 2]);
                         }
@@ -372,8 +383,14 @@ struct ViewerApp {
     last_pointer: Option<(f32, f32)>,
     keys: KeyGate,
     fullscreen: bool,
-    /// Borderless mode: no toolbar strip, only the hotkey toolbar.
+    /// Borderless mode: like full screen, the toolbar slides out from the top.
     chromeless: bool,
+    name: String,
+    muted: Arc<std::sync::atomic::AtomicBool>,
+    /// Where the floating toolbar (or its tab) is; pointer events there stay local.
+    chrome: Option<Rect>,
+    /// The floating toolbar stays out until then.
+    reveal_until: Option<Instant>,
 }
 
 impl ViewerApp {
@@ -384,8 +401,15 @@ impl ViewerApp {
     /// Translate this frame's egui input into remote input, relative to `image` on screen.
     fn forward_input(&mut self, ui: &egui::Ui, image: Rect) {
         let events = ui.ctx().input(|i| i.events.clone());
+        let chrome = self.chrome;
+        let on_chrome = |p: Pos2| chrome.is_some_and(|r| r.contains(p));
+        let hover_on_chrome = ui.ctx().pointer_hover_pos().is_some_and(on_chrome);
         for ev in events {
             match ev {
+                // Over the toolbar, the mouse belongs to the viewer.
+                egui::Event::PointerMoved(p) if on_chrome(p) => {}
+                egui::Event::PointerButton { pos, .. } if on_chrome(pos) => {}
+                egui::Event::MouseWheel { .. } if hover_on_chrome => {}
                 // While the toolbar is open, the mouse belongs to the viewer.
                 egui::Event::PointerMoved(_)
                 | egui::Event::PointerButton { .. }
@@ -490,56 +514,167 @@ pub fn fit(area: Rect, size: Vec2) -> Rect {
     Rect::from_center_size(area.center(), size * scale)
 }
 
+const BAR_H: f32 = 40.0;
+const DANGER: Color32 = Color32::from_rgb(210, 70, 60);
+
+/// Key combinations offered in the toolbar's Keys menu (pressed in order, released in reverse).
+const COMBOS: [(&str, &[u16]); 3] = {
+    use rconn_core::hid::usage as u;
+    [
+        ("Windows key", &[u::META_LEFT]),
+        ("Alt+Tab", &[u::ALT_LEFT, u::TAB]),
+        (
+            "Task Manager (Ctrl+Shift+Esc)",
+            &[u::CONTROL_LEFT, u::SHIFT_LEFT, u::ESCAPE],
+        ),
+    ]
+};
+
 impl ViewerApp {
-    fn toolbar_buttons(&mut self, ui: &mut egui::Ui) {
+    fn is_fullscreen(&self, ui: &egui::Ui) -> bool {
+        self.chromeless
+            || self.fullscreen
+            || ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false))
+    }
+
+    fn send_combo(&self, keys: &[u16]) {
+        for &k in keys {
+            self.send(key_event(k, true));
+        }
+        for &k in keys.iter().rev() {
+            self.send(key_event(k, false));
+        }
+    }
+
+    fn stats(&self, fps: f32, kbps: f32) -> String {
+        match &self.texture {
+            Some(t) => format!(
+                "{}x{}  ·  {fps:.0} fps  ·  {kbps:.0} kbps",
+                t.size()[0],
+                t.size()[1]
+            ),
+            None => "connecting…".into(),
+        }
+    }
+
+    /// The toolbar itself (docked in a window, floating in full screen).
+    fn bar_contents(&mut self, ui: &mut egui::Ui, stats: &str, fullscreen: bool) {
+        ui.spacing_mut().button_padding = Vec2::new(8.0, 4.0);
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(egui::RichText::new("🖥").size(16.0));
+        ui.label(egui::RichText::new(&self.name).strong());
+        ui.separator();
+        ui.menu_button("⌨ Keys", |ui| {
+            for (label, keys) in COMBOS {
+                if ui.button(label).clicked() {
+                    self.send_combo(keys);
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Send keys your Mac would keep for itself");
         if ui
-            .button(if self.fullscreen {
-                "Exit full screen"
+            .button("🔄 Refresh")
+            .on_hover_text("Ask the host for a fresh picture")
+            .clicked()
+        {
+            let _ = self.keyframe.send(());
+        }
+        let muted = self.muted.load(std::sync::atomic::Ordering::Relaxed);
+        if ui
+            .button(if muted {
+                "🔇 Sound off"
+            } else {
+                "🔊 Sound on"
+            })
+            .clicked()
+        {
+            self.muted
+                .store(!muted, std::sync::atomic::Ordering::Relaxed);
+        }
+        if ui
+            .button(if fullscreen {
+                "🔳 Exit full screen"
             } else {
                 "🔳 Full screen"
             })
             .clicked()
         {
-            self.fullscreen = !self.fullscreen;
+            self.fullscreen = !fullscreen;
             ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
         }
-        if ui.button("🔄 Refresh picture").clicked() {
-            let _ = self.keyframe.send(());
-        }
-        if ui.button("❌ Disconnect").clicked() {
+        ui.separator();
+        ui.label(egui::RichText::new(stats).color(Color32::GRAY).monospace());
+        ui.separator();
+        let bye = egui::Button::new(egui::RichText::new("❌ Disconnect").color(Color32::WHITE))
+            .fill(DANGER);
+        if ui.add(bye).clicked() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        if self.keys.toolbar {
+            ui.label(egui::RichText::new("Keyboard paused").color(Color32::GRAY))
+                .on_hover_text(format!(
+                    "{HOTKEY_HINT} gives the keyboard back to the remote computer"
+                ));
+        }
     }
 
-    /// Floating toolbar (hotkey); owns the keyboard while open.
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        egui::Area::new(egui::Id::unique("toolbar"))
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 8.0])
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        self.toolbar_buttons(ui);
-                        ui.label(format!("{HOTKEY_HINT} to return"));
-                    });
+    /// Full screen: a small tab at the top; the toolbar slides out when the mouse reaches
+    /// the top edge (or on the hotkey) and goes away a moment after it leaves.
+    fn floating_bar(&mut self, ui: &mut egui::Ui, area: Rect, stats: &str) {
+        let now = Instant::now();
+        let pointer = ui.ctx().pointer_hover_pos();
+        let near_top = pointer.is_some_and(|p| p.y <= area.min.y + 6.0);
+        let over = pointer
+            .zip(self.chrome)
+            .is_some_and(|(p, r)| r.expand(16.0).contains(p));
+        if near_top || over || self.keys.toolbar {
+            self.reveal_until = Some(now + Duration::from_millis(1200));
+        }
+        if self.reveal_until.is_some_and(|t| now < t) {
+            let ctx = ui.ctx().clone();
+            let shown = egui::Area::new(egui::Id::unique("floating-toolbar"))
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 0.0])
+                .order(egui::Order::Foreground)
+                .show(&ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| self.bar_contents(ui, stats, true));
+                        });
                 });
-            });
+            self.chrome = Some(shown.response.rect);
+            ctx.request_repaint_after(Duration::from_millis(250)); // to slide away on time
+        } else {
+            let tab = Rect::from_center_size(
+                Pos2::new(area.center().x, area.min.y + 11.0),
+                Vec2::new(96.0, 22.0),
+            );
+            let p = ui.painter();
+            p.rect_filled(
+                tab,
+                egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 8,
+                    se: 8,
+                },
+                Color32::from_black_alpha(170),
+            );
+            p.text(
+                tab.center(),
+                egui::Align2::CENTER_CENTER,
+                "rconn",
+                egui::FontId::proportional(13.0),
+                Color32::from_gray(220),
+            );
+            self.chrome = Some(tab);
+        }
     }
 
-    /// Fixed strip above the picture in a normal window.
-    fn toolbar_strip(&mut self, ui: &mut egui::Ui, strip: Rect, stats: &str) {
-        let mut child =
-            ui.new_child(egui::UiBuilder::new().max_rect(strip.shrink2(Vec2::new(8.0, 4.0))));
-        child.horizontal_centered(|ui| {
-            self.toolbar_buttons(ui);
-            ui.separator();
-            ui.label(egui::RichText::new(stats).color(Color32::GRAY));
-        });
-    }
-}
-
-impl eframe::App for ViewerApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn draw(&mut self, ui: &mut egui::Ui) {
         let (new_frame, status, fps, kbps) = {
             let mut s = self.shared.lock().expect("ui state");
             (s.frame.take(), s.status.clone(), s.fps, s.kbps)
@@ -554,56 +689,59 @@ impl eframe::App for ViewerApp {
                 }
             }
         }
-
-        let full = ui.available_rect_before_wrap();
-        let strip_h = if self.chromeless || self.fullscreen {
-            0.0
-        } else {
-            34.0
-        };
-        let (strip, area) = full.split_top_bottom_at_y(full.min.y + strip_h);
-        ui.painter().rect_filled(full, 0.0, Color32::BLACK);
-        let (_, _) = ui.allocate_exact_size(full.size(), Sense::click_and_drag());
-        if strip_h > 0.0 {
-            ui.painter()
-                .rect_filled(strip, 0.0, ui.visuals().panel_fill);
-            let stats = match &self.texture {
-                Some(t) => format!(
-                    "{}x{} · {fps:.0} fps · {kbps:.0} kbps",
-                    t.size()[0],
-                    t.size()[1]
-                ),
-                None => String::new(),
-            };
-            self.toolbar_strip(ui, strip, &stats);
+        let fullscreen = self.is_fullscreen(ui);
+        let stats = self.stats(fps, kbps);
+        if !fullscreen {
+            self.chrome = None;
+            egui::Panel::top("toolbar")
+                .exact_size(BAR_H)
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(ui.visuals().panel_fill)
+                        .inner_margin(egui::Margin::symmetric(10, 6)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal_centered(|ui| self.bar_contents(ui, &stats, false));
+                });
         }
-        if let Some(tex) = &self.texture {
-            let [w, h] = tex.size();
-            let image = fit(area, Vec2::new(w as f32, h as f32));
-            ui.painter().image(
-                tex.id(),
-                image,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-            self.forward_input(ui, image);
-            if self.keys.toolbar {
-                self.toolbar(ui);
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            let area = ui.max_rect();
+            ui.painter().rect_filled(area, 0.0, Color32::BLACK);
+            let _ = ui.allocate_rect(area, Sense::click_and_drag());
+            let image = self.texture.as_ref().map(|tex| {
+                let [w, h] = tex.size();
+                let image = fit(area, Vec2::new(w as f32, h as f32));
+                ui.painter().image(
+                    tex.id(),
+                    image,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                image
+            });
+            if fullscreen {
+                self.floating_bar(ui, area, &stats);
             }
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                    "rconn — {w}x{h} · {fps:.0} fps · {kbps:.0} kbps"
-                )));
-        }
-        if !status.is_empty() {
-            ui.painter().text(
-                area.center(),
-                egui::Align2::CENTER_CENTER,
-                status,
-                egui::FontId::proportional(18.0),
-                Color32::LIGHT_GRAY,
-            );
-        }
+            if let Some(image) = image {
+                self.forward_input(ui, image);
+            }
+            if !status.is_empty() {
+                ui.painter().text(
+                    area.center(),
+                    egui::Align2::CENTER_CENTER,
+                    status,
+                    egui::FontId::proportional(18.0),
+                    Color32::LIGHT_GRAY,
+                );
+            }
+        });
+    }
+}
+
+impl eframe::App for ViewerApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
     }
 }
 
@@ -730,6 +868,86 @@ mod tests {
             keys(g.key(egui::Key::C, true, false, cmd)),
             vec![(u::A + 2, true)],
             "Ctrl stays held while Cmd is"
+        );
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    //! Offscreen renders of the session window (set RCONN_VIEWER_PNG_DIR to keep PNGs).
+    use super::*;
+    use egui_kittest::Harness;
+
+    fn app(fullscreen: bool, hotkey: bool) -> ViewerApp {
+        let (input, _) = mpsc::unbounded_channel();
+        let (keyframe, _) = mpsc::unbounded_channel();
+        let (w, h) = (1496, 938);
+        let mut rgba = vec![0u8; w * h * 4];
+        for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = (i % w, i / w);
+            *px = [(x * 255 / w) as u8, 90, (y * 255 / h) as u8, 255];
+        }
+        let shared = Arc::new(Mutex::new(Shared {
+            frame: Some(DecodedFrame {
+                width: w,
+                height: h,
+                rgba,
+            }),
+            status: String::new(),
+            fps: 29.0,
+            kbps: 2400.0,
+        }));
+        let keys = KeyGate {
+            toolbar: hotkey,
+            ..Default::default()
+        };
+        ViewerApp {
+            shared,
+            input,
+            keyframe,
+            texture: None,
+            last_pointer: None,
+            keys,
+            fullscreen,
+            chromeless: false,
+            name: "MATTHEWLONG4FBB".into(),
+            muted: Arc::default(),
+            chrome: None,
+            reveal_until: None,
+        }
+    }
+
+    fn render(name: &str, app: ViewerApp) -> ViewerApp {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 700.0))
+            .build_ui_state(|ui, app: &mut ViewerApp| app.draw(ui), app);
+        harness.run_steps(3);
+        let image = harness.render().expect("offscreen render");
+        if let Some(dir) = std::env::var_os("RCONN_VIEWER_PNG_DIR") {
+            image
+                .save(std::path::Path::new(&dir).join(format!("{name}.png")))
+                .unwrap();
+        }
+        harness.into_state()
+    }
+
+    #[test]
+    fn windowed_has_a_docked_toolbar_above_the_picture() {
+        let app = render("viewer-window", app(false, false));
+        assert!(app.chrome.is_none(), "docked bar, nothing floating");
+    }
+
+    #[test]
+    fn full_screen_shows_a_tab_then_the_toolbar_when_revealed() {
+        let tab = render("viewer-fullscreen-tab", app(true, false));
+        assert!(
+            tab.chrome.is_some_and(|r| r.height() < 30.0),
+            "just the tab"
+        );
+        let bar = render("viewer-fullscreen-bar", app(true, true));
+        assert!(
+            bar.chrome.is_some_and(|r| r.width() > 400.0),
+            "the full toolbar"
         );
     }
 }

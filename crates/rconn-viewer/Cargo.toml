@@ -31,3 +31,6 @@ openidconnect = "4"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }

@@ -5203,6 +5203,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "egui_kittest",
  "openidconnect",
  "png",
  "rconn-core",

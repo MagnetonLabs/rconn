@@ -7,8 +7,7 @@ use rconn_app::worker::{self, Paths};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-/// Held by the open window; a second launch asks it to come forward instead.
-const WINDOW_PORT: u16 = 47_391;
+use rconn_app::WINDOW_PORT;
 
 struct App {
     shared: worker::Shared,
@@ -74,13 +73,19 @@ fn main() -> anyhow::Result<()> {
             let ctx = cc.egui_ctx.clone();
             let front = ctx.clone();
             std::thread::spawn(move || {
-                for conn in listener.incoming() {
-                    if conn.is_ok() {
-                        front.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                        front.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        front.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        front.request_repaint();
+                use std::io::BufRead;
+                for conn in listener.incoming().flatten() {
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(conn).read_line(&mut line);
+                    if line.trim() == "quit" {
+                        // Tray "Quit rconn": close session windows too, then exit.
+                        worker::end_all_sessions();
+                        std::process::exit(0);
                     }
+                    front.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    front.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    front.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    front.request_repaint();
                 }
             });
             let tx = worker::spawn(shared.clone(), ctx, paths);

@@ -42,11 +42,19 @@ pub fn run(status_file: PathBuf) -> anyhow::Result<()> {
         id_item: MenuItem::new("ID: not set up", false, None),
         state_item: MenuItem::new("", false, None),
         open: MenuItem::new("Open rconn", true, None),
-        quit: MenuItem::new("Quit tray icon", true, None),
+        quit: MenuItem::new("Quit rconn", true, None),
         next_status: Instant::now(),
     };
     event_loop.run_app(&mut tray)?;
     Ok(())
+}
+
+/// Quit everything: ask an open window (and through it, its session windows) to exit.
+fn quit_app() {
+    use std::io::Write;
+    if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", crate::WINDOW_PORT)) {
+        let _ = s.write_all(b"quit\n");
+    }
 }
 
 fn open_window() {
@@ -65,14 +73,25 @@ impl Tray {
             &self.open,
             &self.quit,
         ])?;
-        let img = crate::icon::tray();
+        let mac = cfg!(target_os = "macos");
+        let img = if mac {
+            crate::icon::tray_template()
+        } else {
+            crate::icon::tray()
+        };
         let icon = tray_icon::Icon::from_rgba(img.rgba, img.width, img.height)?;
+        let builder = TrayIconBuilder::new();
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_icon_templated(icon);
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.with_icon(icon);
         self.icon = Some(
-            TrayIconBuilder::new()
+            builder
                 .with_menu(Box::new(menu))
-                .with_menu_on_left_click(false)
+                // Windows: left click opens the window, right click the menu.
+                // macOS: any click opens the menu, as menu-bar icons do.
+                .with_menu_on_left_click(mac)
                 .with_tooltip("rconn")
-                .with_icon(icon)
                 .build()?,
         );
         Ok(())
@@ -125,6 +144,7 @@ impl ApplicationHandler for Tray {
             if ev.id == *self.open.id() {
                 open_window();
             } else if ev.id == *self.quit.id() {
+                quit_app();
                 self.icon = None;
                 event_loop.exit();
                 return;
