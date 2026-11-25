@@ -259,6 +259,8 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
         .with_context(|| format!("opening {}", audit_path.display()))?;
     let auth = Arc::new(auth);
     let state = AppState::with_audit(auth.clone(), Arc::new(audit));
+    // Signed-in operators may turn their own computers into hosts from the app.
+    state.allow_enrollment(org_id, ca);
     // Live reload: operators, accounts and revocations apply without a restart.
     {
         let (store, auth, state) = (DataDir::new(store.path()), auth.clone(), state.clone());

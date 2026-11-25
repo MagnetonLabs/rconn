@@ -10,7 +10,7 @@ trap 'rm -rf "$work"' EXIT
 
 app="$work/dmg/rconn.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$stage/rconn" "$stage/rconn-viewer" "$app/Contents/MacOS/"
+cp "$stage/rconn" "$stage/rconn-viewer" "$stage/rconn-host-agent" "$app/Contents/MacOS/"
 # Menu-bar icon: its own helper app (own bundle id, no Dock icon), so macOS still opens the
 # window when rconn is launched while the icon runs.
 helper="$app/Contents/Helpers/rconn-tray.app"
@@ -57,6 +57,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 PLIST
 codesign --force --sign - "$helper" 2>/dev/null
 codesign --force --sign - "$app/Contents/MacOS/rconn-viewer" 2>/dev/null
+codesign --force --sign - --identifier app.rconn.host-agent "$app/Contents/MacOS/rconn-host-agent" 2>/dev/null
 codesign --force --sign - "$app" 2>/dev/null
 codesign --verify --strict "$app"
 for lib in "$stage"/libopenh264-*.dylib; do

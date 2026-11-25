@@ -72,18 +72,27 @@ impl Authenticator for TestAuth {
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn start() -> (String, AppState) {
+    start_with_ca().await.0
+}
+
+/// Like `start`, with self-service enrollment on for org A; returns A's CA certificate.
+async fn start_with_ca() -> ((String, AppState), String) {
+    let org_a = OrgId::new();
+    let ca = rconn_core::fleet::FleetCa::generate(org_a).unwrap();
+    let ca_pem = ca.cert_pem().to_owned();
     let auth = TestAuth {
-        org_a: OrgId::new(),
+        org_a,
         org_b: OrgId::new(),
         op_a: OperatorId::new(),
         op_b: OperatorId::new(),
     };
     let state = AppState::new(Arc::new(auth));
+    state.allow_enrollment(org_a, ca);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("ws://{addr}/v1/ws"), state)
+    ((format!("ws://{addr}/v1/ws"), state), ca_pem)
 }
 
 async fn send(ws: &mut Ws, m: &ClientMessage) {
@@ -484,4 +493,52 @@ async fn computer_list_shows_own_org_hosts_with_their_names() {
     assert!(
         matches!(recv(&mut op_b).await, Some(ServerMessage::Hosts { hosts }) if hosts.is_empty())
     );
+}
+
+#[tokio::test]
+async fn operators_can_enroll_their_own_computer_only_in_their_org() {
+    let ((url, _), ca_pem) = start_with_ca().await;
+    let key = rconn_core::fleet::HostKey::generate().unwrap();
+    let mut op = connect_operator(&url, "op-a").await;
+    send(
+        &mut op,
+        &ClientMessage::EnrollHost {
+            public_key_der: key.public_der(),
+        },
+    )
+    .await;
+    let Some(ServerMessage::HostEnrolled { host_id, cert_pem }) = recv(&mut op).await else {
+        panic!("expected HostEnrolled")
+    };
+    let claims = rconn_core::fleet::verify_host_cert(&ca_pem, &cert_pem).unwrap();
+    assert_eq!(claims.host_id, host_id);
+    assert_eq!(
+        claims.public_key.to_vec(),
+        key.public_der()[key.public_der().len() - 32..].to_vec()
+    );
+
+    // Org B has no enrollment here; garbage keys are refused too.
+    let mut op_b = connect_operator(&url, "op-b").await;
+    send(
+        &mut op_b,
+        &ClientMessage::EnrollHost {
+            public_key_der: key.public_der(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut op_b).await,
+        Some(ServerMessage::Error { .. })
+    ));
+    send(
+        &mut op,
+        &ClientMessage::EnrollHost {
+            public_key_der: b"junk".to_vec(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut op).await,
+        Some(ServerMessage::Error { .. })
+    ));
 }

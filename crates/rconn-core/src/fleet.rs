@@ -68,6 +68,11 @@ impl HostKey {
     pub fn to_pem(&self) -> String {
         self.0.serialize_pem()
     }
+    /// The public half (SubjectPublicKeyInfo DER), sent to the server to get a certificate.
+    pub fn public_der(&self) -> Vec<u8> {
+        use rcgen::PublicKeyData;
+        self.0.subject_public_key_info()
+    }
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, FleetError> {
         use rcgen::SigningKey;
         Ok(self.0.sign(msg)?)
@@ -141,10 +146,33 @@ impl FleetCa {
         self.issue_with_validity(host_id, host_key, HOST_CERT_LIFETIME)
     }
 
+    /// Issue a host certificate from only the host's public key (SubjectPublicKeyInfo DER),
+    /// so the private key never leaves the host. Only Ed25519 keys are accepted.
+    pub fn issue_host_cert_for_public_key(
+        &self,
+        host_id: HostId,
+        spki_der: &[u8],
+    ) -> Result<String, FleetError> {
+        let spki = rcgen::SubjectPublicKeyInfo::from_der(spki_der)?;
+        let cert = self.issue_with_validity_for(host_id, &spki, HOST_CERT_LIFETIME)?;
+        // Re-verify: rejects anything that isn't a valid Ed25519 host cert for this CA.
+        verify_host_cert(&self.cert_pem, &cert)?;
+        Ok(cert)
+    }
+
     fn issue_with_validity(
         &self,
         host_id: HostId,
         host_key: &HostKey,
+        life: Duration,
+    ) -> Result<String, FleetError> {
+        self.issue_with_validity_for(host_id, &host_key.0, life)
+    }
+
+    fn issue_with_validity_for(
+        &self,
+        host_id: HostId,
+        subject_key: &impl rcgen::PublicKeyData,
         life: Duration,
     ) -> Result<String, FleetError> {
         let mut params = CertificateParams::new(Vec::<String>::new())?;
@@ -159,7 +187,7 @@ impl FleetCa {
         let now = OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::minutes(5);
         params.not_after = now + life;
-        Ok(params.signed_by(&host_key.0, &self.issuer)?.pem())
+        Ok(params.signed_by(subject_key, &self.issuer)?.pem())
     }
 }
 
@@ -273,6 +301,24 @@ pub fn verify_host_proof(
         ed25519_dalek::Signature::from_slice(signature).map_err(|_| FleetError::BadSignature)?;
     key.verify_strict(transcript, &sig)
         .map_err(|_| FleetError::BadSignature)
+}
+
+#[cfg(test)]
+mod public_key_enroll_tests {
+    use super::*;
+
+    #[test]
+    fn a_cert_issued_from_the_public_key_alone_verifies_for_that_key() {
+        let ca = FleetCa::generate(OrgId::new()).unwrap();
+        let key = HostKey::generate().unwrap();
+        let id = HostId::new();
+        let cert = ca
+            .issue_host_cert_for_public_key(id, &key.public_der())
+            .unwrap();
+        let claims = verify_host_cert(ca.cert_pem(), &cert).unwrap();
+        assert_eq!(claims.host_id, id);
+        assert!(ca.issue_host_cert_for_public_key(id, b"not a key").is_err());
+    }
 }
 
 #[cfg(test)]

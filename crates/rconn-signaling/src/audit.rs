@@ -42,6 +42,12 @@ pub enum AuditEvent {
         session_id: SessionId,
         reason: EndReason,
     },
+    /// An operator turned a computer into a host (self-service enrollment).
+    HostEnrolled {
+        org_id: OrgId,
+        host_id: HostId,
+        operator_id: OperatorId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

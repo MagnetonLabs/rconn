@@ -69,6 +69,13 @@ pub enum ClientMessage {
         protocol_version: u16,
         id_token: String,
     },
+    /// Operator turns the computer it runs on into a host: the server issues an id and a
+    /// certificate for this public key (the private key never leaves the computer).
+    /// Answered with [`ServerMessage::HostEnrolled`].
+    EnrollHost {
+        /// Ed25519 SubjectPublicKeyInfo, DER.
+        public_key_der: Vec<u8>,
+    },
     /// Operator asks which of the org's hosts are online. Answered with [`ServerMessage::Hosts`].
     ListHosts,
     /// Operator asks to open a session to a host.
@@ -101,6 +108,11 @@ pub enum ServerMessage {
         /// Optional features this server supports. See [`SERVER_CAPABILITIES`].
         #[serde(default)]
         capabilities: Vec<String>,
+    },
+    /// Answer to `EnrollHost`.
+    HostEnrolled {
+        host_id: HostId,
+        cert_pem: String,
     },
     /// Answer to `ListHosts`: the org's online hosts.
     Hosts {

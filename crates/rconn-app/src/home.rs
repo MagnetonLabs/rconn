@@ -39,6 +39,12 @@ pub enum Request {
     /// Open the admin settings window (UAC prompt on Windows).
     OpenHostSettings,
     RestartHostAgent,
+    /// macOS: make this Mac a host ("Allow connections to this computer").
+    EnableHost,
+    /// macOS: stop being a host (the identity is kept).
+    DisableHost,
+    /// macOS: open System Settings at this permission ("Screen Recording", "Accessibility").
+    OpenPermission(String),
 }
 
 pub struct Home {
@@ -60,6 +66,8 @@ pub struct Home {
     pub busy: Option<String>,
     /// The host's own settings when readable (admin); None when not installed.
     pub host_settings: Option<HostSettings>,
+    /// The app itself can make this computer a host (macOS; Windows uses the installer).
+    pub can_host_here: bool,
 }
 
 impl Home {
@@ -79,6 +87,7 @@ impl Home {
             notice: None,
             busy: None,
             host_settings: None,
+            can_host_here: cfg!(target_os = "macos"),
         }
     }
 
@@ -111,7 +120,7 @@ pub fn draw(ui: &mut egui::Ui, h: &mut Home) -> Vec<Request> {
                 .fill(ui.visuals().faint_bg_color)
                 .inner_margin(20.0),
         )
-        .show(ui, |ui| this_computer(ui, h));
+        .show(ui, |ui| this_computer(ui, h, &mut out));
     egui::Panel::bottom("status")
         .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 8)))
         .show(ui, |ui| status_bar(ui, h));
@@ -131,7 +140,7 @@ pub fn draw(ui: &mut egui::Ui, h: &mut Home) -> Vec<Request> {
     out
 }
 
-fn this_computer(ui: &mut egui::Ui, h: &Home) {
+fn this_computer(ui: &mut egui::Ui, h: &Home, out: &mut Vec<Request>) {
     ui.label(
         RichText::new("This computer")
             .font(FontId::proportional(24.0))
@@ -139,7 +148,30 @@ fn this_computer(ui: &mut egui::Ui, h: &Home) {
     );
     ui.add_space(6.0);
     let Some(s) = &h.this else {
-        ui.label("Connections to this computer are off: the rconn host isn't installed here.");
+        if !h.can_host_here {
+            ui.label("Connections to this computer are off: the rconn host isn't installed here.");
+            return;
+        }
+        ui.label("Connections to this computer are off.");
+        ui.add_space(12.0);
+        let ready = h.signed_in && h.busy.is_none();
+        let button = egui::Button::new(
+            RichText::new("Allow connections to this computer").color(Color32::WHITE),
+        )
+        .fill(ACCENT);
+        if ui.add_enabled(ready, button).clicked() {
+            out.push(Request::EnableHost);
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(if h.signed_in {
+                "Gives this Mac an ID on your server. macOS will then ask you to allow Screen Recording and Accessibility."
+            } else {
+                "Sign in first (⚙ Settings)."
+            })
+            .small()
+            .color(Color32::GRAY),
+        );
         return;
     };
     ui.label("Others can connect to this computer with this ID.");
@@ -159,8 +191,11 @@ fn this_computer(ui: &mut egui::Ui, h: &Home) {
     ui.label(RichText::new("Name").color(Color32::GRAY));
     ui.label(RichText::new(&s.label).size(16.0));
     ui.add_space(10.0);
-    let (dot, text) = if !s.is_fresh(h.now) {
+    let fresh = s.is_fresh(h.now);
+    let (dot, text) = if !fresh {
         (Color32::GRAY, "Offline: host service not running")
+    } else if !s.missing_permissions.is_empty() {
+        (BAD, "Waiting for macOS permissions")
     } else if s.online {
         (GOOD, "Online, ready for connections")
     } else {
@@ -170,13 +205,40 @@ fn this_computer(ui: &mut egui::Ui, h: &Home) {
         status_dot(ui, dot);
         ui.label(text);
     });
-    if s.session_active && s.is_fresh(h.now) {
+    if s.session_active && fresh {
         ui.add_space(8.0);
         ui.label(
             RichText::new("🔴 Someone is connected now")
                 .color(BAD)
                 .strong(),
         );
+    }
+    if fresh && !s.missing_permissions.is_empty() {
+        ui.add_space(10.0);
+        ui.label(RichText::new("macOS needs your OK:").strong());
+        for p in &s.missing_permissions {
+            if ui
+                .button(format!("Allow {p}…"))
+                .on_hover_text("Opens System Settings; switch rconn-host-agent on")
+                .clicked()
+            {
+                out.push(Request::OpenPermission(p.clone()));
+            }
+        }
+        ui.label(
+            RichText::new("Then restart the host so macOS applies it:")
+                .small()
+                .color(Color32::GRAY),
+        );
+        if ui.button("🔄 Restart host").clicked() {
+            out.push(Request::RestartHostAgent);
+        }
+    }
+    if h.can_host_here {
+        ui.add_space(16.0);
+        if ui.small_button("Turn off connections").clicked() {
+            out.push(Request::DisableHost);
+        }
     }
 }
 

@@ -27,11 +27,11 @@ for arch in x64 arm64; do
     -DOUT="$PWD/dist/rconn-host-setup-$arch-$VERSION.exe" deploy/windows/rconn-host.nsi
 done
 
-cargo build -q --release -p rconn-viewer -p rconn-app
-cargo build -q --release -p rconn-viewer -p rconn-app --target x86_64-apple-darwin
+cargo build -q --release -p rconn-viewer -p rconn-app -p rconn-host-agent
+cargo build -q --release -p rconn-viewer -p rconn-app -p rconn-host-agent --target x86_64-apple-darwin
 stage=dist/rconn-macos
 mkdir -p "$stage"
-for bin in rconn-viewer rconn rconn-tray; do
+for bin in rconn-viewer rconn rconn-tray rconn-host-agent; do
   lipo -create -output "$stage/$bin" "target/release/$bin" "target/x86_64-apple-darwin/release/$bin"
 done
 cp "$(scripts/fetch-openh264.sh mac-arm64)" "$(scripts/fetch-openh264.sh mac-x64)" "$stage/"

@@ -97,10 +97,12 @@ impl Cli {
         let name = rconn_media::cisco::current_binary_name()
             .context("no Cisco openh264 build for this platform")?;
         let exe = std::env::current_exe()?;
-        Ok(exe
-            .parent()
-            .context("executable has no directory")?
-            .join(name))
+        let dir = exe.parent().context("executable has no directory")?;
+        // macOS app bundle: Contents/Resources holds Cisco's (unmodified) library.
+        let bundled = dir.parent().map(|c| c.join("Resources").join(name));
+        Ok(bundled
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| dir.join(name)))
     }
 
     fn capturer_factory(&self) -> Result<stream::CapturerFactory> {
@@ -159,6 +161,7 @@ async fn main() -> Result<()> {
     );
 
     let host_kind = hostkind::detect();
+    request_permissions();
     let status = StatusPublisher::new(
         cli.status_file.clone(),
         host_id,
@@ -445,6 +448,7 @@ impl StatusPublisher {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let s = rconn_core::status::HostStatus {
+            missing_permissions: missing_permissions(),
             online,
             session_active,
             updated,
@@ -452,6 +456,41 @@ impl StatusPublisher {
         };
         if let Err(e) = s.write(path) {
             tracing::debug!(error = %e, "could not write status file");
+        }
+    }
+}
+
+/// OS permissions this host still needs to capture the screen and inject input.
+fn missing_permissions() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_core_graphics::{CGPreflightPostEventAccess, CGPreflightScreenCaptureAccess};
+        let mut missing = Vec::new();
+        if !CGPreflightScreenCaptureAccess() {
+            missing.push("Screen Recording".to_owned());
+        }
+        if !CGPreflightPostEventAccess() {
+            missing.push("Accessibility".to_owned());
+        }
+        missing
+    }
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
+}
+
+/// macOS: ask once for the permissions a host needs (shows the system prompts).
+fn request_permissions() {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_core_graphics::{
+            CGPreflightPostEventAccess, CGPreflightScreenCaptureAccess, CGRequestPostEventAccess,
+            CGRequestScreenCaptureAccess,
+        };
+        if !CGPreflightScreenCaptureAccess() {
+            let _ = CGRequestScreenCaptureAccess();
+        }
+        if !CGPreflightPostEventAccess() {
+            let _ = CGRequestPostEventAccess();
         }
     }
 }

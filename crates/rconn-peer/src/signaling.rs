@@ -112,6 +112,29 @@ impl SignalingClient {
         }
     }
 
+    /// Turn this computer into a host: returns its new id and certificate for `key`.
+    pub async fn enroll_host(
+        url: &str,
+        trust: &ServerTrust,
+        token: &str,
+        key: &rconn_core::fleet::HostKey,
+    ) -> Result<(rconn_core::ids::HostId, String)> {
+        let mut c = Self::connect_operator(url, trust, token).await?;
+        c.send(&ClientMessage::EnrollHost {
+            public_key_der: key.public_der(),
+        })
+        .await?;
+        loop {
+            match c.recv().await? {
+                ServerMessage::HostEnrolled { host_id, cert_pem } => {
+                    return Ok((host_id, cert_pem));
+                }
+                ServerMessage::Error { message, .. } => bail!("{message}"),
+                _ => continue,
+            }
+        }
+    }
+
     /// The org's online computers (needs an operator token).
     pub async fn list_hosts(
         url: &str,

@@ -44,10 +44,24 @@ pub fn service_state() -> String {
     }
 }
 
-/// Restart the agent so new settings apply; the service relaunches it within ~2 s.
+/// Restart the agent so new settings apply; it is back within ~2 s.
 pub fn restart_agent() -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        // Per-user LaunchAgent set up by the app (see rconn-app's machost).
+        let uid = quiet("id").arg("-u").output().map_err(|e| e.to_string())?;
+        let uid = String::from_utf8_lossy(&uid.stdout).trim().to_owned();
+        let out = quiet("launchctl")
+            .args(["kickstart", "-k", &format!("gui/{uid}/app.rconn.host")])
+            .output()
+            .map_err(|e| e.to_string())?;
+        return if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+        };
+    }
     if !cfg!(windows) {
-        return Err("Restarting the agent is Windows-only for now".into());
+        return Err("Restarting the agent isn't supported on this OS yet".into());
     }
     let out = quiet("taskkill")
         .args(["/IM", "rconn-host-agent.exe", "/F"])

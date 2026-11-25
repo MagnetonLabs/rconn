@@ -2,6 +2,8 @@
 
 pub mod home;
 pub mod icon;
+#[cfg(target_os = "macos")]
+pub mod machost;
 pub mod profile;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod tray;

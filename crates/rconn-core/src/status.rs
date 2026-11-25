@@ -17,6 +17,9 @@ pub struct HostStatus {
     pub online: bool,
     /// An operator is connected right now.
     pub session_active: bool,
+    /// OS permissions the host still needs (macOS: "Screen Recording", "Accessibility").
+    #[serde(default)]
+    pub missing_permissions: Vec<String>,
     /// Unix seconds of the last update (stale = agent not running).
     pub updated: u64,
 }

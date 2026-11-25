@@ -47,6 +47,8 @@ struct Inner {
     auth: Arc<dyn Authenticator>,
     audit: Arc<dyn AuditSink>,
     registry: Mutex<Registry>,
+    /// The org's fleet CA, when this server may enroll hosts itself.
+    enroller: std::sync::OnceLock<(rconn_core::ids::OrgId, rconn_core::fleet::FleetCa)>,
 }
 
 #[derive(Default)]
@@ -74,8 +76,15 @@ impl AppState {
                 auth,
                 audit,
                 registry: Mutex::default(),
+                enroller: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Let signed-in operators of `org` turn their own computers into hosts
+    /// ("Allow connections to this computer" in the app).
+    pub fn allow_enrollment(&self, org: rconn_core::ids::OrgId, ca: rconn_core::fleet::FleetCa) {
+        let _ = self.inner.enroller.set((org, ca));
     }
 
     fn audit(&self, event: AuditEvent) {
@@ -420,6 +429,34 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                 }
             }
             Next::Close(Phase::New)
+        }
+        (Phase::Ready(Peer::Operator(op)), ClientMessage::EnrollHost { public_key_der }) => {
+            let issued = match state.inner.enroller.get() {
+                Some((org, ca)) if *org == op.org_id => {
+                    let host_id = HostId::new();
+                    ca.issue_host_cert_for_public_key(host_id, &public_key_der)
+                        .map(|cert| (host_id, cert))
+                        .map_err(|_| "not a valid Ed25519 public key")
+                }
+                _ => Err("this server doesn't enroll hosts from the app"),
+            };
+            match issued {
+                Ok((host_id, cert_pem)) => {
+                    state.audit(AuditEvent::HostEnrolled {
+                        org_id: op.org_id,
+                        host_id,
+                        operator_id: op.operator_id,
+                    });
+                    let _ = tx.send(ServerMessage::HostEnrolled { host_id, cert_pem });
+                }
+                Err(message) => {
+                    let _ = tx.send(ServerMessage::Error {
+                        code: ErrorCode::BadRequest,
+                        message: message.into(),
+                    });
+                }
+            }
+            Next::Continue(Phase::Ready(Peer::Operator(op)))
         }
         (Phase::Ready(Peer::Operator(op)), ClientMessage::ListHosts) => {
             let reg = state.inner.registry.lock().await;

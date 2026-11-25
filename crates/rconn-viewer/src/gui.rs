@@ -228,6 +228,7 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 muted,
                 chrome: None,
                 reveal_until: None,
+                fit_window: false,
             }))
         }),
     )
@@ -391,6 +392,8 @@ struct ViewerApp {
     chrome: Option<Rect>,
     /// The floating toolbar stays out until then.
     reveal_until: Option<Instant>,
+    /// Resize the window to the remote screen's shape on the next frame.
+    fit_window: bool,
 }
 
 impl ViewerApp {
@@ -506,6 +509,17 @@ fn map_button(b: egui::PointerButton) -> Option<MouseButton> {
         egui::PointerButton::Extra1 => MouseButton::Back,
         egui::PointerButton::Extra2 => MouseButton::Forward,
     })
+}
+
+/// Window size showing a `remote`-sized screen with no black bars: 1:1 when it fits,
+/// else scaled down to 90% of the display, plus the toolbar.
+pub fn window_size_for(remote: Vec2, monitor: Option<Vec2>) -> Vec2 {
+    let max = monitor.unwrap_or(Vec2::new(1600.0, 1000.0)) * 0.9 - Vec2::new(0.0, BAR_H);
+    let scale = (max.x / remote.x).min(max.y / remote.y).min(1.0);
+    Vec2::new(
+        (remote.x * scale).round(),
+        (remote.y * scale).round() + BAR_H,
+    )
 }
 
 /// Largest rect with `aspect` (w/h) centred in `area`.
@@ -685,11 +699,22 @@ impl ViewerApp {
                 Some(t) if t.size() == [f.width, f.height] => t.set(img, TextureOptions::LINEAR),
                 _ => {
                     self.texture =
-                        Some(ui.ctx().load_texture("screen", img, TextureOptions::LINEAR))
+                        Some(ui.ctx().load_texture("screen", img, TextureOptions::LINEAR));
+                    self.fit_window = true; // first picture, or the remote resolution changed
                 }
             }
         }
         let fullscreen = self.is_fullscreen(ui);
+        if std::mem::take(&mut self.fit_window)
+            && !fullscreen
+            && let Some(t) = &self.texture
+        {
+            let [w, h] = t.size();
+            let monitor = ui.ctx().input(|i| i.viewport().monitor_size);
+            let size = window_size_for(Vec2::new(w as f32, h as f32), monitor);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
         let stats = self.stats(fps, kbps);
         if !fullscreen {
             self.chrome = None;
@@ -748,6 +773,23 @@ impl eframe::App for ViewerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_matches_the_remote_shape_and_fits_the_display() {
+        let remote = Vec2::new(1496.0, 938.0);
+        let big = window_size_for(remote, Some(Vec2::new(3000.0, 2000.0)));
+        assert_eq!(big, Vec2::new(1496.0, 938.0 + BAR_H), "1:1 when it fits");
+        let small = window_size_for(remote, Some(Vec2::new(1440.0, 900.0)));
+        let picture = Vec2::new(small.x, small.y - BAR_H);
+        assert!(
+            small.x <= 1296.0 && small.y <= 810.0,
+            "within 90% of the display: {small:?}"
+        );
+        assert!(
+            (picture.x / picture.y - remote.x / remote.y).abs() < 0.01,
+            "same shape: no bars"
+        );
+    }
 
     #[test]
     fn fit_letterboxes_and_centres() {
@@ -914,6 +956,7 @@ mod render_tests {
             muted: Arc::default(),
             chrome: None,
             reveal_until: None,
+            fit_window: false,
         }
     }
 
