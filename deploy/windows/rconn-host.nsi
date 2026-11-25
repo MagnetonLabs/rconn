@@ -11,6 +11,7 @@ Unicode true
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
 !include "x64.nsh"
+!include "getarg.nsh"
 
 Name "rconn host ${VERSION} (${ARCH})"
 OutFile "${OUT}"
@@ -27,8 +28,8 @@ Var PinField
 Var IdentityField
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "${__FILEDIR__}\rconn.ico"
-!define MUI_UNICON "${__FILEDIR__}\rconn.ico"
+!define MUI_ICON "rconn.ico"
+!define MUI_UNICON "rconn.ico"
 !insertmacro MUI_PAGE_WELCOME
 Page custom ServerPage ServerPageLeave
 !insertmacro MUI_PAGE_INSTFILES
@@ -44,9 +45,10 @@ Function .onInit
   ${EndIf}
   SetRegView 64
   ${GetParameters} $0
-  ${GetOptions} $0 "/SERVER=" $Server
-  ${GetOptions} $0 "/PIN=" $Pin
-  ${GetOptions} $0 "/IDENTITY=" $Identity
+  ; GetArg, not GetOptions: GetOptions cuts values at the first "/" (wss://...).
+  !insertmacro GetArg $0 "/SERVER=" $Server
+  !insertmacro GetArg $0 "/PIN=" $Pin
+  !insertmacro GetArg $0 "/IDENTITY=" $Identity
 FunctionEnd
 
 Function ServerPage
@@ -115,7 +117,7 @@ Section "rconn host" SecHost
   File "${SRC}\viewer\rconn-viewer.exe"
   File "${SRC}\viewer\rconn.exe"
   File "${SRC}\host\rconn-settings.exe"
-  File "${__FILEDIR__}\rconn.ico"
+  File "rconn.ico"
 
   ${If} $Pin == ""
     nsExec::ExecToLog '"$INSTDIR\rconn-host-service.exe" configure --server "$Server" --identity-from "$Identity"'

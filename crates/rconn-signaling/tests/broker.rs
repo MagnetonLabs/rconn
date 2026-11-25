@@ -116,7 +116,7 @@ async fn connect_host(url: &str) -> (Ws, HostId) {
             host_id,
             cert_pem: "test".into(),
             client_nonce: vec![0; 32],
-            label: None,
+            label: Some("BOX-1".into()),
         },
     )
     .await;
@@ -461,5 +461,27 @@ async fn audit_trail_records_the_whole_lifecycle() {
                 reason: EndReason::HostOffline
             },
         ]
+    );
+}
+
+#[tokio::test]
+async fn computer_list_shows_own_org_hosts_with_their_names() {
+    let (url, _) = start().await;
+    let (_host, host_id) = connect_host(&url).await;
+    let mut op = connect_operator(&url, "op-a").await;
+    send(&mut op, &ClientMessage::ListHosts).await;
+    match recv(&mut op).await {
+        Some(ServerMessage::Hosts { hosts }) => {
+            assert_eq!(hosts.len(), 1);
+            assert_eq!(hosts[0].host_id, host_id);
+            assert_eq!(hosts[0].label.as_deref(), Some("BOX-1"));
+        }
+        other => panic!("expected Hosts, got {other:?}"),
+    }
+    // Another org's operator sees none of them.
+    let mut op_b = connect_operator(&url, "op-b").await;
+    send(&mut op_b, &ClientMessage::ListHosts).await;
+    assert!(
+        matches!(recv(&mut op_b).await, Some(ServerMessage::Hosts { hosts }) if hosts.is_empty())
     );
 }

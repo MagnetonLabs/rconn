@@ -85,6 +85,8 @@ enum Cmd {
         #[arg(long, default_value_t = 8765)]
         redirect_port: u16,
     },
+    /// List the computers that are online (ID, short code, name).
+    Hosts,
     /// Open a session to a host and measure data-channel round-trip time.
     Ping {
         host: uuid::Uuid,
@@ -177,6 +179,20 @@ async fn main() -> Result<()> {
                 *redirect_port,
             )
             .await
+        }
+        Cmd::Hosts => {
+            let hosts =
+                SignalingClient::list_hosts(&cli.server, &trust(&cli), &token_for(&cli)?).await?;
+            for h in &hosts {
+                println!(
+                    "{}  {}  {}",
+                    h.host_id.short_code(),
+                    h.host_id,
+                    h.label.as_deref().unwrap_or("-")
+                );
+            }
+            println!("{} computer(s) online", hosts.len());
+            Ok(())
         }
         Cmd::Ping {
             host,

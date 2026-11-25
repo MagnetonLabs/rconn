@@ -174,7 +174,7 @@ async fn main() -> Result<()> {
             host_id,
             key: &key,
             cert_pem: &cert,
-            label: None,
+            label: Some(machine_name()),
         };
         match SignalingClient::connect_host(&server, &trust, creds).await {
             Ok(sig) => {
