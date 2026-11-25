@@ -37,7 +37,7 @@ done
 cp "$(scripts/fetch-openh264.sh mac-arm64)" "$(scripts/fetch-openh264.sh mac-x64)" "$stage/"
 cp deploy/README-package.txt "$stage/README.txt"
 (cd dist && zip -qr "rconn-macos-$VERSION.zip" rconn-macos)
-deploy/macos/make-dmg.sh "$stage" "$VERSION" "dist/rconn-$VERSION.dmg" >/dev/null
+deploy/macos/make-dmg.sh "$stage" "$VERSION" "dist/Rconn-$VERSION.dmg" >/dev/null
 
 (cd dist && shasum -a 256 ./*.zip ./*.exe ./*.dmg > SHA256SUMS)
 ls -lh dist/*.zip dist/*.exe dist/*.dmg

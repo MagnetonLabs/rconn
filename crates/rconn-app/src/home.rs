@@ -149,7 +149,7 @@ fn this_computer(ui: &mut egui::Ui, h: &Home, out: &mut Vec<Request>) {
     ui.add_space(6.0);
     let Some(s) = &h.this else {
         if !h.can_host_here {
-            ui.label("Connections to this computer are off: the rconn host isn't installed here.");
+            ui.label("Connections to this computer are off: the Rconn host isn't installed here.");
             return;
         }
         ui.label("Connections to this computer are off.");
@@ -219,7 +219,7 @@ fn this_computer(ui: &mut egui::Ui, h: &Home, out: &mut Vec<Request>) {
         for p in &s.missing_permissions {
             if ui
                 .button(format!("Allow {p}…"))
-                .on_hover_text("Opens System Settings; switch rconn-host-agent on")
+                .on_hover_text("Opens System Settings; switch Rconn on")
                 .clicked()
             {
                 out.push(Request::OpenPermission(p.clone()));
@@ -375,7 +375,7 @@ fn computers(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
         return empty(
             ui,
             "🖥",
-            "No computers online. Install rconn host on a computer to add it.",
+            "No computers online. Install the Rconn host on a computer to add it.",
         );
     }
     let enabled = h.busy.is_none();
@@ -525,7 +525,7 @@ fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     match &mut h.host_settings {
         None => {
             ui.label(
-                "The rconn host isn't installed here, so nobody can connect to this computer.",
+                "The Rconn host isn't installed here, so nobody can connect to this computer.",
             );
         }
         Some(model) => {

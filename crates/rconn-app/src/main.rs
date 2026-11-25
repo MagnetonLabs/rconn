@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([760.0, 520.0])
-            .with_title("rconn")
+            .with_title("Rconn")
             .with_icon(egui::IconData {
                 rgba: icon.rgba,
                 width: icon.width,
@@ -93,7 +93,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "rconn",
+        "Rconn",
         options,
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();

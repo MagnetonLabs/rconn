@@ -16,7 +16,7 @@ pub struct I420 {
 /// Rows per band below which splitting isn't worth a thread.
 const MIN_BAND_ROWS: usize = 64;
 
-fn threads() -> usize {
+pub(crate) fn threads() -> usize {
     std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(8)
@@ -193,6 +193,45 @@ impl I420 {
     }
 }
 
+/// One BT.601 limited-range pixel, as openh264's own conversion.
+#[inline]
+fn yuv_to_rgba(y: u8, u: u8, v: u8) -> [u8; 4] {
+    let c = 298 * (i32::from(y) - 16);
+    let d = i32::from(u) - 128;
+    let e = i32::from(v) - 128;
+    let clamp = |n: i32| ((n + 128) >> 8).clamp(0, 255) as u8;
+    [
+        clamp(c + 409 * e),
+        clamp(c - 100 * d - 208 * e),
+        clamp(c + 516 * d),
+        255,
+    ]
+}
+
+/// Converts `out` (`width * height * 4` bytes) in bands of rows, one per core;
+/// `row(y, dst)` fills one row.
+fn rgba_bands(
+    (width, height): (usize, usize),
+    out: &mut [u8],
+    row: impl Fn(usize, &mut [u8]) + Sync,
+) {
+    assert!(out.len() >= width * height * 4);
+    let rows_per = height.div_ceil(threads()).next_multiple_of(2).max(2);
+    let row = &row;
+    std::thread::scope(|s| {
+        for (band, dst) in out[..width * height * 4]
+            .chunks_mut(rows_per * width * 4)
+            .enumerate()
+        {
+            s.spawn(move || {
+                for (r, line) in dst.chunks_exact_mut(width * 4).enumerate() {
+                    row(band * rows_per + r, line);
+                }
+            });
+        }
+    });
+}
+
 /// I420 planes -> RGBA (BT.601 limited range, as openh264's own conversion), split across
 /// cores. `strides` are (Y, U, V) bytes per row; `out` is `width * height * 4` bytes.
 pub fn i420_to_rgba(
@@ -201,31 +240,26 @@ pub fn i420_to_rgba(
     (width, height): (usize, usize),
     out: &mut [u8],
 ) {
-    assert!(out.len() >= width * height * 4);
-    let rows_per = height.div_ceil(threads()).next_multiple_of(2).max(2);
-    std::thread::scope(|s| {
-        for (band, dst) in out[..width * height * 4]
-            .chunks_mut(rows_per * width * 4)
-            .enumerate()
-        {
-            s.spawn(move || {
-                for (r, row) in dst.chunks_exact_mut(width * 4).enumerate() {
-                    let yy = band * rows_per + r;
-                    let (yrow, urow, vrow) =
-                        (&y[yy * ys..], &u[(yy / 2) * us..], &v[(yy / 2) * vs..]);
-                    for x in 0..width {
-                        let c = 298 * (i32::from(yrow[x]) - 16);
-                        let d = i32::from(urow[x / 2]) - 128;
-                        let e = i32::from(vrow[x / 2]) - 128;
-                        let clamp = |n: i32| ((n + 128) >> 8).clamp(0, 255) as u8;
-                        let px = &mut row[4 * x..4 * x + 4];
-                        px[0] = clamp(c + 409 * e);
-                        px[1] = clamp(c - 100 * d - 208 * e);
-                        px[2] = clamp(c + 516 * d);
-                        px[3] = 255;
-                    }
-                }
-            });
+    rgba_bands((width, height), out, |yy, line| {
+        let (yrow, urow, vrow) = (&y[yy * ys..], &u[(yy / 2) * us..], &v[(yy / 2) * vs..]);
+        for (x, px) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *px = yuv_to_rgba(yrow[x], urow[x / 2], vrow[x / 2]);
+        }
+    });
+}
+
+/// NV12 (Y plane, then interleaved U/V) -> RGBA, same colours as [`i420_to_rgba`].
+pub fn nv12_to_rgba(
+    (y, uv): (&[u8], &[u8]),
+    (ys, uvs): (usize, usize),
+    (width, height): (usize, usize),
+    out: &mut [u8],
+) {
+    rgba_bands((width, height), out, |yy, line| {
+        let (yrow, uvrow) = (&y[yy * ys..], &uv[(yy / 2) * uvs..]);
+        for (x, px) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let c = x & !1;
+            *px = yuv_to_rgba(yrow[x], uvrow[c], uvrow[c + 1]);
         }
     });
 }

@@ -74,7 +74,7 @@ struct Cli {
     /// the CPU can't keep up.
     #[arg(long, default_value_t = 60)]
     max_fps: u32,
-    #[arg(long, default_value_t = 8000)]
+    #[arg(long, default_value_t = 25_000)]
     max_kbps: u32,
     /// Host settings file (the service passes ProgramData\\rconn\\host.toml).
     #[arg(long, env = "RCONN_SETTINGS")]
@@ -562,7 +562,7 @@ fn lock_screen() -> Result<()> {
 fn restart_computer() -> Result<()> {
     #[cfg(windows)]
     let status = std::process::Command::new("shutdown")
-        .args(["/r", "/t", "5", "/c", "Restart requested from rconn"])
+        .args(["/r", "/t", "5", "/c", "Restart requested from Rconn"])
         .status()?;
     #[cfg(not(windows))]
     let status = std::process::Command::new("osascript")

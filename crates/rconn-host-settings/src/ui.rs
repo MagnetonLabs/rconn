@@ -15,7 +15,7 @@ const LEVELS: [&str; 4] = ["error", "warn", "info", "debug"];
 
 pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
     let mut actions = Actions::default();
-    ui.heading("rconn host settings");
+    ui.heading("Rconn host settings");
     ui.add_space(4.0);
 
     egui::Grid::new("status")

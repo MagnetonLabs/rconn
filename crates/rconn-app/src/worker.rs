@@ -339,7 +339,7 @@ impl Worker {
     /// host agent as a login item.
     async fn enable_host(&self) {
         #[cfg(not(target_os = "macos"))]
-        self.notice("Use the rconn host installer on this OS", true);
+        self.notice("Use the Rconn host installer on this OS", true);
         #[cfg(target_os = "macos")]
         {
             let Some(token) = self.token() else {

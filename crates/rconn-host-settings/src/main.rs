@@ -37,11 +37,11 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([720.0, 520.0])
-            .with_title("rconn settings"),
+            .with_title("Rconn settings"),
         ..Default::default()
     };
     eframe::run_native(
-        "rconn settings",
+        "Rconn settings",
         options,
         Box::new(|_| Ok(Box::new(App(model)))),
     )

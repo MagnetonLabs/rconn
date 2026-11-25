@@ -13,12 +13,12 @@ Unicode true
 !include "x64.nsh"
 !include "getarg.nsh"
 
-Name "rconn host ${VERSION} (${ARCH})"
+Name "Rconn host ${VERSION} (${ARCH})"
 OutFile "${OUT}"
 InstallDir "$PROGRAMFILES64\rconn"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
-BrandingText "rconn"
+BrandingText "Rconn"
 
 Var Server
 Var Pin
@@ -40,7 +40,7 @@ Page custom ServerPage ServerPageLeave
 
 Function .onInit
   ${IfNot} ${RunningX64}
-    MessageBox MB_ICONSTOP "rconn requires 64-bit Windows." /SD IDOK
+    MessageBox MB_ICONSTOP "Rconn requires 64-bit Windows." /SD IDOK
     Abort
   ${EndIf}
   SetRegView 64
@@ -52,7 +52,7 @@ Function .onInit
 FunctionEnd
 
 Function ServerPage
-  !insertmacro MUI_HEADER_TEXT "Connect to your rconn server" "Values printed by the server installer and by enroll-host."
+  !insertmacro MUI_HEADER_TEXT "Connect to your Rconn server" "Values printed by the server installer and by enroll-host."
   nsDialogs::Create 1018
   Pop $0
   ${NSD_CreateLabel} 0 0 100% 12u "Server URL (e.g. wss://rconn.example.com:443/v1/ws):"
@@ -93,7 +93,7 @@ Function ServerPageLeave
   ${EndIf}
 FunctionEnd
 
-Section "rconn host" SecHost
+Section "Rconn host" SecHost
   SetRegView 64
   ${If} $Server == ""
   ${OrIf} $Identity == ""
@@ -141,23 +141,27 @@ Section "rconn host" SecHost
 
   ; Start Menu + desktop for everyone; the tray icon starts at every login.
   SetShellVarContext all
-  CreateShortcut "$SMPROGRAMS\rconn.lnk" "$INSTDIR\rconn.exe" "" "$INSTDIR\rconn.ico"
-  CreateShortcut "$SMPROGRAMS\rconn host settings.lnk" "$INSTDIR\rconn-settings.exe" "" "$INSTDIR\rconn.ico"
-  CreateShortcut "$DESKTOP\rconn.lnk" "$INSTDIR\rconn.exe" "" "$INSTDIR\rconn.ico"
+  ; Older installs named these in lowercase; Windows keeps a file's old case, so remove first.
+  Delete "$SMPROGRAMS\rconn.lnk"
+  Delete "$SMPROGRAMS\rconn host settings.lnk"
+  Delete "$DESKTOP\rconn.lnk"
+  CreateShortcut "$SMPROGRAMS\Rconn.lnk" "$INSTDIR\rconn.exe" "" "$INSTDIR\rconn.ico"
+  CreateShortcut "$SMPROGRAMS\Rconn host settings.lnk" "$INSTDIR\rconn-settings.exe" "" "$INSTDIR\rconn.ico"
+  CreateShortcut "$DESKTOP\Rconn.lnk" "$INSTDIR\rconn.exe" "" "$INSTDIR\rconn.ico"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "rconn" '"$INSTDIR\rconn.exe" --tray'
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
   !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\rconn-host"
-  WriteRegStr HKLM "${UNINST}" "DisplayName" "rconn host"
+  WriteRegStr HKLM "${UNINST}" "DisplayName" "Rconn host"
   WriteRegStr HKLM "${UNINST}" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKLM "${UNINST}" "Publisher" "rconn"
+  WriteRegStr HKLM "${UNINST}" "Publisher" "Rconn"
   WriteRegStr HKLM "${UNINST}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKLM "${UNINST}" "DisplayIcon" "$INSTDIR\rconn.ico"
   WriteRegStr HKLM "${UNINST}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKLM "${UNINST}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
   WriteRegDWORD HKLM "${UNINST}" "NoModify" 1
   WriteRegDWORD HKLM "${UNINST}" "NoRepair" 1
-  DetailPrint "rconn host installed and running (service: rconn-host)."
+  DetailPrint "Rconn host installed and running (service: rconn-host)."
   ; Open the app as the signed-in user (not elevated): explorer starts it unelevated.
   ${IfNot} ${Silent}
     Exec '"$WINDIR\explorer.exe" "$INSTDIR\rconn.exe"'
@@ -173,9 +177,9 @@ Section "Uninstall"
   nsExec::ExecToLog 'taskkill /IM rconn.exe /F'
   Pop $0
   SetShellVarContext all
-  Delete "$SMPROGRAMS\rconn.lnk"
-  Delete "$SMPROGRAMS\rconn host settings.lnk"
-  Delete "$DESKTOP\rconn.lnk"
+  Delete "$SMPROGRAMS\Rconn.lnk"
+  Delete "$SMPROGRAMS\Rconn host settings.lnk"
+  Delete "$DESKTOP\Rconn.lnk"
   DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "rconn"
   Delete "$INSTDIR\rconn.exe"
   Delete "$INSTDIR\rconn-settings.exe"

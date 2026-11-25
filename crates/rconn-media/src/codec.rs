@@ -7,6 +7,8 @@ use thiserror::Error;
 pub enum CodecError {
     #[error("openh264: {0}")]
     OpenH264(String),
+    #[error("VideoToolbox: {0}")]
+    VideoToolbox(String),
     #[error("opus: {0}")]
     Opus(#[from] opus::Error),
 }

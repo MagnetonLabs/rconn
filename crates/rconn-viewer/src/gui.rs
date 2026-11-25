@@ -246,7 +246,7 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
 /// Later `rconn-viewer connect` runs add tabs to it (see [`hand_off`]).
 pub fn run(args: ConnectArgs) -> Result<()> {
     let chromeless = args.chromeless;
-    let title = format!("rconn — {}", args.name);
+    let title = format!("Rconn — {}", args.name);
     let ctx_slot: Arc<Mutex<Option<egui::Context>>> = Arc::default();
     let (tab_tx, tab_rx) = std::sync::mpsc::channel::<ConnectArgs>();
     if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", VIEWER_PORT)) {
@@ -278,10 +278,19 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 v
             }
         },
+        // Show each picture as soon as it is drawn: waiting for the display's refresh
+        // (the default) adds up to two frames (16-33 ms at 60 Hz) of delay.
+        wgpu_options: eframe::WgpuConfiguration {
+            surface: eframe::SurfaceConfig {
+                present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+                desired_maximum_frame_latency: Some(1),
+            },
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
-        "rconn",
+        "Rconn",
         options,
         Box::new(move |cc| {
             *ctx_slot.lock().expect("ctx") = Some(cc.egui_ctx.clone());
@@ -415,7 +424,7 @@ impl eframe::App for Window {
         let tab = &mut self.tabs[self.active];
         // Only on change: every viewport command makes egui repaint, so sending the title
         // each frame would redraw the window nonstop (100%+ CPU).
-        let title = format!("rconn — {}", tab.name);
+        let title = format!("Rconn — {}", tab.name);
         if self.title != title {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1020,7 +1029,7 @@ impl ViewerApp {
             p.text(
                 tab.center(),
                 egui::Align2::CENTER_CENTER,
-                "rconn",
+                "Rconn",
                 egui::FontId::proportional(13.0),
                 Color32::from_gray(220),
             );
@@ -1034,7 +1043,12 @@ impl ViewerApp {
             (s.frame.take(), s.status.clone(), s.fps, s.kbps)
         };
         if let Some(f) = new_frame {
-            let img = ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
+            // Hand the pixels over without converting them one by one (opaque RGBA is
+            // already what egui stores): saves a full-picture pass on this thread.
+            let img = Arc::new(ColorImage::new(
+                [f.width, f.height],
+                bytemuck::cast_slice::<u8, Color32>(&f.rgba).to_vec(),
+            ));
             match &mut self.texture {
                 Some(t) if t.size() == [f.width, f.height] => t.set(img, TextureOptions::LINEAR),
                 _ => {

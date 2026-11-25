@@ -308,41 +308,100 @@ pub struct DecodedFrame {
     pub rgba: Vec<u8>,
 }
 
+/// H.264 decoder: the Mac's hardware decoder (VideoToolbox) where available, Cisco's
+/// openh264 otherwise. `RCONN_DECODER=openh264` forces software, for comparisons.
 pub struct VideoDecoder {
-    decoder: Decoder,
+    engine: DecEngine,
+    /// For falling back to software if the hardware decoder refuses a stream.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    openh264_path: std::path::PathBuf,
+}
+
+enum DecEngine {
+    OpenH264(Box<Decoder>),
+    #[cfg(target_os = "macos")]
+    VideoToolbox(crate::vt::VtDecoder),
 }
 
 impl VideoDecoder {
     pub fn new(openh264_path: &std::path::Path) -> Result<Self, CodecError> {
-        let api = crate::codec::load_openh264(openh264_path)?;
+        let software = std::env::var("RCONN_DECODER").is_ok_and(|v| v == "openh264");
+        let engine = if cfg!(target_os = "macos") && !software {
+            #[cfg(target_os = "macos")]
+            {
+                DecEngine::VideoToolbox(crate::vt::VtDecoder::new())
+            }
+            #[cfg(not(target_os = "macos"))]
+            unreachable!()
+        } else {
+            Self::openh264(openh264_path)?
+        };
+        Ok(Self {
+            engine,
+            openh264_path: openh264_path.to_owned(),
+        })
+    }
+
+    fn openh264(path: &std::path::Path) -> Result<DecEngine, CodecError> {
+        let api = crate::codec::load_openh264(path)?;
         let decoder = Decoder::with_api_config(api, DecoderConfig::new())
             .map_err(|e| CodecError::OpenH264(e.to_string()))?;
-        Ok(Self { decoder })
+        Ok(DecEngine::OpenH264(Box::new(decoder)))
+    }
+
+    pub fn engine_name(&self) -> &'static str {
+        match self.engine {
+            DecEngine::OpenH264(_) => "openh264 (software)",
+            #[cfg(target_os = "macos")]
+            DecEngine::VideoToolbox(_) => "VideoToolbox (hardware)",
+        }
     }
 
     /// Decode one Annex-B access unit. `None` until the decoder has a full picture.
     pub fn decode(&mut self, annex_b: &[u8]) -> Result<Option<DecodedFrame>, CodecError> {
-        let Some(yuv) = self
-            .decoder
-            .decode(annex_b)
-            .map_err(|e| CodecError::OpenH264(e.to_string()))?
-        else {
-            return Ok(None);
-        };
-        let (width, height) = yuv.dimensions();
-        let mut rgba = vec![0u8; width * height * 4];
-        // Our conversion uses every core (openh264's uses one: ~20 ms at 2992x1878).
-        crate::yuv::i420_to_rgba(
-            (yuv.y(), yuv.u(), yuv.v()),
-            yuv.strides(),
-            (width, height),
-            &mut rgba,
-        );
-        Ok(Some(DecodedFrame {
-            width,
-            height,
-            rgba,
-        }))
+        match &mut self.engine {
+            #[cfg(target_os = "macos")]
+            DecEngine::VideoToolbox(vt) => {
+                let mut rgba = Vec::new();
+                match vt.decode(annex_b, &mut rgba) {
+                    Ok(Some((width, height))) => Ok(Some(DecodedFrame {
+                        width,
+                        height,
+                        rgba,
+                    })),
+                    Ok(None) => Ok(None),
+                    Err(e) if e.starts_with("VTDecompressionSessionCreate") => {
+                        // No hardware decoder for this stream: software from here on.
+                        tracing::warn!(error = %e, "hardware decoder unavailable; using openh264");
+                        self.engine = Self::openh264(&self.openh264_path)?;
+                        self.decode(annex_b)
+                    }
+                    Err(e) => Err(CodecError::VideoToolbox(e)),
+                }
+            }
+            DecEngine::OpenH264(decoder) => {
+                let Some(yuv) = decoder
+                    .decode(annex_b)
+                    .map_err(|e| CodecError::OpenH264(e.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                let (width, height) = yuv.dimensions();
+                let mut rgba = vec![0u8; width * height * 4];
+                // Our conversion uses every core (openh264's uses one: ~20 ms at 2992x1878).
+                crate::yuv::i420_to_rgba(
+                    (yuv.y(), yuv.u(), yuv.v()),
+                    yuv.strides(),
+                    (width, height),
+                    &mut rgba,
+                );
+                Ok(Some(DecodedFrame {
+                    width,
+                    height,
+                    rgba,
+                }))
+            }
+        }
     }
 }
 
@@ -448,5 +507,106 @@ mod usage_bench {
                 t.elapsed().as_secs_f64() * 1e3 / frames.len() as f64
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod hardware_decode {
+    //! `cargo test --release -p rconn-media hardware_decode -- --nocapture` prints speed.
+    use super::*;
+
+    /// A 2992x1878 desktop-like stream: text-ish stripes that scroll every frame.
+    fn stream(lib: &std::path::Path, n: usize) -> Vec<Vec<u8>> {
+        let (w, h) = (2992, 1878);
+        let mut enc = VideoEncoder::new(
+            lib,
+            EncoderSettings {
+                bitrate_bps: 8_000_000,
+                max_fps: 30.0,
+                threads: 0,
+                slice_bytes: None,
+            },
+        )
+        .unwrap();
+        (0..n)
+            .filter_map(|k| {
+                let mut bgra = vec![0u8; w * h * 4];
+                for (i, px) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let (x, y) = (i % w, i / w + k * 9);
+                    let ink = (y / 14) % 3 != 0 && (x / 7 + y / 14) % 5 != 0;
+                    let c = if ink { 40 } else { 235 };
+                    *px = [
+                        c,
+                        (c as usize + x / 12) as u8,
+                        (c as usize + y % 200) as u8,
+                        255,
+                    ];
+                }
+                enc.encode(&Frame {
+                    width: w,
+                    height: h,
+                    bgra,
+                    captured_at: Instant::now(),
+                })
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// Pictures, and steady-state ms per frame (the first two frames start the decoder).
+    fn decode_all(dec: &mut VideoDecoder, aus: &[Vec<u8>]) -> (Vec<DecodedFrame>, f64) {
+        let mut frames = Vec::new();
+        let mut t = Instant::now();
+        for (i, au) in aus.iter().enumerate() {
+            if i == 2 {
+                t = Instant::now();
+            }
+            frames.extend(dec.decode(au).unwrap());
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / (aus.len() - 2) as f64;
+        (frames, ms)
+    }
+
+    #[test]
+    fn matches_software_decoder_and_reports_speed() {
+        let Some(lib) = crate::cisco::local_binary_path() else {
+            return;
+        };
+        let aus = stream(&lib, 40);
+        let mut hw = VideoDecoder::new(&lib).unwrap();
+        assert_eq!(hw.engine_name(), "VideoToolbox (hardware)");
+        let mut sw = VideoDecoder {
+            engine: VideoDecoder::openh264(&lib).unwrap(),
+            openh264_path: lib.clone(),
+        };
+        let (a, hw_ms) = decode_all(&mut hw, &aus);
+        let (b, sw_ms) = decode_all(&mut sw, &aus);
+        assert_eq!(hw.engine_name(), "VideoToolbox (hardware)", "no fallback");
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.len(), aus.len(), "every unit gives a picture");
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!((x.width, x.height), (y.width, y.height));
+            let diff: u64 = x
+                .rgba
+                .iter()
+                .zip(&y.rgba)
+                .map(|(p, q)| u64::from(p.abs_diff(*q)))
+                .sum();
+            let mean = diff as f64 / x.rgba.len() as f64;
+            if mean >= 3.0 {
+                for i in [0usize, 1001, 50_000, 2_000_000] {
+                    println!(
+                        "px {i}: hw {:?} sw {:?}",
+                        &x.rgba[i * 4..i * 4 + 4],
+                        &y.rgba[i * 4..i * 4 + 4]
+                    );
+                }
+            }
+            assert!(mean < 3.0, "hardware picture differs: mean {mean:.2}");
+        }
+        println!(
+            "{}x{}: VideoToolbox {hw_ms:.1} ms/frame, openh264 {sw_ms:.1} ms/frame",
+            a[0].width, a[0].height
+        );
     }
 }

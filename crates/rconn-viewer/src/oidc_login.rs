@@ -89,7 +89,7 @@ fn wait_for_callback(listener: &TcpListener) -> Result<(String, String)> {
                 .map(|(_, v)| v.to_owned())
         })
     };
-    let body = "Signed in. You can close this window and return to rconn.";
+    let body = "Signed in. You can close this window and return to Rconn.";
     let _ = write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",

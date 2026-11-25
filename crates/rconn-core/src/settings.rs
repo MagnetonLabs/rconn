@@ -89,7 +89,7 @@ impl Default for HostSettings {
             hidden_mode: HiddenMode::Auto,
             host_kind: None,
             clipboard: true,
-            max_bitrate_kbps: 8_000,
+            max_bitrate_kbps: 25_000,
             log_level: "info".into(),
         }
     }

@@ -32,8 +32,10 @@ pub const H264_PAYLOAD_TYPE: u8 = 102;
 const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 
 pub const MIN_BITRATE_BPS: f64 = 300_000.0;
-pub const START_BITRATE_BPS: f64 = 2_500_000.0;
-pub const MAX_BITRATE_BPS: f64 = 20_000_000.0;
+/// High enough for a sharp full-resolution desktop from the first second; congestion
+/// control lowers it within a few round trips on a slow link.
+pub const START_BITRATE_BPS: f64 = 8_000_000.0;
+pub const MAX_BITRATE_BPS: f64 = 25_000_000.0;
 
 pub const OPUS_PAYLOAD_TYPE: u8 = 111;
 

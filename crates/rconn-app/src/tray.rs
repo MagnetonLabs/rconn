@@ -51,8 +51,8 @@ pub fn run(status_file: PathBuf) -> anyhow::Result<()> {
         icon: None,
         id_item: MenuItem::new("ID: not set up", false, None),
         state_item: MenuItem::new("", false, None),
-        open: MenuItem::new("Open rconn", true, None),
-        quit: MenuItem::new("Quit rconn", true, None),
+        open: MenuItem::new("Open Rconn", true, None),
+        quit: MenuItem::new("Quit Rconn", true, None),
         next_status: Instant::now(),
     };
     event_loop.run_app(&mut tray)?;
@@ -119,7 +119,7 @@ impl Tray {
                 // Windows: left click opens the window, right click the menu.
                 // macOS: any click opens the menu, as menu-bar icons do.
                 .with_menu_on_left_click(mac)
-                .with_tooltip("rconn")
+                .with_tooltip("Rconn")
                 .build()?,
         );
         Ok(())
@@ -148,7 +148,7 @@ impl Tray {
         self.id_item.set_text(&id);
         self.state_item.set_text(state);
         if let Some(icon) = &self.icon {
-            let _ = icon.set_tooltip(Some(format!("rconn: {id}, {}", state.to_lowercase())));
+            let _ = icon.set_tooltip(Some(format!("Rconn: {id}, {}", state.to_lowercase())));
         }
     }
 }

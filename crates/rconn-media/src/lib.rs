@@ -9,4 +9,6 @@ pub mod mf;
 #[cfg(all(windows, target_arch = "aarch64"))]
 mod opus_shim;
 pub mod video;
+#[cfg(target_os = "macos")]
+pub mod vt;
 pub mod yuv;
