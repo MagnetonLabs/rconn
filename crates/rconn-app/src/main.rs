@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--tray") {
         #[cfg(any(windows, target_os = "macos"))]
-        return rconn_app::tray::run(rconn_host_settings::platform::status_file());
+        return rconn_app::tray::run(rconn_app::worker::Paths::installed().status_file);
         #[cfg(not(any(windows, target_os = "macos")))]
         return Ok(());
     }

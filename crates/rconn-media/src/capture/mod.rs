@@ -4,6 +4,8 @@
 //!   basic display adapters in VMs; only returns frames when something changed.
 //! * macOS: ScreenCaptureKit ([`macos`]): an `SCStream` of the main display at native
 //!   pixel size; needs the Screen Recording permission. Also only sends changed frames.
+//! * Linux (X11): MIT-SHM reads of the root window, converting only what XDamage reports
+//!   changed ([`x11`]).
 //! * [`TestPattern`]: synthetic moving content, for pipelines without a desktop.
 
 use crate::video::Frame;
@@ -15,6 +17,8 @@ use thiserror::Error;
 pub mod dxgi;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "linux")]
+pub mod x11;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -90,7 +94,11 @@ pub fn primary_display() -> Result<Box<dyn Capturer>, CaptureError> {
     {
         Ok(Box::new(macos::MacCapturer::new()?))
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(x11::X11Capturer::new()?))
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         Err(CaptureError::Backend(
             "no capture backend for this OS yet".into(),

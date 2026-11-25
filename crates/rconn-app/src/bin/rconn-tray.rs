@@ -4,7 +4,7 @@
 
 fn main() -> anyhow::Result<()> {
     #[cfg(any(windows, target_os = "macos"))]
-    return rconn_app::tray::run(rconn_host_settings::platform::status_file());
+    return rconn_app::tray::run(rconn_app::worker::Paths::installed().status_file);
     #[cfg(not(any(windows, target_os = "macos")))]
     Ok(())
 }
