@@ -65,6 +65,8 @@ pub struct DxgiCapturer {
     want_full: bool,
     /// When this capturer started (for the no-first-frame fallback).
     started: Instant,
+    /// DXGI "access lost" count (logged sparingly).
+    access_lost: u32,
 }
 
 /// With no first image from DXGI after this long, grab one through GDI instead.
@@ -115,6 +117,7 @@ impl DxgiCapturer {
                     staging: None,
                     want_full: true,
                     started: Instant::now(),
+                    access_lost: 0,
                 });
             }
             Err(CaptureError::NoOutput)
@@ -268,34 +271,28 @@ impl DxgiCapturer {
     }
 }
 
-impl Capturer for DxgiCapturer {
-    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+impl DxgiCapturer {
+    /// One DXGI attempt: `Ok(None)` when nothing new is available.
+    fn acquire(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
         let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
         let dup = self.duplication()?.clone();
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
         match unsafe { dup.AcquireNextFrame(ms, &mut info, &mut resource) } {
             Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                // Nothing presented yet (idle desktop; a VM whose window is hidden on the
-                // host Mac presents nothing at all): read the desktop directly once, so a
-                // new viewer always gets a picture.
-                if self.want_full && self.started.elapsed() > FIRST_FRAME_FALLBACK {
-                    let frame = self.gdi_snapshot()?;
-                    self.want_full = false;
-                    tracing::info!(
-                        w = frame.width,
-                        h = frame.height,
-                        "first picture taken via GDI (DXGI had none)"
-                    );
-                    return Ok(Some(frame));
-                }
-                return Ok(None);
-            }
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                // Desktop switch, resolution change, full-screen app: start over.
-                tracing::debug!("desktop duplication lost; recreating");
+                // Desktop switch, resolution change, full-screen app, or a display that
+                // isn't being presented: start over, without spinning.
+                self.access_lost += 1;
+                if self.access_lost == 1 || self.access_lost.is_multiple_of(100) {
+                    tracing::info!(
+                        times = self.access_lost,
+                        "desktop duplication lost; recreating"
+                    );
+                }
                 self.dup = None;
+                std::thread::sleep(Duration::from_millis(50));
                 return Ok(None);
             }
             Err(e) => return Err(backend(e)),
@@ -303,16 +300,33 @@ impl Capturer for DxgiCapturer {
         let result = match resource {
             // LastPresentTime == 0 means only the cursor moved, except for the first image
             // after duplication starts, which we always take.
-            Some(r) if info.LastPresentTime != 0 || self.want_full => {
-                let frame = self.copy_out(r);
-                if frame.is_ok() {
-                    self.want_full = false;
-                }
-                frame.map(Some)
-            }
+            Some(r) if info.LastPresentTime != 0 || self.want_full => self.copy_out(r).map(Some),
             _ => Ok(None),
         };
         let _ = unsafe { dup.ReleaseFrame() };
         result
+    }
+}
+
+impl Capturer for DxgiCapturer {
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        let frame = self.acquire(timeout)?;
+        if frame.is_some() {
+            self.want_full = false;
+            return Ok(frame);
+        }
+        // No first image from DXGI (idle desktop; a VM whose window is hidden presents
+        // nothing): read the desktop directly once, so a new viewer always gets a picture.
+        if self.want_full && self.started.elapsed() > FIRST_FRAME_FALLBACK {
+            self.want_full = false;
+            let frame = self.gdi_snapshot()?;
+            tracing::info!(
+                w = frame.width,
+                h = frame.height,
+                "first picture taken via GDI (DXGI had none)"
+            );
+            return Ok(Some(frame));
+        }
+        Ok(None)
     }
 }
