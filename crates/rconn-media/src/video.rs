@@ -110,6 +110,7 @@ pub struct VideoEncoder {
     yuv: Option<I420>,
     /// Fraction of the captured size to encode (1.0 = full); lowered when the CPU is busy.
     scale: f32,
+    last_was_key: bool,
     force_key: bool,
 }
 
@@ -128,6 +129,7 @@ impl VideoEncoder {
             encoder: None,
             yuv: None,
             scale: 1.0,
+            last_was_key: false,
             force_key: false,
         })
     }
@@ -211,8 +213,17 @@ impl VideoEncoder {
         let bits = encoder
             .encode(&*yuv)
             .map_err(|e| CodecError::OpenH264(e.to_string()))?;
+        self.last_was_key = matches!(
+            bits.frame_type(),
+            openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
+        );
         let out = bits.to_vec();
         Ok(if out.is_empty() { None } else { Some(out) })
+    }
+
+    /// Was the last encoded frame a keyframe? (Keyframes are always slow and large.)
+    pub fn last_was_key(&self) -> bool {
+        self.last_was_key
     }
 }
 

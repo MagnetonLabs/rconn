@@ -239,7 +239,9 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
         closing: false,
         host,
         _close: Some(close),
-        last_snap: None,
+        seen_window: None,
+        resized_at: None,
+        snapped_to: None,
     }
 }
 
@@ -612,8 +614,10 @@ struct ViewerApp {
     host: HostId,
     /// Dropped with the tab, which ends the session.
     _close: Option<tokio::sync::watch::Sender<()>>,
-    /// When the window was last snapped to the picture's shape.
-    last_snap: Option<Instant>,
+    /// Window size last seen, when the user last resized it, and our pending snap size.
+    seen_window: Option<Vec2>,
+    resized_at: Option<Instant>,
+    snapped_to: Option<Vec2>,
 }
 
 /// The local pointer icon for a host pointer shape.
@@ -1114,27 +1118,48 @@ impl ViewerApp {
             if fullscreen {
                 self.floating_bar(ui, area, &stats);
             } else if let Some(t) = &self.texture {
-                // Keep the window the picture's shape (no black bars) once a resize ends.
-                let (window, monitor, dragging) = ui.ctx().input(|i| {
+                // After the user resizes the window, snap it once to the picture's shape.
+                let (window, monitor, dragging, maximized) = ui.ctx().input(|i| {
+                    let v = i.viewport();
                     (
-                        i.viewport().inner_rect.map(|r| r.size()),
-                        i.viewport().monitor_size,
+                        v.inner_rect.map(|r| r.size()),
+                        v.monitor_size,
                         i.pointer.any_down(),
+                        v.maximized.unwrap_or(false),
                     )
                 });
-                let settled = self
-                    .last_snap
-                    .is_none_or(|t| t.elapsed() > Duration::from_millis(400));
-                let [w, h] = t.size();
-                if !dragging
-                    && settled
-                    && let Some(window) = window
-                    && let Some(size) =
-                        snap_to_picture(window, area.size(), Vec2::new(w as f32, h as f32), monitor)
-                {
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                    self.last_snap = Some(Instant::now());
+                if let Some(window) = window {
+                    let changed = self.seen_window.is_none_or(|w| (w - window).length() > 2.0);
+                    if changed {
+                        self.seen_window = Some(window);
+                        // Our own snap landing: nothing more to do.
+                        let ours = self
+                            .snapped_to
+                            .take()
+                            .is_some_and(|s| (s - window).length() < 8.0);
+                        self.resized_at = (!ours).then(Instant::now);
+                    } else if !dragging
+                        && !maximized
+                        && self
+                            .resized_at
+                            .is_some_and(|t| t.elapsed() > Duration::from_millis(300))
+                    {
+                        self.resized_at = None; // at most one snap per resize
+                        let [w, h] = t.size();
+                        if let Some(size) = snap_to_picture(
+                            window,
+                            area.size(),
+                            Vec2::new(w as f32, h as f32),
+                            monitor,
+                        ) {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                            self.snapped_to = Some(size);
+                        }
+                    }
+                    if self.resized_at.is_some() {
+                        ui.ctx().request_repaint_after(Duration::from_millis(350));
+                    }
                 }
             }
             if let Some(image) = image {
@@ -1387,7 +1412,9 @@ mod render_tests {
             closing: false,
             host: HostId(uuid::Uuid::nil()),
             _close: None,
-            last_snap: None,
+            seen_window: None,
+            resized_at: None,
+            snapped_to: None,
         }
     }
 
