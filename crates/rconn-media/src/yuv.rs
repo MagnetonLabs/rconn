@@ -193,6 +193,43 @@ impl I420 {
     }
 }
 
+/// I420 planes -> RGBA (BT.601 limited range, as openh264's own conversion), split across
+/// cores. `strides` are (Y, U, V) bytes per row; `out` is `width * height * 4` bytes.
+pub fn i420_to_rgba(
+    (y, u, v): (&[u8], &[u8], &[u8]),
+    (ys, us, vs): (usize, usize, usize),
+    (width, height): (usize, usize),
+    out: &mut [u8],
+) {
+    assert!(out.len() >= width * height * 4);
+    let rows_per = height.div_ceil(threads()).next_multiple_of(2).max(2);
+    std::thread::scope(|s| {
+        for (band, dst) in out[..width * height * 4]
+            .chunks_mut(rows_per * width * 4)
+            .enumerate()
+        {
+            s.spawn(move || {
+                for (r, row) in dst.chunks_exact_mut(width * 4).enumerate() {
+                    let yy = band * rows_per + r;
+                    let (yrow, urow, vrow) =
+                        (&y[yy * ys..], &u[(yy / 2) * us..], &v[(yy / 2) * vs..]);
+                    for x in 0..width {
+                        let c = 298 * (i32::from(yrow[x]) - 16);
+                        let d = i32::from(urow[x / 2]) - 128;
+                        let e = i32::from(vrow[x / 2]) - 128;
+                        let clamp = |n: i32| ((n + 128) >> 8).clamp(0, 255) as u8;
+                        let px = &mut row[4 * x..4 * x + 4];
+                        px[0] = clamp(c + 409 * e);
+                        px[1] = clamp(c - 100 * d - 208 * e);
+                        px[2] = clamp(c + 516 * d);
+                        px[3] = 255;
+                    }
+                }
+            });
+        }
+    });
+}
+
 impl YUVSource for I420 {
     fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
@@ -294,6 +331,46 @@ mod tests {
             (148..=152).contains(&row.iter().position(|&v| v > 128).unwrap()),
             "edge in the middle"
         );
+    }
+
+    #[test]
+    fn rgba_conversion_matches_openh264_and_is_faster() {
+        let (w, h) = (1496, 938);
+        let mut p = I420::new(w, h);
+        p.fill_from_bgra(&sample(w, h), w);
+        let mut ours = vec![0u8; w * h * 4];
+        let t = std::time::Instant::now();
+        i420_to_rgba((p.y(), p.u(), p.v()), p.strides(), (w, h), &mut ours);
+        let ours_ms = t.elapsed().as_secs_f64() * 1e3;
+        // Reference: openh264's (crate-private) float formula, single-threaded.
+        let mut theirs = vec![0u8; w * h * 4];
+        let t = std::time::Instant::now();
+        let ym = 255.0 / 219.0;
+        let rv = 255.0 / 224.0 * 1.402;
+        let gv = -255.0 / 224.0 * 1.402 * 0.299 / 0.587;
+        let gu = -255.0 / 224.0 * 1.772 * 0.114 / 0.587;
+        let bu = 255.0 / 224.0 * 1.772;
+        for yy in 0..h {
+            for x in 0..w {
+                let yv = (f32::from(p.y()[yy * w + x]) - 16.0) * ym;
+                let u = f32::from(p.u()[(yy / 2) * (w / 2) + x / 2]) - 128.0;
+                let v = f32::from(p.v()[(yy / 2) * (w / 2) + x / 2]) - 128.0;
+                let i = (yy * w + x) * 4;
+                theirs[i] = (yv + rv * v).clamp(0.0, 255.0) as u8;
+                theirs[i + 1] = (yv + gv * v + gu * u).clamp(0.0, 255.0) as u8;
+                theirs[i + 2] = (yv + bu * u).clamp(0.0, 255.0) as u8;
+                theirs[i + 3] = 255;
+            }
+        }
+        let theirs_ms = t.elapsed().as_secs_f64() * 1e3;
+        let worst = ours
+            .iter()
+            .zip(&theirs)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(worst <= 3, "colours differ by up to {worst}");
+        println!("I420->RGBA {w}x{h}: openh264 {theirs_ms:.2} ms, ours {ours_ms:.2} ms");
     }
 
     /// `cargo test --release -p rconn-media yuv::tests::speed -- --ignored --nocapture`

@@ -331,7 +331,13 @@ impl VideoDecoder {
         };
         let (width, height) = yuv.dimensions();
         let mut rgba = vec![0u8; width * height * 4];
-        yuv.write_rgba8(&mut rgba);
+        // Our conversion uses every core (openh264's uses one: ~20 ms at 2992x1878).
+        crate::yuv::i420_to_rgba(
+            (yuv.y(), yuv.u(), yuv.v()),
+            yuv.strides(),
+            (width, height),
+            &mut rgba,
+        );
         Ok(Some(DecodedFrame {
             width,
             height,
