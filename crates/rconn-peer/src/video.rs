@@ -281,9 +281,11 @@ pub struct VideoReceiver {
 
 impl Default for VideoReceiver {
     fn default() -> Self {
-        // Hold up to ~512 packets for reordering before giving up on a frame.
+        // How many packets a frame may span before it is given up on. A detailed full-size
+        // keyframe (a photo wallpaper at 2992x1878) is ~1 MB, ~900 packets: at 512 it could
+        // never complete, so the picture never came. 4096 covers ~4.5 MB frames.
         Self {
-            builder: SampleBuilder::new(512, H264Packet::default(), 90_000),
+            builder: SampleBuilder::new(4096, H264Packet::default(), 90_000),
         }
     }
 }
@@ -298,5 +300,63 @@ impl VideoReceiver {
             out.push(sample.data);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod receiver_tests {
+    use super::*;
+    use rtc::rtp::codec::h264::H264Payloader;
+    use rtc::rtp::packetizer::Payloader;
+
+    /// Packetize `au` as one RTP frame at `timestamp`, starting at sequence `seq`.
+    fn packets(au: &[u8], timestamp: u32, seq: &mut u16) -> Vec<rtc::rtp::Packet> {
+        let payloads = H264Payloader::default()
+            .payload(1200, &Bytes::copy_from_slice(au))
+            .expect("payload");
+        let n = payloads.len();
+        payloads
+            .into_iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                *seq = seq.wrapping_add(1);
+                rtc::rtp::Packet {
+                    header: rtc::rtp::header::Header {
+                        version: 2,
+                        marker: i + 1 == n,
+                        payload_type: H264_PAYLOAD_TYPE,
+                        sequence_number: *seq,
+                        timestamp,
+                        ssrc: 1,
+                        ..Default::default()
+                    },
+                    payload,
+                }
+            })
+            .collect()
+    }
+
+    /// A detailed full-size keyframe (~1 MB, ~900 packets) must come out whole: at a
+    /// 512-packet limit it was silently discarded and the viewer never got a picture.
+    #[test]
+    fn a_one_megabyte_keyframe_is_reassembled() {
+        let mut big = vec![0, 0, 0, 1, 0x65]; // IDR slice
+        big.extend((0..1_050_000u32).map(|i| (i % 251) as u8 | 1)); // no start codes inside
+        let small = [0u8, 0, 0, 1, 0x41, 7, 7, 7]; // the next frame, to close the first
+        let mut rx = VideoReceiver::default();
+        let mut seq = 100;
+        let mut out = Vec::new();
+        for p in packets(&big, 1000, &mut seq)
+            .into_iter()
+            .chain(packets(&small, 4000, &mut seq))
+        {
+            out.extend(rx.push(p));
+        }
+        let first = out.first().expect("the keyframe came out");
+        assert!(
+            first.len() >= big.len() - 4,
+            "whole frame: {} bytes",
+            first.len()
+        );
     }
 }
