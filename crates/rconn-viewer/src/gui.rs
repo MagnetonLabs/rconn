@@ -236,6 +236,7 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
         last_frame: None,
         fit_sent: None,
         fit_pending: None,
+        last_stats: String::new(),
         confirm_restart: false,
         toast: None,
         closing: false,
@@ -276,6 +277,12 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 .with_title(title);
             if chromeless {
                 v.with_decorations(false).with_maximized(true)
+            } else if cfg!(target_os = "macos") {
+                // Tabs live in the title bar, as in RustDesk and Chrome: more height for
+                // the picture, so a maximised window has the remote screen's shape.
+                v.with_fullsize_content_view(true)
+                    .with_titlebar_shown(false)
+                    .with_title_shown(false)
             } else {
                 v
             }
@@ -320,6 +327,8 @@ struct Window {
 }
 
 const TABS_H: f32 = 32.0;
+/// Room for the macOS window buttons, which sit over the tab strip.
+const WINDOW_BUTTONS_W: f32 = if cfg!(target_os = "macos") { 72.0 } else { 0.0 };
 
 impl Window {
     fn switch_to(&mut self, i: usize) {
@@ -347,6 +356,7 @@ impl Window {
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
+                    ui.add_space(WINDOW_BUTTONS_W);
                     for (i, tab) in self.tabs.iter_mut().enumerate() {
                         let active = i == self.active;
                         let frame = egui::Frame::new()
@@ -382,6 +392,25 @@ impl Window {
                                 }
                             });
                         });
+                    }
+                    // The active computer's toolbar, in the same row: one strip of
+                    // window chrome leaves the most room (and the right shape) for the
+                    // picture.
+                    ui.separator();
+                    let tab = &mut self.tabs[self.active];
+                    let stats = tab.last_stats.clone();
+                    tab.bar_contents(ui, &stats, false);
+                    // The empty rest of the strip is the title bar: drag to move the
+                    // window, double-click to zoom it.
+                    let rest =
+                        ui.allocate_rect(ui.available_rect_before_wrap(), Sense::click_and_drag());
+                    if rest.drag_started() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if rest.double_clicked() {
+                        let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
                     }
                 });
             });
@@ -622,6 +651,8 @@ struct ViewerApp {
     /// new size waiting for the window to stop changing.
     fit_sent: Option<(u32, u32)>,
     fit_pending: Option<((u32, u32), Instant)>,
+    /// The toolbar's stats line, as of the last frame drawn.
+    last_stats: String,
     /// "Restart remote computer" is waiting for confirmation.
     confirm_restart: bool,
     /// Short feedback shown in the toolbar, until the deadline.
@@ -773,7 +804,7 @@ fn map_button(b: egui::PointerButton) -> Option<MouseButton> {
 /// Window size showing a `remote`-sized screen with no black bars: 1:1 when it fits,
 /// else scaled down to 90% of the display, plus the toolbar.
 pub fn window_size_for(remote: Vec2, monitor: Option<Vec2>) -> Vec2 {
-    let chrome = BAR_H + TABS_H;
+    let chrome = TABS_H;
     let max = monitor.unwrap_or(Vec2::new(1600.0, 1000.0)) * 0.9 - Vec2::new(0.0, chrome);
     let scale = (max.x / remote.x).min(max.y / remote.y).min(1.0);
     Vec2::new(
@@ -782,13 +813,17 @@ pub fn window_size_for(remote: Vec2, monitor: Option<Vec2>) -> Vec2 {
     )
 }
 
-/// Largest rect with `aspect` (w/h) centred in `area`.
+/// Largest rect with `size`'s shape centred in `area`, or all of `area` when the shapes
+/// differ by 4% or less: a stretch that small can't be seen, a sliver of black can.
 pub fn fit(area: Rect, size: Vec2) -> Rect {
+    let mismatch = (area.aspect_ratio() / (size.x / size.y)).ln().abs();
+    if mismatch <= 0.04 {
+        return area;
+    }
     let scale = (area.width() / size.x).min(area.height() / size.y);
     Rect::from_center_size(area.center(), size * scale)
 }
 
-const BAR_H: f32 = 40.0;
 const DANGER: Color32 = Color32::from_rgb(210, 70, 60);
 
 /// Key combinations offered in the toolbar's Keys menu (pressed in order, released in reverse).
@@ -1113,21 +1148,12 @@ impl ViewerApp {
                 .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
         let stats = self.stats(fps, kbps);
+        self.last_stats.clone_from(&stats);
         let ctx = ui.ctx().clone();
         self.restart_dialog(&ctx);
         if !fullscreen {
+            // In a window the toolbar shares the tab strip's row (see `Window::tab_strip`).
             self.chrome = None;
-            egui::Panel::top("toolbar")
-                .exact_size(BAR_H)
-                .resizable(false)
-                .frame(
-                    egui::Frame::new()
-                        .fill(ui.visuals().panel_fill)
-                        .inner_margin(egui::Margin::symmetric(10, 6)),
-                )
-                .show(ui, |ui| {
-                    ui.horizontal_centered(|ui| self.bar_contents(ui, &stats, false));
-                });
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let area = ui.max_rect();
@@ -1179,13 +1205,9 @@ mod tests {
     fn window_matches_the_remote_shape_and_fits_the_display() {
         let remote = Vec2::new(1496.0, 938.0);
         let big = window_size_for(remote, Some(Vec2::new(3000.0, 2000.0)));
-        assert_eq!(
-            big,
-            Vec2::new(1496.0, 938.0 + BAR_H + TABS_H),
-            "1:1 when it fits"
-        );
+        assert_eq!(big, Vec2::new(1496.0, 938.0 + TABS_H), "1:1 when it fits");
         let small = window_size_for(remote, Some(Vec2::new(1440.0, 900.0)));
-        let picture = Vec2::new(small.x, small.y - BAR_H - TABS_H);
+        let picture = Vec2::new(small.x, small.y - TABS_H);
         assert!(
             small.x <= 1296.0 && small.y <= 810.0,
             "within 90% of the display: {small:?}"
@@ -1366,6 +1388,7 @@ mod render_tests {
             last_frame: None,
             fit_sent: None,
             fit_pending: None,
+            last_stats: String::new(),
             confirm_restart: false,
             toast: None,
             closing: false,

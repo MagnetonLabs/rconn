@@ -42,22 +42,31 @@ impl Drop for Fit {
     }
 }
 
-/// Of `modes`, the one closest to `want`: same shape first, then nearest size.
+/// Of `modes`, the one closest to `want`: among modes of a similar size (so the desktop
+/// is neither cramped nor tiny), the closest shape (black bars), then the nearest size.
+/// If no mode is of a similar size, the nearest size overall.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn closest(modes: &[(u32, u32)], want: (u32, u32)) -> Option<(u32, u32)> {
     let aspect = |(w, h): (u32, u32)| f64::from(w) / f64::from(h.max(1));
-    let target = aspect(want);
-    modes.iter().copied().min_by(|&a, &b| {
-        let score = |m: (u32, u32)| {
-            let shape = (aspect(m) / target).ln().abs();
-            let size = (f64::from(m.0) * f64::from(m.1) / (f64::from(want.0) * f64::from(want.1)))
-                .ln()
-                .abs();
-            // Shape matters most (black bars); size second (sharpness vs. tiny text).
-            shape * 4.0 + size
-        };
-        score(a).total_cmp(&score(b))
-    })
+    let area_ratio = |m: (u32, u32)| {
+        f64::from(m.0) * f64::from(m.1) / (f64::from(want.0) * f64::from(want.1)).max(1.0)
+    };
+    let shape = |m: (u32, u32)| (aspect(m) / aspect(want)).ln().abs();
+    let size = |m: (u32, u32)| area_ratio(m).ln().abs();
+    let similar: Vec<(u32, u32)> = modes
+        .iter()
+        .copied()
+        .filter(|&m| (0.7..=1.4).contains(&area_ratio(m)))
+        .collect();
+    if similar.is_empty() {
+        return modes
+            .iter()
+            .copied()
+            .min_by(|&a, &b| size(a).total_cmp(&size(b)));
+    }
+    similar
+        .into_iter()
+        .min_by(|&a, &b| (shape(a) * 50.0 + size(a)).total_cmp(&(shape(b) * 50.0 + size(b))))
 }
 
 #[cfg(windows)]
@@ -136,6 +145,11 @@ mod imp {
                 }
                 modes.sort_unstable();
                 modes.dedup();
+                tracing::info!(
+                    want = format!("{width}x{height}"),
+                    offered = ?modes,
+                    "exact size not supported; choosing the closest display mode"
+                );
                 super::closest(&modes, (width, height))
                     .ok_or_else(|| "the display lists no modes".to_owned())?
             };
@@ -190,6 +204,19 @@ mod tests {
         ];
         // A wide 16:9 window: a 16:9 mode, the one nearest in size.
         assert_eq!(closest(&modes, (2400, 1350)), Some((2560, 1440)));
+        // A Parallels VM on a Mac offers big 16:10 modes and only small 16:9 ones: a
+        // similar-size mode wins over a cramped one of the exact shape.
+        let vm = [
+            (1024, 768),
+            (2048, 1152),
+            (2560, 1600),
+            (2992, 1870),
+            (2992, 1934),
+        ];
+        assert_eq!(closest(&vm, (2992, 1820)), Some((2992, 1870)));
+        assert_eq!(closest(&vm, (3024, 1964)), Some((2992, 1934))); // full screen
+        // Nothing of a similar size: the nearest size.
+        assert_eq!(closest(&vm, (800, 500)), Some((1024, 768)));
         // 16:10 window.
         assert_eq!(closest(&modes, (1900, 1190)), Some((1920, 1200)));
         assert_eq!(closest(&[], (100, 100)), None);
