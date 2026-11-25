@@ -49,6 +49,8 @@ pub struct Paths {
     pub host_data: PathBuf,
     pub viewer_exe: PathBuf,
     pub settings_exe: PathBuf,
+    /// Windows: the host service program (sets admin-only settings when elevated).
+    pub service_exe: PathBuf,
 }
 
 impl Paths {
@@ -74,6 +76,7 @@ impl Paths {
             host_data,
             viewer_exe: beside("rconn-viewer"),
             settings_exe: beside("rconn-settings"),
+            service_exe: beside("rconn-host-service"),
         }
     }
 }
@@ -288,6 +291,8 @@ impl Worker {
             }
             Request::Connect(id, label) => self.connect(id, label).await,
             Request::ConnectGuest { id, password } => self.connect_guest(id, password.0).await,
+            Request::SetAccessPassword(p) => self.set_access_password(Some(p.0)).await,
+            Request::ClearAccessPassword => self.set_access_password(None).await,
             Request::SaveServer {
                 server,
                 fingerprint,
@@ -387,6 +392,62 @@ impl Worker {
                 }
                 Err(e) => self.notice(format!("Couldn't start the host: {e}"), true),
             }
+        }
+    }
+
+    /// Set (or, with `None`, turn off) this computer's access password. Only the derived
+    /// verifier is stored; on Windows it is written by the host service with admin rights.
+    async fn set_access_password(&self, password: Option<String>) {
+        self.home(|h| h.busy = Some("Saving the access password…".into()));
+        let verifier = match password {
+            None => String::new(),
+            Some(p) => {
+                match tokio::task::spawn_blocking(move || rconn_core::guest::make_verifier(&p))
+                    .await
+                {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => return self.notice(e.to_string(), true),
+                    Err(e) => return self.notice(e.to_string(), true),
+                }
+            }
+        };
+        let on = !verifier.is_empty();
+        let (host_data, service) = (self.paths.host_data.clone(), self.paths.service_exe.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            if cfg!(windows) {
+                rconn_host_settings::platform::run_elevated_wait(
+                    &service,
+                    &["set", "access_password", &verifier],
+                )
+            } else {
+                rconn_core::settings::write_setting(
+                    rconn_core::settings::SettingsLayers {
+                        system_file: Some(host_data.join("host.toml")),
+                        ..Default::default()
+                    },
+                    "access_password",
+                    &verifier,
+                    rconn_core::settings::Writer::Admin,
+                    host_data.join("session.active").exists(),
+                )
+                .map_err(|e| e.to_string())
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                self.home(|h| h.host_password_saved = Some((on, profile::now_unix())));
+                self.notice(
+                    if on {
+                        "Access password set: connect with this computer's ID and the password"
+                    } else {
+                        "Access password turned off"
+                    },
+                    false,
+                );
+            }
+            Ok(Err(e)) => self.notice(format!("Couldn't save the access password: {e}"), true),
+            Err(e) => self.notice(format!("Couldn't save the access password: {e}"), true),
         }
     }
 

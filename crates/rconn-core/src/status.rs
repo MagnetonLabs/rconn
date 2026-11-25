@@ -20,6 +20,9 @@ pub struct HostStatus {
     /// OS permissions the host still needs (macOS: "Screen Recording", "Accessibility").
     #[serde(default)]
     pub missing_permissions: Vec<String>,
+    /// An access password is set: anyone with the ID and the password can connect.
+    #[serde(default)]
+    pub access_password: bool,
     /// Unix seconds of the last update (stale = agent not running).
     pub updated: u64,
 }

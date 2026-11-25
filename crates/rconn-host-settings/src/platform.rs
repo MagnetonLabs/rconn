@@ -86,6 +86,42 @@ pub fn relaunch_elevated() -> Result<(), String> {
     run_elevated(&std::env::current_exe().map_err(|e| e.to_string())?)
 }
 
+/// Run `exe args` with administrator rights (UAC prompt) and wait for it. Arguments must
+/// not contain quotes. Fails if the prompt is declined or the program fails.
+pub fn run_elevated_wait(exe: &std::path::Path, args: &[&str]) -> Result<(), String> {
+    if !cfg!(windows) {
+        return Err("Run with sudo on this OS".into());
+    }
+    if args.iter().any(|a| a.contains(['\'', '"'])) {
+        return Err("unsupported characters in arguments".into());
+    }
+    let arglist = args
+        .iter()
+        .map(|a| {
+            if a.is_empty() {
+                "'\"\"'".to_owned()
+            } else {
+                format!("'{a}'")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "try {{ $p = Start-Process -FilePath '{}' -ArgumentList {arglist} -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} catch {{ exit 1223 }}",
+        exe.display()
+    );
+    let status = quiet("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .status()
+        .map_err(|e| e.to_string())?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(1223) => Err("the administrator prompt was declined".into()),
+        Some(c) => Err(format!("failed (exit code {c})")),
+        None => Err("failed".into()),
+    }
+}
+
 /// Start `exe` with administrator rights (shows the UAC prompt).
 pub fn run_elevated(exe: &std::path::Path) -> Result<(), String> {
     if !cfg!(windows) {

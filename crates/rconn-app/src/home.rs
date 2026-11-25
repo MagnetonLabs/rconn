@@ -50,6 +50,10 @@ pub enum Request {
     DisableHost,
     /// macOS: open System Settings at this permission ("Screen Recording", "Accessibility").
     OpenPermission(String),
+    /// Set this computer's access password (Windows asks for administrator approval).
+    SetAccessPassword(Secret),
+    /// Turn access by password off for this computer.
+    ClearAccessPassword,
 }
 
 /// A password that must not show up in logs or debug output.
@@ -72,6 +76,10 @@ pub struct Home {
     pub connect_to: String,
     /// The typed computer's access password (connect without an account). Cleared once used.
     pub access_password: String,
+    /// A new access password for this computer, being typed in Settings.
+    pub new_host_password: String,
+    /// What was just saved (on/off, when): shown until the host's status file catches up.
+    pub host_password_saved: Option<(bool, u64)>,
     /// None until loaded.
     pub computers: Option<Vec<HostInfo>>,
     pub username: String,
@@ -100,6 +108,8 @@ impl Home {
             tab: Tab::Computers,
             connect_to: String::new(),
             access_password: String::new(),
+            new_host_password: String::new(),
+            host_password_saved: None,
             computers: None,
             password: String::new(),
             notice: None,
@@ -563,6 +573,7 @@ fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     }
 
     section(ui, "🖥  This computer (host)");
+    access_password_block(ui, h, out);
     match &mut h.host_settings {
         None => {
             ui.label(
@@ -579,6 +590,64 @@ fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             }
         }
     }
+}
+
+/// "Access password": lets anyone with this computer's ID and the password connect.
+fn access_password_block(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
+    ui.label(RichText::new("Access password").strong());
+    let Some(this) = &h.this else {
+        ui.label(RichText::new("Turn on connections to this computer first.").color(Color32::GRAY));
+        ui.add_space(8.0);
+        return;
+    };
+    // Just saved: trust that for a minute, until the host's status reports it.
+    let on = match h.host_password_saved {
+        Some((on, at)) if h.now.saturating_sub(at) < 60 => on,
+        _ => this.access_password,
+    };
+    ui.label(if on {
+        format!(
+            "On: anyone with this computer's ID ({}) and the password can connect.",
+            this.short_code
+        )
+    } else {
+        "Off: only signed-in accounts can connect.".into()
+    });
+    ui.horizontal(|ui| {
+        let label = ui.label(if on { "New password" } else { "Password" });
+        ui.add(
+            egui::TextEdit::singleline(&mut h.new_host_password)
+                .password(true)
+                .hint_text("8 or more characters")
+                .desired_width(240.0),
+        )
+        .labelled_by(label.id);
+        let ok = h.new_host_password.chars().count() >= rconn_core::guest::MIN_PASSWORD_LEN
+            && h.busy.is_none();
+        if ui
+            .add_enabled(ok, egui::Button::new("Set password"))
+            .clicked()
+        {
+            out.push(Request::SetAccessPassword(Secret(std::mem::take(
+                &mut h.new_host_password,
+            ))));
+        }
+        if on
+            && ui
+                .add_enabled(h.busy.is_none(), egui::Button::new("Turn off"))
+                .clicked()
+        {
+            out.push(Request::ClearAccessPassword);
+        }
+    });
+    if cfg!(windows) {
+        ui.label(
+            RichText::new("Windows asks for administrator approval to change it.")
+                .small()
+                .color(Color32::GRAY),
+        );
+    }
+    ui.add_space(8.0);
 }
 
 fn status_bar(ui: &mut egui::Ui, h: &Home) {

@@ -181,6 +181,7 @@ async fn main() -> Result<()> {
         host_id,
         &server,
         cli.fingerprint.clone(),
+        cli.settings.clone(),
     );
     let trust = ServerTrust::from_fingerprint(cli.fingerprint.as_deref());
     // Reconnect forever with capped backoff: an unattended host must come back by itself.
@@ -483,6 +484,8 @@ struct StatusPublisher {
     path: Option<PathBuf>,
     base: rconn_core::status::HostStatus,
     state: Arc<std::sync::Mutex<(bool, bool)>>, // (online, session_active)
+    /// Host settings file, re-read on each publish (the access password can change any time).
+    settings: Option<PathBuf>,
 }
 
 impl StatusPublisher {
@@ -491,6 +494,7 @@ impl StatusPublisher {
         host_id: HostId,
         server: &str,
         fingerprint: Option<String>,
+        settings: Option<PathBuf>,
     ) -> Self {
         let base = rconn_core::status::HostStatus {
             host_id: host_id.to_string(),
@@ -504,6 +508,7 @@ impl StatusPublisher {
             path,
             base,
             state: Arc::default(),
+            settings,
         };
         p.publish();
         // Heartbeat so the app can tell a dead agent from an idle one.
@@ -531,8 +536,15 @@ impl StatusPublisher {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let access_password =
+            rconn_core::settings::LoadedSettings::load(rconn_core::settings::SettingsLayers {
+                system_file: self.settings.clone(),
+                ..Default::default()
+            })
+            .is_ok_and(|s| !s.settings().access_password.is_empty());
         let s = rconn_core::status::HostStatus {
             missing_permissions: missing_permissions(),
+            access_password,
             online,
             session_active,
             updated,
