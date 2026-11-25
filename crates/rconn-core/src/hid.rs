@@ -205,10 +205,86 @@ pub fn to_mac_keycode(hid: u16) -> Option<u16> {
     }
 }
 
+/// HID usage -> Linux evdev key code (`KEY_*` from `input-event-codes.h`), as Wayland's
+/// remote-desktop portal takes it; X servers use this plus 8 as the X keycode.
+///
+/// For keys without the 0xE0 prefix, evdev codes are the set-1 scan codes; the rest are
+/// listed.
+pub fn to_linux_evdev(hid: u16) -> Option<u16> {
+    use usage::*;
+    let code = match hid {
+        PAUSE => 119,       // KEY_PAUSE (the set-1 table approximates it as Num Lock)
+        PRINT_SCREEN => 99, // KEY_SYSRQ
+        INSERT => 110,
+        HOME => 102,
+        PAGE_UP => 104,
+        DELETE => 111,
+        END => 107,
+        PAGE_DOWN => 109,
+        ARROW_RIGHT => 106,
+        ARROW_LEFT => 105,
+        ARROW_DOWN => 108,
+        ARROW_UP => 103,
+        NUM_LOCK => 69,
+        CONTEXT_MENU => 127,                                  // KEY_COMPOSE
+        h if (F13..F13 + 12).contains(&h) => 183 + (h - F13), // KEY_F13..KEY_F24
+        CONTROL_RIGHT => 97,
+        META_LEFT => 125,
+        ALT_RIGHT => 100,
+        META_RIGHT => 126,
+        h => {
+            let sc = to_windows_scancode(h)?;
+            debug_assert!(
+                !sc.extended,
+                "extended key {h:#x} needs an explicit evdev code"
+            );
+            sc.code
+        }
+    };
+    Some(code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::usage::*;
     use super::*;
+
+    #[test]
+    fn evdev_spot_checks_against_input_event_codes() {
+        // KEY_A, KEY_1, KEY_ENTER, KEY_ESC, KEY_F1, KEY_F12, KEY_LEFTCTRL, KEY_RIGHTCTRL,
+        // KEY_LEFTMETA, KEY_UP, KEY_DELETE, KEY_102ND, KEY_F24
+        for (hid, want) in [
+            (A, 30),
+            (DIGIT1, 2),
+            (ENTER, 28),
+            (ESCAPE, 1),
+            (F1, 59),
+            (0x45, 88),
+            (CONTROL_LEFT, 29),
+            (CONTROL_RIGHT, 97),
+            (META_LEFT, 125),
+            (ARROW_UP, 103),
+            (DELETE, 111),
+            (INTL_BACKSLASH, 86),
+            (F13 + 11, 194),
+        ] {
+            assert_eq!(to_linux_evdev(hid), Some(want), "hid {hid:#x}");
+        }
+    }
+
+    #[test]
+    fn every_mapped_evdev_code_is_unique() {
+        let mut seen = std::collections::HashMap::new();
+        for hid in 0..=0xFFu16 {
+            if let Some(code) = to_linux_evdev(hid) {
+                assert!(
+                    seen.insert(code, hid).is_none(),
+                    "evdev {code} for both {:#x} and {hid:#x}",
+                    seen[&code]
+                );
+            }
+        }
+    }
 
     #[test]
     fn mac_spot_checks_against_kvk() {
