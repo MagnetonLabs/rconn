@@ -95,6 +95,10 @@ pub async fn run(
 
     let mut scaler = AdaptiveScale::default();
     let mut first_sent = false;
+    // The first keyframe can go out before the viewer is ready to receive video, and an
+    // idle screen sends nothing else: repeat the current picture as a keyframe shortly
+    // after, so a picture always arrives within about a second.
+    let mut resends: std::collections::VecDeque<Instant> = std::collections::VecDeque::new();
     while !stop.load(Ordering::Relaxed) {
         // Wake for: a new frame, a keyframe request, or the send slot of a frame we hold.
         let slot = tokio::time::Instant::from_std(next_send);
@@ -111,6 +115,13 @@ pub async fn run(
                 tracing::debug!("keyframe requested");
             }
             () = tokio::time::sleep_until(slot), if last.is_some() => {}
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(resends.front().copied().unwrap_or(next_send))), if !resends.is_empty() => {
+                resends.pop_front();
+                enc.request_keyframe();
+                if last.is_none() {
+                    last = sent.clone();
+                }
+            }
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
         // Pace to max_fps: hold the newest frame until its slot; older ones are dropped.
@@ -152,6 +163,8 @@ pub async fn run(
         if let Some(au) = encoded {
             if !first_sent {
                 first_sent = true;
+                let now = Instant::now();
+                resends.extend([300, 1000, 2500].map(|ms| now + Duration::from_millis(ms)));
                 tracing::info!(
                     bytes = au.len(),
                     key = enc.last_was_key(),
