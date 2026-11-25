@@ -5122,6 +5122,7 @@ dependencies = [
  "uuid",
  "webrtc",
  "windows",
+ "x11rb",
 ]
 
 [[package]]
