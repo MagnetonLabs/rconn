@@ -6,7 +6,7 @@ LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || true)"
 export PATH="$LLVM_PREFIX/bin:$PATH"
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 # Only remove what this script builds: dist/ also holds local server credentials.
-mkdir -p dist && rm -rf dist/rconn-windows-* dist/rconn-macos* dist/rconn-host-setup-* dist/SHA256SUMS
+mkdir -p dist && rm -rf dist/rconn-windows-* dist/rconn-macos* dist/rconn-host-setup-* dist/rconn-*.dmg dist/SHA256SUMS
 
 for arch in x64 arm64; do
   case $arch in
@@ -37,6 +37,7 @@ done
 cp "$(scripts/fetch-openh264.sh mac-arm64)" "$(scripts/fetch-openh264.sh mac-x64)" "$stage/"
 cp deploy/README-package.txt "$stage/README.txt"
 (cd dist && zip -qr "rconn-macos-$VERSION.zip" rconn-macos)
+deploy/macos/make-dmg.sh "$stage" "$VERSION" "dist/rconn-$VERSION.dmg" >/dev/null
 
-(cd dist && shasum -a 256 ./*.zip ./*.exe > SHA256SUMS)
-ls -lh dist/*.zip dist/*.exe
+(cd dist && shasum -a 256 ./*.zip ./*.exe ./*.dmg > SHA256SUMS)
+ls -lh dist/*.zip dist/*.exe dist/*.dmg
