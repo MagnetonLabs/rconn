@@ -587,6 +587,7 @@ async fn session(
     let mut rx = VideoReceiver::default();
     let mut dec = VideoDecoder::new(&args.openh264)?;
     let (mut frames, mut bytes, mut since) = (0u32, 0usize, Instant::now());
+    let mut last_kf_request: Option<Instant> = None;
     loop {
         let Some(ev) = track.poll().await else { break };
         let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
@@ -605,8 +606,15 @@ async fn session(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(error = %e, "decode error; requesting keyframe");
-                    let _ = kf_tx.send(());
+                    // Ask for a fresh keyframe, but not on every broken frame: each one
+                    // costs the host a full-size encode.
+                    if last_kf_request
+                        .is_none_or(|t: Instant| t.elapsed() >= Duration::from_millis(300))
+                    {
+                        tracing::warn!(error = %e, "decode error; requesting keyframe");
+                        let _ = kf_tx.send(());
+                        last_kf_request = Some(Instant::now());
+                    }
                 }
             }
         }

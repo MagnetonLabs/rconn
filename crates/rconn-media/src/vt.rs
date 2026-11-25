@@ -205,7 +205,7 @@ impl VtDecoder {
     ) -> Result<Option<(usize, usize)>, String> {
         let (mut sps, mut pps) = (None, None);
         self.avcc.clear();
-        for nal in nal_units(annex_b) {
+        for nal in crate::video::nal_units(annex_b) {
             match nal[0] & 0x1f {
                 7 => sps = Some(nal),
                 8 => pps = Some(nal),
@@ -228,7 +228,9 @@ impl VtDecoder {
             return Ok(None);
         }
         let (Some(session), Some(format)) = (&self.session, &self.format) else {
-            return Ok(None); // waiting for a keyframe
+            // Picture data without stream headers to read it by (decoder lost its place,
+            // or the stream changed size): say so, so the viewer asks for a keyframe.
+            return Err("waiting for a keyframe with stream headers".into());
         };
 
         let mut image: Option<Cf> = None;
@@ -377,38 +379,6 @@ impl Drop for VtDecoder {
     }
 }
 
-/// The NAL units of an Annex-B stream, without start codes.
-fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            starts.push(i + 3);
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    let ends: Vec<usize> = starts
-        .iter()
-        .skip(1)
-        .map(|&s| {
-            // Trim the next start code, and the zero before it if it was 4 bytes long.
-            let mut e = s - 3;
-            while e > 0 && data[e - 1] == 0 {
-                e -= 1;
-            }
-            e
-        })
-        .chain(std::iter::once(data.len()))
-        .collect();
-    starts
-        .into_iter()
-        .zip(ends)
-        .filter(|(s, e)| e > s)
-        .map(move |(s, e)| &data[s..e])
-}
-
 /// NV12 pixel buffer -> tightly packed RGBA.
 fn copy_nv12_to_rgba(image: &Cf, rgba: &mut Vec<u8>) -> (usize, usize) {
     // SAFETY: the buffer is locked read-only while we read each plane's
@@ -430,19 +400,5 @@ fn copy_nv12_to_rgba(image: &Cf, rgba: &mut Vec<u8>) -> (usize, usize) {
         crate::yuv::nv12_to_rgba((y, uv), (ys, uvs), (w, h), rgba);
         CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
         (w, h)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::nal_units;
-
-    #[test]
-    fn splits_annex_b_with_3_and_4_byte_start_codes() {
-        let data = [
-            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4, 5,
-        ];
-        let nals: Vec<&[u8]> = nal_units(&data).collect();
-        assert_eq!(nals, [&[0x67, 1, 2][..], &[0x68, 3], &[0x65, 4, 5]]);
     }
 }

@@ -40,6 +40,8 @@ fn err(e: windows::core::Error) -> CodecError {
 unsafe impl Send for MfH264Encoder {}
 
 pub struct MfH264Encoder {
+    /// Kept to shut the encoder down when this is dropped (see `Drop`).
+    activate: IMFActivate,
     mft: IMFTransform,
     codec: Option<ICodecAPI>,
     width: u32,
@@ -108,12 +110,15 @@ impl MfH264Encoder {
                 &mut count,
             )
             .map_err(err)?;
-            let activate = std::slice::from_raw_parts(list, count as usize)
-                .iter()
-                .flatten()
-                .next()
-                .cloned();
+            // Take ownership of every entry, so each is released (dropped) here except the
+            // one we keep. Freeing only the array leaked every entry, and with it the
+            // encoder it activates: worker threads and frame buffers, per encoder built.
+            let mut owned: Vec<IMFActivate> = (0..count as usize)
+                .filter_map(|i| std::ptr::read(list.add(i)))
+                .collect();
             windows::Win32::System::Com::CoTaskMemFree(Some(list.cast()));
+            let activate = (!owned.is_empty()).then(|| owned.swap_remove(0));
+            drop(owned);
             activate.ok_or_else(|| {
                 CodecError::OpenH264(
                     if hardware {
@@ -212,6 +217,7 @@ impl MfH264Encoder {
                 .map_err(err)?;
             let info = mft.GetOutputStreamInfo(0).map_err(err)?;
             Ok(Self {
+                activate,
                 mft,
                 codec,
                 width,
@@ -379,6 +385,16 @@ impl MfH264Encoder {
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(false),
                 Err(e) => Err(err(e)),
             }
+        }
+    }
+}
+
+impl Drop for MfH264Encoder {
+    /// An activated MFT lives until its activation object shuts it down; dropping our
+    /// references alone can leave its worker threads and buffers behind.
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.activate.ShutdownObject();
         }
     }
 }

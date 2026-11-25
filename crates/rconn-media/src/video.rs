@@ -121,8 +121,10 @@ pub struct VideoEncoder {
     yuv: Option<I420>,
     /// The NV12 copy of the last picture (Media Foundation input), updated row-wise.
     nv12: Vec<u8>,
-    /// The encoder for the previously used size, kept for switching back.
-    spare: Option<((usize, usize), Engine)>,
+    /// The stream headers (SPS/PPS) of the current encoder.
+    headers: Vec<u8>,
+    /// The encoder for the previously used size (and its headers), kept for switching back.
+    spare: Option<((usize, usize), Engine, Vec<u8>)>,
     /// Fraction of the captured size to encode (1.0 = full); lowered when the CPU is busy.
     scale: f32,
     last_was_key: bool,
@@ -145,6 +147,7 @@ impl VideoEncoder {
             engine_name: String::new(),
             yuv: None,
             nv12: Vec::new(),
+            headers: Vec::new(),
             spare: None,
             scale: 1.0,
             last_was_key: false,
@@ -274,14 +277,16 @@ impl VideoEncoder {
             // Switching between two sizes (full / half while things move) reuses the
             // encoder kept for the other size; its next frame must be a keyframe.
             let previous = self.encoder.take().zip(self.dims);
+            let old_headers = std::mem::take(&mut self.headers);
             let engine = match self.spare.take() {
-                Some((dims, engine)) if dims == (w, h) => {
+                Some((dims, engine, headers)) if dims == (w, h) => {
                     self.force_key = true;
+                    self.headers = headers;
                     engine
                 }
                 _ => self.build(w, h)?,
             };
-            self.spare = previous.map(|(e, d)| (d, e));
+            self.spare = previous.map(|(e, d)| (d, e, old_headers));
             self.encoder = Some(engine);
             self.dims = Some((w, h));
             self.nv12.clear(); // forces a full NV12 rewrite
@@ -318,6 +323,7 @@ impl VideoEncoder {
             }
         };
         let _ = changed_rows; // only the NV12 path can use it
+        let out = with_headers(out, &mut self.headers);
         Ok(if out.is_empty() { None } else { Some(out) })
     }
 
@@ -332,6 +338,71 @@ pub fn has_idr(annex_b: &[u8]) -> bool {
     annex_b
         .windows(4)
         .any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 5)
+}
+
+/// The NAL units of an Annex-B stream, without start codes.
+pub(crate) fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let ends: Vec<usize> = starts
+        .iter()
+        .skip(1)
+        .map(|&s| {
+            // Trim the next start code, and the zero before it if it was 4 bytes long.
+            let mut e = s - 3;
+            while e > 0 && data[e - 1] == 0 {
+                e -= 1;
+            }
+            e
+        })
+        .chain(std::iter::once(data.len()))
+        .collect();
+    starts
+        .into_iter()
+        .zip(ends)
+        .filter(|(s, e)| e > s)
+        .map(move |(s, e)| &data[s..e])
+}
+
+/// The SPS and PPS of `annex_b` (with start codes), if it carries both.
+fn parameter_sets(annex_b: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut sps, mut pps) = (false, false);
+    for nal in nal_units(annex_b) {
+        match nal[0] & 0x1f {
+            7 => sps = true,
+            8 => pps = true,
+            _ => continue,
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+    }
+    (sps && pps).then_some(out)
+}
+
+/// Make every keyframe self-contained: remember the stream headers (SPS/PPS) an encoder
+/// sends, and put them in front of any keyframe that comes without them. A decoder that
+/// lost its place, or a stream that switched encoders (and picture size), can only start
+/// again from a keyframe it can read on its own.
+fn with_headers(out: Vec<u8>, headers: &mut Vec<u8>) -> Vec<u8> {
+    if let Some(h) = parameter_sets(&out) {
+        *headers = h;
+        return out;
+    }
+    if !headers.is_empty() && has_idr(&out) {
+        let mut v = headers.clone();
+        v.extend_from_slice(&out);
+        return v;
+    }
+    out
 }
 
 /// Should a bandwidth estimate move the encoder? Only on a >25% change, so GCC jitter
@@ -448,6 +519,43 @@ impl VideoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_annex_b_with_3_and_4_byte_start_codes() {
+        let data = [
+            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4, 5,
+        ];
+        let nals: Vec<&[u8]> = nal_units(&data).collect();
+        assert_eq!(nals, [&[0x67, 1, 2][..], &[0x68, 3], &[0x65, 4, 5]]);
+    }
+
+    #[test]
+    fn keyframes_always_carry_the_stream_headers() {
+        let mut headers = Vec::new();
+        let first = vec![
+            0, 0, 0, 1, 0x67, 9, 0, 0, 0, 1, 0x68, 8, 0, 0, 0, 1, 0x65, 1,
+        ];
+        assert_eq!(
+            with_headers(first.clone(), &mut headers),
+            first,
+            "already complete"
+        );
+        let p_frame = vec![0, 0, 0, 1, 0x41, 2];
+        assert_eq!(
+            with_headers(p_frame.clone(), &mut headers),
+            p_frame,
+            "untouched"
+        );
+        let bare_idr = vec![0, 0, 0, 1, 0x65, 3];
+        let fixed = with_headers(bare_idr, &mut headers);
+        assert_eq!(
+            fixed,
+            [
+                0, 0, 0, 1, 0x67, 9, 0, 0, 0, 1, 0x68, 8, 0, 0, 0, 1, 0x65, 3
+            ],
+            "headers put back in front"
+        );
+    }
 
     #[test]
     fn retarget_threshold() {
