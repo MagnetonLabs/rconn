@@ -6,6 +6,9 @@
 //!   pixel size; needs the Screen Recording permission. Also only sends changed frames.
 //! * Linux (X11): MIT-SHM reads of the root window, converting only what XDamage reports
 //!   changed ([`x11`]).
+//! * Linux (Wayland, e.g. standard Ubuntu/GNOME): the desktop portal's PipeWire screen
+//!   stream, converting only what the compositor reports as damaged ([`portal`]). The
+//!   person at the computer allows it once; the choice is remembered.
 //! * [`TestPattern`]: synthetic moving content, for pipelines without a desktop.
 
 use crate::video::Frame;
@@ -17,6 +20,8 @@ use thiserror::Error;
 pub mod dxgi;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "linux")]
+pub mod portal;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
@@ -96,13 +101,59 @@ pub fn primary_display() -> Result<Box<dyn Capturer>, CaptureError> {
     }
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(x11::X11Capturer::new()?))
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let socket = env("XDG_RUNTIME_DIR").is_some_and(|d| {
+            let name = env("WAYLAND_DISPLAY").unwrap_or_else(|| "wayland-0".into());
+            std::path::Path::new(&d).join(name).exists()
+        });
+        let backend = linux_backend(
+            env("RCONN_CAPTURE").as_deref(),
+            env("XDG_SESSION_TYPE").as_deref(),
+            env("WAYLAND_DISPLAY").is_some(),
+            socket,
+        );
+        tracing::info!(?backend, "Linux capture backend");
+        match backend {
+            LinuxBackend::Portal => Ok(Box::new(portal::PortalCapturer::new()?)),
+            LinuxBackend::X11 => Ok(Box::new(x11::X11Capturer::new()?)),
+        }
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         Err(CaptureError::Backend(
             "no capture backend for this OS yet".into(),
         ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxBackend {
+    X11,
+    Portal,
+}
+
+/// Wayland or X11? On a Wayland desktop, X11 capture would only see Xwayland windows,
+/// so any sign of Wayland picks the portal. `RCONN_CAPTURE=x11|portal` overrides. A
+/// systemd user unit may lack the session variables, so a Wayland socket in
+/// `XDG_RUNTIME_DIR` counts too.
+#[cfg(target_os = "linux")]
+fn linux_backend(
+    forced: Option<&str>,
+    session_type: Option<&str>,
+    wayland_display: bool,
+    wayland_socket: bool,
+) -> LinuxBackend {
+    match forced {
+        Some("x11") => return LinuxBackend::X11,
+        Some("portal" | "wayland") => return LinuxBackend::Portal,
+        _ => {}
+    }
+    match session_type {
+        Some("wayland") => LinuxBackend::Portal,
+        Some("x11") => LinuxBackend::X11,
+        _ if wayland_display || wayland_socket => LinuxBackend::Portal,
+        _ => LinuxBackend::X11,
     }
 }
 
@@ -167,6 +218,25 @@ impl Capturer for TestPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_desktops_use_the_portal() {
+        use LinuxBackend::*;
+        // Ubuntu 24.04 default (GNOME on Wayland; DISPLAY is Xwayland's).
+        assert_eq!(linux_backend(None, Some("wayland"), true, true), Portal);
+        // "Ubuntu on Xorg".
+        assert_eq!(linux_backend(None, Some("x11"), false, false), X11);
+        // systemd user unit without the session variables.
+        assert_eq!(linux_backend(None, None, false, true), Portal);
+        assert_eq!(linux_backend(None, None, true, false), Portal);
+        assert_eq!(linux_backend(None, None, false, false), X11);
+        assert_eq!(linux_backend(Some("x11"), Some("wayland"), true, true), X11);
+        assert_eq!(
+            linux_backend(Some("portal"), Some("x11"), false, false),
+            Portal
+        );
+    }
 
     #[test]
     fn test_pattern_paces_and_moves() {

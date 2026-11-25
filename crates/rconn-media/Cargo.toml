@@ -38,6 +38,11 @@ dispatch2 = "0.3.1"
 tracing.workspace = true
 libc = "0.2"
 x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "randr"] }
+# Wayland: xdg-desktop-portal (ScreenCast + RemoteDesktop) and PipeWire frames.
+ashpd = { version = "0.14.3", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+pipewire = "0.10.1"
+futures-util = { version = "0.3", default-features = false }
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
 
 [lints]
 workspace = true

@@ -8,6 +8,8 @@ pub mod codec;
 pub mod mf;
 #[cfg(all(windows, target_arch = "aarch64"))]
 mod opus_shim;
+#[cfg(target_os = "linux")]
+pub mod portal;
 pub mod video;
 #[cfg(target_os = "macos")]
 pub mod vt;
