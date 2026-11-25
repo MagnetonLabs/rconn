@@ -234,6 +234,8 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
         fit_window: false,
         cursor: shared_cursor,
         last_frame: None,
+        fit_sent: None,
+        fit_pending: None,
         confirm_restart: false,
         toast: None,
         closing: false,
@@ -616,6 +618,10 @@ struct ViewerApp {
     cursor: Arc<Mutex<Option<rconn_core::protocol::CursorShape>>>,
     /// The latest picture (for "Save screenshot").
     last_frame: Option<DecodedFrame>,
+    /// The remote screen is fitted to the picture area: the size last asked for, and a
+    /// new size waiting for the window to stop changing.
+    fit_sent: Option<(u32, u32)>,
+    fit_pending: Option<((u32, u32), Instant)>,
     /// "Restart remote computer" is waiting for confirmation.
     confirm_restart: bool,
     /// Short feedback shown in the toolbar, until the deadline.
@@ -1037,6 +1043,40 @@ impl ViewerApp {
         }
     }
 
+    /// Ask the host to fit its screen to `area` (in pixels), once the window has stopped
+    /// changing size for a moment: no black bars, and the host's pixels map 1:1 to ours.
+    fn fit_remote_to(&mut self, area: Rect, ctx: &egui::Context) {
+        const SETTLE: Duration = Duration::from_millis(400);
+        if self.texture.is_none() {
+            return; // not connected yet
+        }
+        let ppp = ctx.pixels_per_point();
+        let px = |v: f32| ((v * ppp).round() as u32 & !1).max(480);
+        let want = (px(area.width()), px(area.height()));
+        if self.fit_sent == Some(want) {
+            self.fit_pending = None;
+            return;
+        }
+        match self.fit_pending {
+            Some((size, since)) if size == want => {
+                if since.elapsed() >= SETTLE {
+                    let _ = self.keyframe.send(Control::Resize {
+                        width: want.0,
+                        height: want.1,
+                    });
+                    self.fit_sent = Some(want);
+                    self.fit_pending = None;
+                } else {
+                    ctx.request_repaint_after(SETTLE - since.elapsed());
+                }
+            }
+            _ => {
+                self.fit_pending = Some((want, Instant::now()));
+                ctx.request_repaint_after(SETTLE);
+            }
+        }
+    }
+
     fn draw(&mut self, ui: &mut egui::Ui) {
         let (new_frame, status, fps, kbps) = {
             let mut s = self.shared.lock().expect("ui state");
@@ -1091,6 +1131,7 @@ impl ViewerApp {
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let area = ui.max_rect();
+            self.fit_remote_to(area, ui.ctx());
             ui.painter().rect_filled(area, 0.0, Color32::BLACK);
             let _ = ui.allocate_rect(area, Sense::click_and_drag());
             let image = self.texture.as_ref().map(|tex| {
@@ -1323,6 +1364,8 @@ mod render_tests {
             fit_window: false,
             cursor: Arc::default(),
             last_frame: None,
+            fit_sent: None,
+            fit_pending: None,
             confirm_restart: false,
             toast: None,
             closing: false,

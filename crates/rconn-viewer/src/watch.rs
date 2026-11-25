@@ -26,6 +26,7 @@ pub async fn run(
     openh264: &Path,
     opts: PeerOptions,
     tap_key: Option<(u64, u16)>,
+    fit: Option<(u32, u32)>,
 ) -> Result<()> {
     let t0 = Instant::now();
     let sig = SignalingClient::connect_operator(server, trust, token).await?;
@@ -50,6 +51,17 @@ pub async fn run(
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             println!("tapped key {hid_usage:#04x} at +{after} s");
+        });
+    }
+    // Test aid: ask the host to fit its screen to WxH, as a viewer window would.
+    if let Some((width, height)) = fit {
+        let dc = session.data.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Ok(b) = DataMessage::Control(Control::Resize { width, height }).encode() {
+                let _ = dc.send(BytesMut::from(&b[..])).await;
+            }
+            println!("asked the host to fit {width}x{height}");
         });
     }
     let dc_task = tokio::spawn(async move {

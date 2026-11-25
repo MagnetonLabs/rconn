@@ -5,6 +5,7 @@
 mod audio;
 mod awake;
 mod cursor;
+mod display;
 mod hostkind;
 mod indicator;
 mod input;
@@ -273,13 +274,21 @@ async fn serve_session(
     // Data channels: Ping/Pong, keyframe requests, input, clipboard (if policy allows).
     let clipboard = session.policy.clipboard;
     let kf = keyframes.clone();
+    // The screen fitted to the viewer's window; the original size returns at the end.
+    let fit = Arc::new(std::sync::Mutex::new(display::Fit::default()));
+    let channel_fit = fit.clone();
     let mut channels = std::mem::replace(
         &mut session.channels,
         tokio::sync::mpsc::unbounded_channel().1,
     );
     tokio::spawn(async move {
         while let Some(dc) = channels.recv().await {
-            tokio::spawn(serve_channel(dc, kf.clone(), clipboard));
+            tokio::spawn(serve_channel(
+                dc,
+                kf.clone(),
+                clipboard,
+                channel_fit.clone(),
+            ));
         }
     });
 
@@ -336,7 +345,7 @@ async fn serve_session(
             }
         });
     }
-    stream::run(
+    let result = stream::run(
         cli.capturer_factory()?,
         session.video,
         session.target_bitrate,
@@ -344,10 +353,17 @@ async fn serve_session(
         cfg,
         stop,
     )
-    .await
+    .await;
+    let _ = tokio::task::spawn_blocking(move || fit.lock().expect("fit").restore()).await;
+    result
 }
 
-async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests, clipboard: bool) {
+async fn serve_channel(
+    dc: Arc<dyn DataChannel>,
+    keyframes: KeyframeRequests,
+    clipboard: bool,
+    fit: Arc<std::sync::Mutex<display::Fit>>,
+) {
     match dc.protocol().await {
         Ok(p) if p == DATA_CHANNEL_PROTOCOL => {}
         other => {
@@ -379,6 +395,12 @@ async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests, cl
                     Ok(DataMessage::Control(Control::Ping(n))) => send(DataMessage::Control(Control::Pong(n))).await,
                     Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
                     Ok(DataMessage::Control(Control::Action(action))) => host_action(action),
+                    Ok(DataMessage::Control(Control::Resize { width, height })) => {
+                        let fit = fit.clone();
+                        tokio::task::spawn_blocking(move || {
+                            fit.lock().expect("fit").apply(width, height)
+                        });
+                    }
                     Ok(DataMessage::Input(ev)) => {
                         stream::note_input(); // someone is interacting: full frame rate
                         input.send(ev)

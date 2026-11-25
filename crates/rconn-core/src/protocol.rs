@@ -291,6 +291,12 @@ pub enum Control {
     Cursor(CursorShape),
     /// Viewer -> host: a one-off action from the toolbar.
     Action(HostAction),
+    /// Viewer -> host: the viewer's picture area in pixels; the host fits its screen to
+    /// it (closest display mode) until the session ends.
+    Resize {
+        width: u32,
+        height: u32,
+    },
 }
 
 /// Toolbar actions the host performs on request.

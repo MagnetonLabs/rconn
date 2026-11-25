@@ -67,6 +67,10 @@ enum Cmd {
         /// e.g. `5:0x29` for Escape.
         #[arg(long, value_parser = parse_tap)]
         tap_key: Option<(u64, u16)>,
+        /// Test aid: after 2 s, ask the host to fit its screen to `WIDTHxHEIGHT`, as a
+        /// viewer window of that size would.
+        #[arg(long, value_parser = parse_size)]
+        fit: Option<(u32, u32)>,
         /// Cisco openh264 library. Default: next to this executable, else target/openh264.
         #[arg(long, env = "RCONN_OPENH264")]
         openh264: Option<std::path::PathBuf>,
@@ -117,6 +121,7 @@ async fn main() -> Result<()> {
             seconds,
             snapshot,
             tap_key,
+            fit,
             openh264,
             udp,
             relay_only,
@@ -138,6 +143,7 @@ async fn main() -> Result<()> {
                     relay_only: *relay_only,
                 },
                 *tap_key,
+                *fit,
             )
             .await
         }
@@ -411,6 +417,14 @@ fn default_openh264() -> Result<std::path::PathBuf> {
     }
     rconn_media::cisco::local_binary_path()
         .ok_or_else(|| anyhow::anyhow!("openh264 not found; pass --openh264"))
+}
+
+fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
+    Ok((
+        w.parse().map_err(|e| format!("width: {e}"))?,
+        h.parse().map_err(|e| format!("height: {e}"))?,
+    ))
 }
 
 fn parse_tap(s: &str) -> Result<(u64, u16), String> {
