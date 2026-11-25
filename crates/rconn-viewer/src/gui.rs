@@ -642,7 +642,17 @@ async fn session(
         let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
             continue;
         };
-        for au in rx.push(pkt) {
+        let aus = rx.push(pkt);
+        // Video data was lost for good: later pictures build on a broken one, so start
+        // over from a fresh keyframe (throttled like decode errors).
+        if rx.take_loss()
+            && last_kf_request.is_none_or(|t: Instant| t.elapsed() >= Duration::from_millis(300))
+        {
+            tracing::warn!("video packets lost; requesting keyframe");
+            let _ = kf_tx.send(());
+            last_kf_request = Some(Instant::now());
+        }
+        for au in aus {
             bytes += au.len();
             match dec.decode(&au) {
                 Ok(Some(f)) => {

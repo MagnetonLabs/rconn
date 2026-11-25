@@ -177,7 +177,12 @@ pub async fn run(
         let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
             continue;
         };
-        for au in rx.push(pkt) {
+        let aus = rx.push(pkt);
+        if rx.take_loss() {
+            tracing::warn!("video packets lost; requesting keyframe");
+            let _ = kf_tx.send(());
+        }
+        for au in aus {
             window.bytes += au.len();
             let d0 = Instant::now();
             match dec.decode(&au) {

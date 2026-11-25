@@ -277,15 +277,24 @@ impl AudioSender {
 /// Reassembles RTP packets into H.264 access units on the viewer.
 pub struct VideoReceiver {
     builder: SampleBuilder<H264Packet>,
+    /// Packets were lost for good since the last `take_loss`: the picture that follows
+    /// is missing data, so the viewer should ask for a keyframe.
+    lost: bool,
 }
 
 impl Default for VideoReceiver {
     fn default() -> Self {
-        // How many packets a frame may span before it is given up on. A detailed full-size
-        // keyframe (a photo wallpaper at 2992x1878) is ~1 MB, ~900 packets: at 512 it could
-        // never complete, so the picture never came. 4096 covers ~4.5 MB frames.
+        // Room for big frames: a detailed full-size keyframe (a photo wallpaper at
+        // 2992x1878) is ~1 MB, ~900 packets; at 512 it could never complete. 4096 packets
+        // covers ~4.5 MB frames.
+        //
+        // But give up on a frame with a lost packet after 250 ms of newer video (a
+        // retransmit takes a round trip): a packet-count limit alone meant one lost packet
+        // froze the picture until 4096 more arrived, 15-20 s at desktop bitrates.
         Self {
-            builder: SampleBuilder::new(4096, H264Packet::default(), 90_000),
+            builder: SampleBuilder::new(4096, H264Packet::default(), 90_000)
+                .with_max_time_delay(LOSS_GIVE_UP),
+            lost: false,
         }
     }
 }
@@ -297,11 +306,21 @@ impl VideoReceiver {
         self.builder.push(now, packet);
         let mut out = Vec::new();
         while let Some(sample) = self.builder.pop(now) {
+            self.lost |= sample.prev_dropped_packets > 0;
             out.push(sample.data);
         }
         out
     }
+
+    /// Were packets lost for good since the last call? (Then ask the host for a keyframe:
+    /// later pictures build on the incomplete one.)
+    pub fn take_loss(&mut self) -> bool {
+        std::mem::take(&mut self.lost)
+    }
 }
+
+/// How long the viewer waits for a missing packet before giving up on its frame.
+pub const LOSS_GIVE_UP: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 mod receiver_tests {
@@ -358,5 +377,35 @@ mod receiver_tests {
             "whole frame: {} bytes",
             first.len()
         );
+        assert!(!rx.take_loss());
+    }
+
+    /// One packet lost for good must not freeze the picture: the frame is given up once
+    /// newer video is LOSS_GIVE_UP ahead, later frames flow, and the loss is reported.
+    #[test]
+    fn a_lost_packet_costs_one_frame_not_the_stream() {
+        let mut rx = VideoReceiver::default();
+        let mut seq = 7;
+        let mut big = vec![0, 0, 0, 1, 0x41];
+        big.extend((0..20_000u32).map(|i| (i % 251) as u8 | 1));
+        let mut packets_in = packets(&big, 0, &mut seq);
+        packets_in.remove(3); // lost, never retransmitted
+        let mut out = Vec::new();
+        for p in packets_in {
+            out.extend(rx.push(p));
+        }
+        // 30 fps of small frames after it: 0.5 s of video.
+        for k in 1..=15u32 {
+            // (Frames of a few bytes: a 1-byte slice would be dropped as padding.)
+            for p in packets(
+                &[0, 0, 0, 1, 0x41, k as u8 | 1, 9, 9, 9],
+                k * 3000,
+                &mut seq,
+            ) {
+                out.extend(rx.push(p));
+            }
+        }
+        assert!(out.len() >= 10, "later frames came through: {}", out.len());
+        assert!(rx.take_loss(), "the loss is reported (ask for a keyframe)");
     }
 }
