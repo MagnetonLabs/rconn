@@ -121,6 +121,8 @@ pub struct VideoEncoder {
     yuv: Option<I420>,
     /// The NV12 copy of the last picture (Media Foundation input), updated row-wise.
     nv12: Vec<u8>,
+    /// The encoder for the previously used size, kept for switching back.
+    spare: Option<((usize, usize), Engine)>,
     /// Fraction of the captured size to encode (1.0 = full); lowered when the CPU is busy.
     scale: f32,
     last_was_key: bool,
@@ -143,6 +145,7 @@ impl VideoEncoder {
             engine_name: String::new(),
             yuv: None,
             nv12: Vec::new(),
+            spare: None,
             scale: 1.0,
             last_was_key: false,
             force_key: false,
@@ -268,9 +271,25 @@ impl VideoEncoder {
     ) -> Result<Option<Vec<u8>>, CodecError> {
         let (w, h) = yuv.dimensions();
         if self.dims != Some((w, h)) || self.encoder.is_none() {
-            self.encoder = Some(self.build(w, h)?);
+            // Switching between two sizes (full / half while things move) reuses the
+            // encoder kept for the other size; its next frame must be a keyframe.
+            let previous = self.encoder.take().zip(self.dims);
+            let engine = match self.spare.take() {
+                Some((dims, engine)) if dims == (w, h) => {
+                    self.force_key = true;
+                    engine
+                }
+                _ => self.build(w, h)?,
+            };
+            self.spare = previous.map(|(e, d)| (d, e));
+            self.encoder = Some(engine);
             self.dims = Some((w, h));
             self.nv12.clear(); // forces a full NV12 rewrite
+            // A kept encoder may still have an older bitrate.
+            #[cfg(windows)]
+            if let Some(Engine::MediaFoundation(mf)) = &mut self.encoder {
+                mf.set_bitrate(self.settings.bitrate_bps);
+            }
         }
         let force_key = std::mem::take(&mut self.force_key);
         let out = match self.encoder.as_mut().expect("built above") {

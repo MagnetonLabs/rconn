@@ -293,6 +293,50 @@ impl I420 {
 }
 
 impl I420 {
+    /// Half the size (2x2 averages), for sending fast motion at a quarter of the pixels.
+    /// `out` is reallocated if it isn't half this picture's size (rounded down to even).
+    pub fn half_into(&self, out: &mut Option<I420>) {
+        let (w, h) = (self.width, self.height);
+        let (hw, hh) = ((w / 2) & !1, (h / 2) & !1);
+        let dst = match out {
+            Some(o) if o.dimensions() == (hw, hh) => o,
+            _ => out.insert(I420::new(hw, hh)),
+        };
+        if hw == 0 || hh == 0 {
+            return;
+        }
+        // Each plane halves the same way: average 2x2 blocks of the source plane.
+        fn half_plane(src: &[u8], sw: usize, dst: &mut [u8], dw: usize) {
+            let rows = dst.len() / dw;
+            let bands = threads().min(rows / MIN_BAND_ROWS).max(1);
+            let band_rows = rows.div_ceil(bands).max(1);
+            std::thread::scope(|s| {
+                for (i, band) in dst.chunks_mut(band_rows * dw).enumerate() {
+                    s.spawn(move || {
+                        for (r, row) in band.chunks_exact_mut(dw).enumerate() {
+                            let y = (i * band_rows + r) * 2;
+                            let (a, b) = (&src[y * sw..], &src[(y + 1) * sw..]);
+                            for (x, px) in row.iter_mut().enumerate() {
+                                let sum = u16::from(a[2 * x])
+                                    + u16::from(a[2 * x + 1])
+                                    + u16::from(b[2 * x])
+                                    + u16::from(b[2 * x + 1]);
+                                *px = ((sum + 2) / 4) as u8;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        let (dy, duv) = dst.data.split_at_mut(hw * hh);
+        let (du, dv) = duv.split_at_mut(hw * hh / 4);
+        half_plane(self.y(), w, dy, hw);
+        half_plane(self.u(), w / 2, du, hw / 2);
+        half_plane(self.v(), w / 2, dv, hw / 2);
+    }
+}
+
+impl I420 {
     /// The same picture as NV12 (Y plane, then interleaved U/V), as Media Foundation wants.
     pub fn to_nv12(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.data.len());
@@ -536,6 +580,26 @@ mod tests {
         inc.write_nv12(&mut nv12_inc, Some((0, h)));
         full.write_nv12(&mut nv12, None);
         assert_eq!(nv12_inc, nv12);
+    }
+
+    #[test]
+    fn half_size_averages_2x2_blocks() {
+        let (w, h) = (2992, 1878);
+        let mut full = I420::new(w, h);
+        full.fill_from_bgra(&sample(w, h), w);
+        let mut half = None;
+        full.half_into(&mut half);
+        let half = half.expect("allocated");
+        assert_eq!(half.dimensions(), (1496, 938)); // 939 rounded down to even
+        let (hw, _) = half.dimensions();
+        for (x, y) in [(0, 0), (7, 3), (1495, 937), (700, 400)] {
+            let f = |dx: usize, dy: usize| u16::from(full.y()[(2 * y + dy) * w + 2 * x + dx]);
+            let want = (f(0, 0) + f(1, 0) + f(0, 1) + f(1, 1) + 2) / 4;
+            assert_eq!(u16::from(half.y()[y * hw + x]), want, "luma at {x},{y}");
+        }
+        let f = |dx: usize, dy: usize| u16::from(full.u()[(2 * 5 + dy) * (w / 2) + 2 * 9 + dx]);
+        let want = (f(0, 0) + f(1, 0) + f(0, 1) + f(1, 1) + 2) / 4;
+        assert_eq!(u16::from(half.u()[5 * (hw / 2) + 9]), want, "chroma");
     }
 
     #[test]

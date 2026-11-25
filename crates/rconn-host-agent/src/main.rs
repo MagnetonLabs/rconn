@@ -72,10 +72,15 @@ struct Cli {
     no_audio: bool,
     /// Frame-rate cap. Idle screens send far fewer frames; the encoder drops frames when
     /// the CPU can't keep up.
-    #[arg(long, default_value_t = 60)]
+    /// Frame rate while someone interacts (background changes get less).
+    #[arg(long, default_value_t = 30)]
     max_fps: u32,
     #[arg(long, default_value_t = 25_000)]
     max_kbps: u32,
+    /// Keep full resolution while large areas move (by default large screens drop to half
+    /// size during scrolling and video: about a quarter of the CPU).
+    #[arg(long)]
+    sharp_motion: bool,
     /// Host settings file (the service passes ProgramData\\rconn\\host.toml).
     #[arg(long, env = "RCONN_SETTINGS")]
     settings: Option<PathBuf>,
@@ -315,6 +320,7 @@ async fn serve_session(
         max_fps: cli.max_fps,
         max_bitrate_bps: cli.max_kbps.saturating_mul(1000),
         max_size: (mw.parse()?, mh.parse()?),
+        motion_half_res: !cli.sharp_motion,
     };
     // Host sound runs alongside the picture; losing it never ends the session.
     if let (Some(audio_track), false) = (session.audio.take(), cli.no_audio) {

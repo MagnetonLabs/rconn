@@ -25,6 +25,9 @@ pub struct StreamConfig {
     pub max_bitrate_bps: u32,
     /// Larger desktops are halved until they fit.
     pub max_size: (usize, usize),
+    /// Send large screens at half size while a big area keeps changing (scrolling, video):
+    /// a quarter of the encoding work; a sharp full-size picture follows when it settles.
+    pub motion_half_res: bool,
 }
 
 /// Asks the encoder for an IDR frame (viewer joined, decoder lost sync).
@@ -37,12 +40,22 @@ impl KeyframeRequests {
     }
 }
 
-/// Encode rate for small background changes when nobody is interacting.
+/// Encode rate for small background changes (spinner, caret) when nobody is interacting.
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(100);
+/// Encode rate for medium background changes (an animated banner, a small video).
+const MEDIUM_INTERVAL: Duration = Duration::from_millis(66);
 /// Input this recent means someone is watching closely: full frame rate.
 const INTERACTIVE_FOR: Duration = Duration::from_secs(2);
-/// A change covering this share of the screen (scrolling, video) gets the full rate.
+/// Background changes covering this share of the screen are "medium" (15 fps).
 const BIG_CHANGE: f32 = 0.02;
+/// Frames in a row changing this share of the screen count as motion (scrolling, a big
+/// video; not an animated banner)...
+const MOTION_CHANGE: f32 = 0.25;
+const MOTION_FRAMES: u32 = 4;
+/// ...which ends after this long without such a frame.
+const MOTION_SETTLE: Duration = Duration::from_millis(700);
+/// Only screens this large (in pixels) are halved during motion.
+const MOTION_MIN_PIXELS: usize = 2_500_000;
 
 fn epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -192,6 +205,10 @@ fn run_generation(
         },
     )?;
     let mut picture: Option<I420> = None;
+    let mut small: Option<I420> = None;
+    let mut motion = false;
+    let mut big_streak = 0u32;
+    let mut last_big = Instant::now();
     let mut pending: Option<Pending> = None;
     let mut produced = false;
     let started = Instant::now();
@@ -215,7 +232,14 @@ fn run_generation(
         // Wait for a change, but wake for a due batch, resend, or keyframe request.
         let due = pending
             .as_ref()
-            .map(|_| last_encode + BACKGROUND_INTERVAL)
+            .map(|p| {
+                last_encode
+                    + if p.changed >= BIG_CHANGE {
+                        MEDIUM_INTERVAL
+                    } else {
+                        BACKGROUND_INTERVAL
+                    }
+            })
             .into_iter()
             .chain(resends.first().copied())
             .min();
@@ -271,9 +295,27 @@ fn run_generation(
         if force {
             enc.request_keyframe();
         }
-        let urgent = interactive() || pending.as_ref().is_some_and(|p| p.changed >= BIG_CHANGE);
-        let interval = if urgent { budget } else { BACKGROUND_INTERVAL };
-        let encode_now = force || (pending.is_some() && now >= last_encode + interval);
+        let (w, h) = pic.dimensions();
+        let may_halve = cfg.motion_half_res && w * h >= MOTION_MIN_PIXELS;
+        // Motion over: one sharp full-size picture.
+        let sharpen = motion && last_big.elapsed() >= MOTION_SETTLE;
+        if sharpen {
+            motion = false;
+            big_streak = 0;
+        }
+        // Full rate while someone interacts or a big area moves; background animation
+        // gets fewer frames (each full-screen encode costs the same, however small the
+        // change).
+        let changed = pending.as_ref().map_or(0.0, |p| p.changed);
+        let urgent = interactive() || changed >= MOTION_CHANGE;
+        let interval = if urgent {
+            budget
+        } else if changed >= BIG_CHANGE {
+            MEDIUM_INTERVAL.max(budget)
+        } else {
+            BACKGROUND_INTERVAL.max(budget)
+        };
+        let encode_now = force || sharpen || (pending.is_some() && now >= last_encode + interval);
         if !encode_now {
             continue;
         }
@@ -292,8 +334,23 @@ fn run_generation(
         }
         let p = pending.take();
         let rows = p.as_ref().map_or((0, 0), |p| p.rows);
+        if p.as_ref().is_some_and(|p| p.changed >= MOTION_CHANGE) {
+            last_big = now;
+            big_streak += 1;
+        } else if p.is_some() {
+            big_streak = 0;
+        }
+        if may_halve && !motion && big_streak >= MOTION_FRAMES {
+            motion = true;
+        }
         let t0 = Instant::now();
-        let encoded = enc.encode_yuv(pic, Some(rows))?;
+        let encoded = if motion && may_halve {
+            pic.half_into(&mut small);
+            stats.half += 1;
+            enc.encode_yuv(small.as_ref().expect("allocated by half_into"), None)?
+        } else {
+            enc.encode_yuv(pic, Some(rows))?
+        };
         stats.encode += t0.elapsed();
         last_encode = Instant::now();
         if urgent {
@@ -357,6 +414,8 @@ struct Stats {
     frames: u32,
     /// Frames sent at the full rate (interaction or a big change).
     urgent: u32,
+    /// Frames sent at half size (motion).
+    half: u32,
     captures: u32,
     bytes: usize,
     capture: Duration,
@@ -386,6 +445,7 @@ impl Stats {
             size = format!("{w}x{h}"),
             fps = format!("{:.1}", f64::from(self.frames) / secs),
             urgent_fps = format!("{:.1}", f64::from(self.urgent) / secs),
+            half_size_fps = format!("{:.1}", f64::from(self.half) / secs),
             kbps = format!("{:.0}", self.bytes as f64 * 8.0 / secs / 1000.0),
             changed_pct = format!("{:.1}", self.changed * 100.0 / n),
             capture_ms = per(self.capture, f64::from(self.captures.max(1))),
