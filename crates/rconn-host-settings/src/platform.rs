@@ -87,23 +87,22 @@ pub fn relaunch_elevated() -> Result<(), String> {
 }
 
 /// Run `exe args` with administrator rights (UAC prompt) and wait for it. Arguments must
-/// not contain quotes. Fails if the prompt is declined or the program fails.
+/// be non-empty, without spaces or quotes. Fails if the prompt is declined or the program fails.
 pub fn run_elevated_wait(exe: &std::path::Path, args: &[&str]) -> Result<(), String> {
     if !cfg!(windows) {
         return Err("Run with sudo on this OS".into());
     }
-    if args.iter().any(|a| a.contains(['\'', '"'])) {
-        return Err("unsupported characters in arguments".into());
+    // Start-Process mangles empty and quoted arguments (an empty one arrived as " "):
+    // refuse them rather than pass something else.
+    if args
+        .iter()
+        .any(|a| a.trim().is_empty() || a.contains(['\'', '"', ' ']))
+    {
+        return Err("unsupported argument (empty, spaces or quotes)".into());
     }
     let arglist = args
         .iter()
-        .map(|a| {
-            if a.is_empty() {
-                "'\"\"'".to_owned()
-            } else {
-                format!("'{a}'")
-            }
-        })
+        .map(|a| format!("'{a}'"))
         .collect::<Vec<_>>()
         .join(",");
     let script = format!(
