@@ -69,7 +69,9 @@ struct Cli {
     /// Don't send host sound.
     #[arg(long)]
     no_audio: bool,
-    #[arg(long, default_value_t = 30)]
+    /// Frame-rate cap. Idle screens send far fewer frames; the encoder drops frames when
+    /// the CPU can't keep up.
+    #[arg(long, default_value_t = 60)]
     max_fps: u32,
     #[arg(long, default_value_t = 8000)]
     max_kbps: u32,
