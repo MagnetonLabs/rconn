@@ -119,7 +119,9 @@ impl Model {
             saved,
             load,
             session_active: data_dir.join("session.active").exists(),
+            // Windows keeps the identity in `identity\`; the Mac host, beside its settings.
             host_id: std::fs::read_to_string(data_dir.join("identity").join("host.id"))
+                .or_else(|_| std::fs::read_to_string(data_dir.join("host.id")))
                 .ok()
                 .map(|s| s.trim().to_owned()),
             service: crate::platform::service_state(),

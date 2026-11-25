@@ -146,7 +146,9 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
             });
             row(ui, "Max video bitrate", locks[5], |ui| {
                 ui.add(
-                    egui::Slider::new(&mut form.max_bitrate_kbps, 500..=20_000)
+                    // Up to the server-side cap; a narrower range would silently lower the
+                    // saved value just by showing it.
+                    egui::Slider::new(&mut form.max_bitrate_kbps, 500..=50_000)
                         .suffix(" kbps")
                         .logarithmic(true),
                 )
