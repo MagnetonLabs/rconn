@@ -63,6 +63,7 @@ impl Authenticator for TestAuth {
     }
     async fn session_policy(&self, _host: HostIdentity) -> SessionPolicy {
         SessionPolicy {
+            guest: false,
             show_indicator: false,
             clipboard: true,
         }
@@ -541,4 +542,102 @@ async fn operators_can_enroll_their_own_computer_only_in_their_org() {
         recv(&mut op).await,
         Some(ServerMessage::Error { .. })
     ));
+}
+
+/// Connect as a guest (no account) to the computer with ID `typed`.
+async fn connect_guest(url: &str, typed: &str) -> (Ws, Option<ServerMessage>) {
+    let (mut ws, _) = connect_async(url).await.unwrap();
+    send(
+        &mut ws,
+        &ClientMessage::GuestHello {
+            protocol_version: PROTOCOL_VERSION,
+            host: typed.into(),
+        },
+    )
+    .await;
+    let first = recv(&mut ws).await;
+    (ws, first)
+}
+
+#[tokio::test]
+async fn a_guest_reaches_only_the_computer_whose_id_they_typed() {
+    let (url, _state) = start().await;
+    let (mut host, host_id) = connect_host(&url).await;
+    let (_other, other_id) = connect_host(&url).await;
+
+    let (mut guest, first) = connect_guest(&url, &host_id.short_code()).await;
+    assert!(matches!(first, Some(ServerMessage::Welcome { .. })));
+    assert_eq!(
+        recv(&mut guest).await,
+        Some(ServerMessage::GuestHost { host_id })
+    );
+
+    // Another computer: refused, and the guest stays connected.
+    send(
+        &mut guest,
+        &ClientMessage::RequestSession { host_id: other_id },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut guest).await,
+        Some(ServerMessage::Error {
+            code: ErrorCode::NotFound,
+            ..
+        })
+    ));
+
+    // Its own computer: the host is told this is a guest, so it asks for the password.
+    send(&mut guest, &ClientMessage::RequestSession { host_id }).await;
+    let Some(ServerMessage::IncomingSession { policy, .. }) = recv(&mut host).await else {
+        panic!("host not told")
+    };
+    assert!(policy.guest, "the host must check the access password");
+    assert!(matches!(
+        recv(&mut guest).await,
+        Some(ServerMessage::SessionReady { .. })
+    ));
+
+    // Guests can't list or enroll computers.
+    send(&mut guest, &ClientMessage::ListHosts).await;
+    assert!(matches!(
+        recv(&mut guest).await,
+        Some(ServerMessage::Error {
+            code: ErrorCode::BadRequest,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn guest_ids_are_not_probeable_and_attempts_are_rate_limited() {
+    let (url, _state) = start().await;
+    let (_host, host_id) = connect_host(&url).await;
+
+    let (_ws, first) = connect_guest(&url, "000 000 000").await;
+    assert!(
+        matches!(
+            first,
+            Some(ServerMessage::Error {
+                code: ErrorCode::NotFound,
+                ..
+            })
+        ),
+        "unknown ID: {first:?}"
+    );
+
+    for _ in 0..rconn_signaling::GUEST_REQUESTS_PER_MINUTE {
+        let (_ws, first) = connect_guest(&url, &host_id.short_code()).await;
+        assert!(matches!(first, Some(ServerMessage::Welcome { .. })));
+    }
+    let (_ws, first) = connect_guest(&url, &host_id.short_code()).await;
+    assert!(
+        matches!(
+            first,
+            Some(ServerMessage::Error {
+                code: ErrorCode::BadRequest,
+                ..
+            })
+        ),
+        "over the limit: {first:?}"
+    );
 }

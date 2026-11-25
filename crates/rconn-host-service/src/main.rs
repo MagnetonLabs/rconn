@@ -23,6 +23,10 @@ enum Cmd {
     /// Change one host setting (admin). Refused during a session, for keys locked by fleet
     /// policy, and for invalid values. Example: `set hidden_mode indicator`.
     Set { key: String, value: String },
+    /// Set the access password (admin): anyone with this computer's ID and the password can
+    /// connect without an account. Read from the first line of stdin, never the command
+    /// line; an empty line turns access by password off.
+    SetAccessPassword,
     /// (Windows, admin) write host.toml + identity into ProgramData\rconn and lock it down.
     Configure {
         /// Signaling server URL (also the identity bound into host proofs).
@@ -82,6 +86,32 @@ fn main() -> Result<()> {
     );
     match cli.cmd {
         Cmd::LaunchInConsole { log, exe, args } => launch(&log, &exe, &args),
+        Cmd::SetAccessPassword => {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let password = line.trim_end_matches(['\r', '\n']);
+            let verifier = if password.is_empty() {
+                String::new()
+            } else {
+                rconn_core::guest::make_verifier(password)?
+            };
+            let dir = paths::data_dir();
+            rconn_core::settings::write_setting(
+                rconn_core::settings::SettingsLayers {
+                    system_file: Some(dir.join("host.toml")),
+                    ..Default::default()
+                },
+                "access_password",
+                &verifier,
+                rconn_core::settings::Writer::Admin,
+                dir.join("session.active").exists(),
+            )?;
+            println!(
+                "access password {}",
+                if verifier.is_empty() { "off" } else { "set" }
+            );
+            Ok(())
+        }
         Cmd::Set { key, value } => {
             let dir = paths::data_dir();
             let session_active = dir.join("session.active").exists();

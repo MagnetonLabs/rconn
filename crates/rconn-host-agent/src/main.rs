@@ -2,6 +2,7 @@
 //! sessions, streams the screen, and serves the data channel. Input and audio attach
 //! here in phases 4 and 7.
 
+mod access;
 mod audio;
 mod awake;
 mod cursor;
@@ -16,7 +17,7 @@ use bytes::BytesMut;
 use clap::Parser;
 use rconn_core::fleet::HostKey;
 use rconn_core::ids::HostId;
-use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage};
+use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage, GuestMessage};
 use rconn_media::capture::{Capturer, TestPattern};
 use rconn_peer::clipboard::ClipboardSync;
 use rconn_peer::rtc::PeerOptions;
@@ -274,6 +275,11 @@ async fn serve_session(
     // Data channels: Ping/Pong, keyframe requests, input, clipboard (if policy allows).
     let clipboard = session.policy.clipboard;
     let kf = keyframes.clone();
+    // Guests (ID + access password, no account) see and control nothing until it checks out.
+    let gate = access::Gate::new(session.policy.guest);
+    let verifier = settings.settings().access_password.clone();
+    let session_id = session.session_id;
+    let channel_gate = gate.clone();
     // The screen fitted to the viewer's window; the original size returns at the end.
     let fit = Arc::new(std::sync::Mutex::new(display::Fit::default()));
     let channel_fit = fit.clone();
@@ -288,6 +294,11 @@ async fn serve_session(
                 kf.clone(),
                 clipboard,
                 channel_fit.clone(),
+                Guest {
+                    gate: channel_gate.clone(),
+                    verifier: verifier.clone(),
+                    session: session_id,
+                },
             ));
         }
     });
@@ -312,6 +323,14 @@ async fn serve_session(
     .unwrap_or(false);
     if !connected {
         anyhow::bail!("peer connection did not connect");
+    }
+    if session.policy.guest {
+        tracing::info!(%session_id, "access-password session: waiting for the password");
+        if !gate.wait(Duration::from_secs(60)).await {
+            // Let the refusal reach the viewer before the connection closes.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            return Ok(());
+        }
     }
     // Stop streaming when the peer connection closes or fails.
     let watch_stop = stop.clone();
@@ -358,11 +377,19 @@ async fn serve_session(
     result
 }
 
+/// The access-password check for a session (open from the start for signed-in operators).
+struct Guest {
+    gate: Arc<access::Gate>,
+    verifier: String,
+    session: rconn_core::ids::SessionId,
+}
+
 async fn serve_channel(
     dc: Arc<dyn DataChannel>,
     keyframes: KeyframeRequests,
     clipboard: bool,
     fit: Arc<std::sync::Mutex<display::Fit>>,
+    guest: Guest,
 ) {
     match dc.protocol().await {
         Ok(p) if p == DATA_CHANNEL_PROTOCOL => {}
@@ -388,10 +415,24 @@ async fn serve_channel(
             }
         }
     };
+    let gate = guest.gate.clone();
+    let mut check = None;
+    if gate.needs_password() {
+        let (c, first) = access::open(&gate, &guest.verifier, guest.session);
+        check = c;
+        send(DataMessage::Guest(first)).await;
+    }
     loop {
         tokio::select! {
             ev = dc.poll() => match ev {
                 Some(DataChannelEvent::OnMessage(msg)) => match DataMessage::decode(&msg.data) {
+                    Ok(DataMessage::Guest(GuestMessage::Proof { msg, confirm })) => {
+                        if let Some(c) = check.take() {
+                            send(DataMessage::Guest(access::answer(&gate, c, &msg, &confirm))).await;
+                        }
+                    }
+                    // Until the access password checks out, nothing else is accepted.
+                    Ok(_) if !gate.is_open() => {}
                     Ok(DataMessage::Control(Control::Ping(n))) => send(DataMessage::Control(Control::Pong(n))).await,
                     Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
                     Ok(DataMessage::Control(Control::Action(action))) => host_action(action),
@@ -415,8 +456,8 @@ async fn serve_channel(
                 Some(DataChannelEvent::OnClose) | None => break,
                 _ => {}
             },
-            Some(text) = local_clip.recv() => send(DataMessage::Clipboard(text)).await,
-            Some(shape) = cursor_shapes.recv() => send(DataMessage::Control(Control::Cursor(shape))).await,
+            Some(text) = local_clip.recv(), if gate.is_open() => send(DataMessage::Clipboard(text)).await,
+            Some(shape) = cursor_shapes.recv(), if gate.is_open() => send(DataMessage::Control(Control::Cursor(shape))).await,
         }
     }
 }

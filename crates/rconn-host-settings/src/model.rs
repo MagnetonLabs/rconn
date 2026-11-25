@@ -15,9 +15,22 @@ pub struct Form {
     pub clipboard: bool,
     pub max_bitrate_kbps: u32,
     pub log_level: String,
+    /// The stored verifier ("" = off). Never the password itself.
+    pub access_password: String,
+    /// A new password being typed (not saved; turned into a verifier by "Set").
+    pub new_access_password: String,
 }
 
 impl Form {
+    /// Turn the typed password into the stored verifier (saved with the other changes).
+    pub fn set_access_password(&mut self) -> Result<(), String> {
+        let v = rconn_core::guest::make_verifier(&self.new_access_password)
+            .map_err(|e| e.to_string())?;
+        self.access_password = v;
+        self.new_access_password.clear();
+        Ok(())
+    }
+
     fn from(s: &rconn_core::settings::HostSettings) -> Self {
         Self {
             server_url: s.server.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
@@ -31,6 +44,8 @@ impl Form {
             clipboard: s.clipboard,
             max_bitrate_kbps: s.max_bitrate_kbps,
             log_level: s.log_level.clone(),
+            access_password: s.access_password.clone(),
+            new_access_password: String::new(),
         }
     }
 
@@ -54,6 +69,7 @@ impl Form {
             ("clipboard", self.clipboard.to_string()),
             ("max_bitrate_kbps", self.max_bitrate_kbps.to_string()),
             ("log_level", self.log_level.clone()),
+            ("access_password", self.access_password.clone()),
         ]
     }
 }

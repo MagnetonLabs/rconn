@@ -80,6 +80,9 @@ pub struct HostSettings {
     pub clipboard: bool,
     pub max_bitrate_kbps: u32,
     pub log_level: String,
+    /// Verifier for the access password (see [`crate::guest::make_verifier`]); empty means
+    /// connecting with just the ID and a password is off.
+    pub access_password: String,
 }
 
 impl Default for HostSettings {
@@ -91,6 +94,7 @@ impl Default for HostSettings {
             clipboard: true,
             max_bitrate_kbps: 25_000,
             log_level: "info".into(),
+            access_password: String::new(),
         }
     }
 }
@@ -146,7 +150,7 @@ const USER_FILE_NAME: &str = "user file";
 /// Keys only an administrator may set: the system file, fleet policy, or an admin write.
 /// The per-user file can't change them, so a user can't hide the session indicator or
 /// repoint the host at another server.
-pub const ADMIN_ONLY_KEYS: &[&str] = &["server", "hidden_mode", "host_kind"];
+pub const ADMIN_ONLY_KEYS: &[&str] = &["server", "hidden_mode", "host_kind", "access_password"];
 
 /// Who is asking to change a setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +397,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "clipboard",
     "max_bitrate_kbps",
     "log_level",
+    "access_password",
 ];
 
 fn same_path(a: &Path, b: &Path) -> bool {

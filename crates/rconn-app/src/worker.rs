@@ -278,10 +278,16 @@ impl Worker {
                 let list = self.fetch_computers(true).await.unwrap_or_default();
                 match resolve(&typed, &list) {
                     Some(c) => self.connect(c.host_id, c.label.clone()).await,
-                    None => self.notice(format!("No online computer has ID {typed}"), true),
+                    None => self.notice(
+                        format!(
+                            "No online computer in your account has ID {typed}. If it has an access password, enter it under the ID."
+                        ),
+                        true,
+                    ),
                 }
             }
             Request::Connect(id, label) => self.connect(id, label).await,
+            Request::ConnectGuest { id, password } => self.connect_guest(id, password.0).await,
             Request::SaveServer {
                 server,
                 fingerprint,
@@ -384,6 +390,22 @@ impl Worker {
         }
     }
 
+    /// Open a session window for the computer with ID `typed`, using its access password
+    /// (no account). The password goes to the viewer in its environment, never argv.
+    async fn connect_guest(&self, typed: String, password: String) {
+        self.home(|h| h.busy = Some(format!("Connecting to {typed}…")));
+        let (server, _, fp) = self.server();
+        let log = self.paths.config.join("viewer.log");
+        let child =
+            viewer_cmd(&self.paths.viewer_exe, &server, fp.as_deref(), &log).and_then(|mut c| {
+                c.env("RCONN_ACCESS_PASSWORD", &password)
+                    .args(["connect", &typed]);
+                c.spawn()
+                    .map_err(|e| format!("{}: {e}", self.paths.viewer_exe.display()))
+            });
+        self.wait_session(child, typed).await;
+    }
+
     /// Open a session window (`rconn-viewer connect`) for `id`.
     async fn connect(&self, id: HostId, label: Option<String>) {
         let Some(token) = self.token() else {
@@ -404,6 +426,11 @@ impl Worker {
                 c.spawn()
                     .map_err(|e| format!("{}: {e}", self.paths.viewer_exe.display()))
             });
+        self.wait_session(child, name).await;
+    }
+
+    /// Track a session window until it closes; report how it ended.
+    async fn wait_session(&self, child: Result<std::process::Child, String>, name: String) {
         let mut child = match child {
             Ok(c) => c,
             Err(e) => return self.notice(format!("Couldn't open the session window: {e}"), true),

@@ -27,10 +27,22 @@ pub async fn run(
     opts: PeerOptions,
     tap_key: Option<(u64, u16)>,
     fit: Option<(u32, u32)>,
+    guest: Option<crate::access::GuestLogin>,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let sig = SignalingClient::connect_operator(server, trust, token).await?;
+    let (sig, host) = match &guest {
+        Some(g) => SignalingClient::connect_guest(server, trust, &g.id).await?,
+        None => (
+            SignalingClient::connect_operator(server, trust, token).await?,
+            host,
+        ),
+    };
     let mut session = open_viewer_session(sig, host, opts).await?;
+    let mut exchange = guest
+        .as_ref()
+        .map(|g| crate::access::Exchange::new(g.password.clone(), session.session_id));
+    let (refused_tx, mut refused_rx) = tokio::sync::oneshot::channel::<String>();
+    let mut refused_tx = Some(refused_tx);
 
     // Ask for a keyframe as soon as the data channel opens (the first IDR may have been
     // sent before our decoder existed).
@@ -74,6 +86,28 @@ pub async fn run(
             tokio::select! {
                 ev = dc.poll() => match ev {
                     Some(DataChannelEvent::OnOpen) => send_kf(dc.clone()).await,
+                    Some(DataChannelEvent::OnMessage(m)) => {
+                        if let (Ok(DataMessage::Guest(g)), Some(ex)) =
+                            (DataMessage::decode(&m.data), exchange.as_mut())
+                        {
+                            match ex.handle(g).await {
+                                crate::access::Step::Send(reply) => {
+                                    if let Ok(b) = reply.encode() {
+                                        let _ = dc.send(BytesMut::from(&b[..])).await;
+                                    }
+                                }
+                                crate::access::Step::Accepted => {
+                                    println!("access password accepted");
+                                    send_kf(dc.clone()).await;
+                                }
+                                crate::access::Step::Refused(why) => {
+                                    if let Some(tx) = refused_tx.take() {
+                                        let _ = tx.send(why);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Some(DataChannelEvent::OnClose) | None => break,
                     _ => {}
                 },
@@ -118,10 +152,16 @@ pub async fn run(
             }
         }
     });
-    let track = tokio::time::timeout(Duration::from_secs(20), video_rx.recv())
-        .await
-        .map_err(|_| anyhow!("no video from the host within 20 s (is it capturing?)"))?
-        .ok_or_else(|| anyhow!("session closed before video arrived"))?;
+    let track = tokio::select! {
+        t = tokio::time::timeout(Duration::from_secs(20), video_rx.recv()) => t
+            .map_err(|_| anyhow!("no video from the host within 20 s (is it capturing?)"))?
+            .ok_or_else(|| anyhow!("session closed before video arrived"))?,
+        Ok(why) = &mut refused_rx => {
+            println!("refused: {why}");
+            session.close().await;
+            anyhow::bail!("refused: {why}");
+        }
+    };
     let mut rx = VideoReceiver::default();
     let mut dec = VideoDecoder::new(openh264)?;
     let deadline = Instant::now() + Duration::from_secs(seconds);

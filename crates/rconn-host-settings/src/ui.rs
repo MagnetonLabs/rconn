@@ -62,10 +62,12 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
         "clipboard",
         "max_bitrate_kbps",
         "log_level",
+        "access_password",
     ]
     .iter()
     .map(|k| m.lock_reason(k))
     .collect();
+    let mut access_msg: Option<(String, bool)> = None;
     let Some(form) = m.form.as_mut() else {
         return actions;
     };
@@ -149,6 +151,35 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
                         .logarithmic(true),
                 )
             });
+            row(ui, "Access password", locks[7], |ui| {
+                ui.vertical(|ui| {
+                    ui.label(if form.access_password.is_empty() {
+                        "Off: only signed-in accounts can connect."
+                    } else {
+                        "On: anyone with this computer's ID and the password can connect."
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.new_access_password)
+                                .password(true)
+                                .desired_width(200.0)
+                                .hint_text("new password (8+ characters)"),
+                        );
+                        if ui.button("Set").clicked() {
+                            match form.set_access_password() {
+                                Ok(()) => {
+                                    access_msg = Some(("Password set: click Save.".into(), false))
+                                }
+                                Err(e) => access_msg = Some((e, true)),
+                            }
+                        }
+                        if !form.access_password.is_empty() && ui.button("Turn off").clicked() {
+                            form.access_password.clear();
+                        }
+                    });
+                })
+                .response
+            });
             row(ui, "Log level", locks[6], |ui| {
                 egui::ComboBox::from_id_salt("log_level")
                     .selected_text(form.log_level.clone())
@@ -161,6 +192,9 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
             });
         });
 
+    if let Some(msg) = access_msg {
+        m.messages = vec![msg];
+    }
     ui.add_space(8.0);
     let changes = m.changes().len();
     ui.horizontal(|ui| {

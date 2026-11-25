@@ -38,6 +38,9 @@ pub struct ConnectArgs {
     pub mute: bool,
     /// Shown in the tab, toolbar and title (the computer's name or ID).
     pub name: String,
+    /// Connecting with the computer's ID and access password instead of an account.
+    #[serde(default)]
+    pub guest: Option<crate::access::GuestLogin>,
 }
 
 /// The local hotkey that toggles the toolbar: Ctrl+Alt+Shift+M. Never sent to the host.
@@ -427,7 +430,7 @@ impl eframe::App for Window {
             match self
                 .tabs
                 .iter()
-                .position(|t| t.host == args.host && !t.closing)
+                .position(|t| t.host == args.host && !t.closing && args.guest.is_none())
             {
                 Some(i) => self.switch_to(i),
                 None => {
@@ -480,14 +483,33 @@ async fn session(
         }
     };
     let trust = ServerTrust::from_fingerprint(args.fingerprint.as_deref());
-    let sig = SignalingClient::connect_operator(&args.server, &trust, &args.token).await?;
+    let (sig, host) = match &args.guest {
+        Some(g) => SignalingClient::connect_guest(&args.server, &trust, &g.id).await?,
+        None => (
+            SignalingClient::connect_operator(&args.server, &trust, &args.token).await?,
+            args.host,
+        ),
+    };
     let opts = PeerOptions {
         udp_addrs: args.udp_addrs.clone(),
         relay_only: args.relay_only,
     };
-    let mut session = open_viewer_session(sig, args.host, opts).await?;
-    shared.lock().expect("ui state").status = "connected, waiting for the picture…".into();
+    let mut session = open_viewer_session(sig, host, opts).await?;
+    let mut exchange = args
+        .guest
+        .as_ref()
+        .map(|g| crate::access::Exchange::new(g.password.clone(), session.session_id));
+    shared.lock().expect("ui state").status = if exchange.is_some() {
+        "checking the access password…".into()
+    } else {
+        "connected, waiting for the picture…".into()
+    };
     repaint();
+    // The computer refused the access password: the session ends with its reason.
+    let (refused_tx, mut refused_rx) = tokio::sync::oneshot::channel::<String>();
+    let mut refused_tx = Some(refused_tx);
+    let status_shared = shared.clone();
+    let status_ctx = ctx.clone();
 
     // Data channel: keyframe request on open, then forward input as it comes.
     let dc = session.data.clone();
@@ -524,6 +546,26 @@ async fn session(
                         Ok(DataMessage::Control(Control::Cursor(shape))) => {
                             cursor.lock().expect("cursor").replace(shape);
                             repaint_cursor();
+                        }
+                        Ok(DataMessage::Guest(m)) => {
+                            if let Some(ex) = exchange.as_mut() {
+                                match ex.handle(m).await {
+                                    crate::access::Step::Send(reply) => send(dc.clone(), reply).await,
+                                    crate::access::Step::Accepted => {
+                                        status_shared.lock().expect("ui state").status =
+                                            "access password accepted, waiting for the picture…".into();
+                                        if let Some(c) = status_ctx.lock().expect("ctx").as_ref() {
+                                            c.request_repaint();
+                                        }
+                                        send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
+                                    }
+                                    crate::access::Step::Refused(why) => {
+                                        if let Some(tx) = refused_tx.take() {
+                                            let _ = tx.send(why);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     },
@@ -579,10 +621,17 @@ async fn session(
             }
         }
     });
-    let track = tokio::time::timeout(Duration::from_secs(20), video_rx.recv())
-        .await
-        .map_err(|_| anyhow!("no video from the host within 20 s"))?
-        .ok_or_else(|| anyhow!("session closed before video arrived"))?;
+    let track = tokio::select! {
+        t = tokio::time::timeout(Duration::from_secs(20), video_rx.recv()) => t
+            .map_err(|_| anyhow!("no video from the host within 20 s"))?
+            .ok_or_else(|| anyhow!("session closed before video arrived"))?,
+        Ok(why) = &mut refused_rx => {
+            dc_task.abort();
+            router.abort();
+            session.close().await;
+            anyhow::bail!("{why}");
+        }
+    };
 
     let mut rx = VideoReceiver::default();
     let mut dec = VideoDecoder::new(&args.openh264)?;

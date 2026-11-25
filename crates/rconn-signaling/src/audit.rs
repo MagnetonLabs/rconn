@@ -42,6 +42,18 @@ pub enum AuditEvent {
         session_id: SessionId,
         reason: EndReason,
     },
+    /// Someone without an account asked for a computer by its ID (access password).
+    /// Whether the password was right is decided, and logged, by the host.
+    GuestConnect {
+        org_id: OrgId,
+        host_id: HostId,
+        /// The temporary id this guest's session carries as its operator.
+        operator_id: OperatorId,
+    },
+    /// A guest request refused before reaching the host (unknown ID, rate limit).
+    GuestRefused {
+        reason: String,
+    },
     /// An operator turned a computer into a host (self-service enrollment).
     HostEnrolled {
         org_id: OrgId,

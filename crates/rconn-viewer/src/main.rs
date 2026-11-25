@@ -1,6 +1,7 @@
 //! Viewer client. The egui UI arrives with video in phase 3; today `ping` opens a real
 //! session to a host and measures data-channel round trips.
 
+mod access;
 mod gui;
 mod keymap;
 mod oidc_login;
@@ -38,7 +39,9 @@ struct Cli {
 enum Cmd {
     /// Open a window on the host's screen with mouse and keyboard control.
     Connect {
-        host: uuid::Uuid,
+        /// The computer: its id (signed in), or its 9-digit ID with the access password in
+        /// the RCONN_ACCESS_PASSWORD environment variable (no account needed).
+        host: String,
         #[arg(long, env = "RCONN_OPENH264")]
         openh264: Option<std::path::PathBuf>,
         #[arg(long, default_value = "0.0.0.0:0")]
@@ -58,7 +61,8 @@ enum Cmd {
     /// Open a session and receive the host's screen (headless): print stream stats, and
     /// optionally save a PNG of the latest frame.
     Watch {
-        host: uuid::Uuid,
+        /// As for `connect`: an id, or a 9-digit ID plus RCONN_ACCESS_PASSWORD.
+        host: String,
         #[arg(long, default_value_t = 15)]
         seconds: u64,
         #[arg(long)]
@@ -130,11 +134,17 @@ async fn main() -> Result<()> {
                 Some(p) => p.clone(),
                 None => default_openh264()?,
             };
+            let (host_id, guest) = target(host)?;
+            let token = if guest.is_some() {
+                String::new()
+            } else {
+                token_for(&cli)?
+            };
             watch::run(
                 &cli.server,
                 &trust(&cli),
-                &token_for(&cli)?,
-                HostId(*host),
+                &token,
+                host_id,
                 *seconds,
                 snapshot.clone(),
                 &lib,
@@ -144,6 +154,7 @@ async fn main() -> Result<()> {
                 },
                 *tap_key,
                 *fit,
+                guest,
             )
             .await
         }
@@ -160,17 +171,26 @@ async fn main() -> Result<()> {
                 Some(p) => p.clone(),
                 None => default_openh264()?,
             };
+            let (host_id, guest) = target(host)?;
             let args = gui::ConnectArgs {
                 server: cli.server.clone(),
                 fingerprint: cli.fingerprint.clone(),
-                token: token_for(&cli)?,
-                host: HostId(*host),
+                token: if guest.is_some() {
+                    String::new()
+                } else {
+                    token_for(&cli)?
+                },
+                host: host_id,
                 openh264,
                 udp_addrs: udp.clone(),
                 relay_only: *relay_only,
                 chromeless: *chromeless,
                 mute: *mute,
-                name: name.clone().unwrap_or_else(|| HostId(*host).short_code()),
+                name: name.clone().unwrap_or_else(|| match &guest {
+                    Some(g) => g.id.clone(),
+                    None => host_id.short_code(),
+                }),
+                guest,
             };
             // A session window is already open: add a tab to it instead of a new window.
             if gui::hand_off(&args) {
@@ -417,6 +437,28 @@ fn default_openh264() -> Result<std::path::PathBuf> {
     }
     rconn_media::cisco::local_binary_path()
         .ok_or_else(|| anyhow::anyhow!("openh264 not found; pass --openh264"))
+}
+
+/// Which computer, and how: a full id means "signed in"; anything else is an ID to use with
+/// the access password from [`access::PASSWORD_ENV`].
+fn target(host: &str) -> Result<(HostId, Option<access::GuestLogin>)> {
+    let password = std::env::var(access::PASSWORD_ENV)
+        .ok()
+        .filter(|p| !p.is_empty());
+    match (uuid::Uuid::parse_str(host.trim()), password) {
+        (Ok(id), None) => Ok((HostId(id), None)),
+        (id, Some(password)) => Ok((
+            HostId(id.unwrap_or_default()),
+            Some(access::GuestLogin {
+                id: host.trim().to_owned(),
+                password,
+            }),
+        )),
+        (Err(_), None) => anyhow::bail!(
+            "`{host}` isn't a computer id; to connect with its 9-digit ID, put its access password in {}",
+            access::PASSWORD_ENV
+        ),
+    }
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32), String> {

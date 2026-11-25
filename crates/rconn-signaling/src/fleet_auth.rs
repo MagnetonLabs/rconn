@@ -43,6 +43,7 @@ impl FleetAuthenticator {
             tokens: None,
             oidc: None,
             policy: SessionPolicy {
+                guest: false,
                 show_indicator: false,
                 clipboard: true,
             },

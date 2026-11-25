@@ -20,6 +20,10 @@ x509-parser = { version = "0.18.1", features = ["verify"] }
 ed25519-dalek = "3.0.0"
 time = "0.3.55"
 toml = "1.2.2"
+spake2 = "0.4"
+argon2 = "0.6.0"
+hmac = "0.13"
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true

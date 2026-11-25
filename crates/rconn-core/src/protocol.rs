@@ -87,6 +87,11 @@ pub enum ClientMessage {
     },
     /// Either side ends a session.
     EndSession { session_id: SessionId },
+    /// First message from someone connecting with a computer's ID and access password
+    /// (no account). `host` is the 9-digit ID as typed. The server answers `Welcome`, then
+    /// [`ServerMessage::GuestHost`]; the password itself is checked by the host, later, on
+    /// the session's encrypted data channel (see [`crate::guest`]).
+    GuestHello { protocol_version: u16, host: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +122,11 @@ pub enum ServerMessage {
     /// Answer to `ListHosts`: the org's online hosts.
     Hosts {
         hosts: Vec<HostInfo>,
+    },
+    /// Answer to `GuestHello`: the computer the ID belongs to. The guest may then request
+    /// a session with it (and only with it).
+    GuestHost {
+        host_id: HostId,
     },
     /// Answer to `GetLoginOptions`.
     LoginOptions {
@@ -205,6 +215,10 @@ pub struct SessionPolicy {
     pub show_indicator: bool,
     /// Allow two-way text clipboard sync.
     pub clipboard: bool,
+    /// The viewer has no account: the host must check its access password before showing
+    /// anything or taking input.
+    #[serde(default)]
+    pub guest: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +254,32 @@ pub enum DataMessage {
     /// Clipboard text, either direction. Bounded by [`MAX_CLIPBOARD_BYTES`].
     Clipboard(String),
     Control(Control),
+    /// Access-password check (see [`crate::guest`]), before a guest session starts.
+    Guest(GuestMessage),
+}
+
+/// The access-password exchange on the data channel. The host speaks first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GuestMessage {
+    /// Host -> viewer: derive with `salt`, answer `msg` (SPAKE2).
+    Challenge { salt: Vec<u8>, msg: Vec<u8> },
+    /// Viewer -> host.
+    Proof { msg: Vec<u8>, confirm: Vec<u8> },
+    /// Host -> viewer: the password was right; `confirm` proves the host knows it too.
+    Accepted { confirm: Vec<u8> },
+    /// Host -> viewer: refused; the session ends.
+    Refused(GuestRefusal),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GuestRefusal {
+    WrongPassword,
+    /// This computer has no access password set.
+    NotEnabled,
+    /// Too many wrong passwords lately; try again later.
+    TooManyAttempts {
+        retry_after_secs: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

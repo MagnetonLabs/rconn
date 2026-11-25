@@ -83,6 +83,30 @@ impl SignalingClient {
         Self::finish(ws).await
     }
 
+    /// Connect without an account, to the computer with the ID `typed` (its access password
+    /// is checked later by the host itself). Returns the computer's full id.
+    pub async fn connect_guest(
+        url: &str,
+        trust: &ServerTrust,
+        typed: &str,
+    ) -> Result<(Self, HostId)> {
+        let mut ws = open(url, trust).await?;
+        send_on(
+            &mut ws,
+            &ClientMessage::GuestHello {
+                protocol_version: PROTOCOL_VERSION,
+                host: typed.to_owned(),
+            },
+        )
+        .await?;
+        let mut client = Self::finish(ws).await?;
+        match client.recv().await? {
+            ServerMessage::GuestHost { host_id } => Ok((client, host_id)),
+            ServerMessage::Error { code, message } => bail!("refused: {code:?}: {message}"),
+            other => bail!("unexpected answer to a guest connection: {other:?}"),
+        }
+    }
+
     /// Exchange a username and password for a session token `(token, expires_at)`.
     /// Refuses plaintext `ws://` except to loopback, so a password never crosses a network
     /// unencrypted.

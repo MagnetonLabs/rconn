@@ -31,6 +31,11 @@ pub enum Request {
     RefreshComputers,
     /// A typed ID (9-digit code or full id).
     ConnectTyped(String),
+    /// A typed ID with that computer's access password: no account needed.
+    ConnectGuest {
+        id: String,
+        password: Secret,
+    },
     Connect(HostId, Option<String>),
     SaveServer {
         server: String,
@@ -47,6 +52,16 @@ pub enum Request {
     OpenPermission(String),
 }
 
+/// A password that must not show up in logs or debug output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<hidden>")
+    }
+}
+
 pub struct Home {
     pub profile: Profile,
     /// This computer as a host (None: rconn host not installed here).
@@ -55,6 +70,8 @@ pub struct Home {
     pub signed_in: bool,
     pub tab: Tab,
     pub connect_to: String,
+    /// The typed computer's access password (connect without an account). Cleared once used.
+    pub access_password: String,
     /// None until loaded.
     pub computers: Option<Vec<HostInfo>>,
     pub username: String,
@@ -82,6 +99,7 @@ impl Home {
             signed_in: false,
             tab: Tab::Computers,
             connect_to: String::new(),
+            access_password: String::new(),
             computers: None,
             password: String::new(),
             notice: None,
@@ -260,10 +278,20 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
                     .font(FontId::proportional(22.0))
                     .desired_width(f32::INFINITY),
             );
-            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let mut enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_space(6.0);
+            let pw = ui.add(
+                egui::TextEdit::singleline(&mut h.access_password)
+                    .password(true)
+                    .hint_text("Access password (no account needed)")
+                    .desired_width(f32::INFINITY),
+            );
+            enter |= pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                let ready = h.signed_in && !h.connect_to.trim().is_empty() && h.busy.is_none();
+                let guest = !h.access_password.is_empty();
+                let ready =
+                    (h.signed_in || guest) && !h.connect_to.trim().is_empty() && h.busy.is_none();
                 let button = egui::Button::new(
                     RichText::new("  Connect  ")
                         .size(18.0)
@@ -273,10 +301,23 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
                 if (ui.add_enabled(ready, button).clicked() || (enter && ready))
                     && !h.connect_to.trim().is_empty()
                 {
-                    out.push(Request::ConnectTyped(h.connect_to.trim().to_owned()));
+                    let id = h.connect_to.trim().to_owned();
+                    out.push(if guest {
+                        Request::ConnectGuest {
+                            id,
+                            password: Secret(std::mem::take(&mut h.access_password)),
+                        }
+                    } else {
+                        Request::ConnectTyped(id)
+                    });
                 }
-                if !h.signed_in {
-                    ui.label(RichText::new("Sign in first (⚙ Settings)").color(Color32::GRAY));
+                if !h.signed_in && !guest {
+                    ui.label(
+                        RichText::new(
+                            "Enter the computer's access password, or sign in (⚙ Settings)",
+                        )
+                        .color(Color32::GRAY),
+                    );
                 }
             });
         });

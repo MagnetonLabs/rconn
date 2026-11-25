@@ -56,7 +56,13 @@ struct Registry {
     hosts: HashMap<HostId, (HostIdentity, Outbox)>,
     labels: HashMap<HostId, String>,
     sessions: HashMap<SessionId, SessionEntry>,
+    /// Recent access-password requests per computer (rate limit).
+    guest_requests: HashMap<HostId, Vec<std::time::Instant>>,
 }
+
+/// Access-password requests allowed per computer per minute. Each one is a live guess the
+/// host checks (and locks out after repeated failures); this caps the attempt rate early.
+pub const GUEST_REQUESTS_PER_MINUTE: usize = 10;
 
 struct SessionEntry {
     host: HostIdentity,
@@ -142,6 +148,12 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 enum Peer {
     Host(HostIdentity),
     Operator(OperatorIdentity),
+    /// Connecting with a computer's ID and access password: may open sessions to that
+    /// one computer only, and the host checks the password before anything else.
+    Guest {
+        op: OperatorIdentity,
+        host_id: HostId,
+    },
 }
 
 enum Phase {
@@ -474,8 +486,31 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
             Next::Continue(Phase::Ready(Peer::Operator(op)))
         }
         (Phase::Ready(Peer::Operator(op)), ClientMessage::RequestSession { host_id }) => {
-            request_session(state, tx, op, host_id).await;
+            request_session(state, tx, op, host_id, false).await;
             Next::Continue(Phase::Ready(Peer::Operator(op)))
+        }
+        (
+            Phase::New,
+            ClientMessage::GuestHello {
+                protocol_version,
+                host,
+            },
+        ) => {
+            if !check_version(tx, protocol_version) {
+                return Next::Close(Phase::New);
+            }
+            guest_hello(state, tx, &host).await
+        }
+        (
+            Phase::Ready(Peer::Guest { op, host_id }),
+            ClientMessage::RequestSession { host_id: h },
+        ) => {
+            if h == host_id {
+                request_session(state, tx, op, host_id, true).await;
+            } else {
+                send_err(tx, ErrorCode::NotFound, "host not found or offline".into());
+            }
+            Next::Continue(Phase::Ready(Peer::Guest { op, host_id }))
         }
         (
             Phase::Ready(peer),
@@ -513,7 +548,75 @@ fn check_version(tx: &Outbox, v: u16) -> bool {
     v == PROTOCOL_VERSION
 }
 
-async fn request_session(state: &AppState, tx: &Outbox, op: OperatorIdentity, host_id: HostId) {
+/// Someone typed a computer's ID to connect with its access password: find the computer,
+/// apply the rate limit, and admit them for that computer only.
+async fn guest_hello(state: &AppState, tx: &Outbox, typed: &str) -> Next {
+    let refuse = |reason: &str| {
+        state.audit(AuditEvent::GuestRefused {
+            reason: reason.to_owned(),
+        });
+        // One answer for "unknown" and "offline", so IDs can't be probed.
+        send_err(
+            tx,
+            ErrorCode::NotFound,
+            "computer not found or offline".into(),
+        );
+        Next::Close(Phase::New)
+    };
+    let mut reg = state.inner.registry.lock().await;
+    let Some(host) = reg
+        .hosts
+        .values()
+        .map(|(h, _)| *h)
+        .find(|h| h.host_id.matches(typed))
+    else {
+        return refuse("unknown or offline ID");
+    };
+    let now = std::time::Instant::now();
+    let recent = reg.guest_requests.entry(host.host_id).or_default();
+    recent.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+    if recent.len() >= GUEST_REQUESTS_PER_MINUTE {
+        drop(reg);
+        state.audit(AuditEvent::GuestRefused {
+            reason: format!("rate limit for {}", host.host_id),
+        });
+        send_err(
+            tx,
+            ErrorCode::BadRequest,
+            "too many attempts for this computer; try again in a minute".into(),
+        );
+        return Next::Close(Phase::New);
+    }
+    recent.push(now);
+    drop(reg);
+
+    let op = OperatorIdentity {
+        operator_id: rconn_core::ids::OperatorId::new(),
+        org_id: host.org_id,
+    };
+    state.audit(AuditEvent::GuestConnect {
+        org_id: host.org_id,
+        host_id: host.host_id,
+        operator_id: op.operator_id,
+    });
+    let ice_servers = state.inner.auth.ice_servers(host.org_id).await;
+    let _ = tx.send(welcome(host.org_id, ice_servers));
+    let _ = tx.send(ServerMessage::GuestHost {
+        host_id: host.host_id,
+    });
+    Next::Continue(Phase::Ready(Peer::Guest {
+        op,
+        host_id: host.host_id,
+    }))
+}
+
+async fn request_session(
+    state: &AppState,
+    tx: &Outbox,
+    op: OperatorIdentity,
+    host_id: HostId,
+    guest: bool,
+) {
     let mut reg = state.inner.registry.lock().await;
     // Same answer for "offline" and "other org", so operators can't probe other tenants.
     let Some((host, host_tx)) = reg
@@ -543,7 +646,8 @@ async fn request_session(state: &AppState, tx: &Outbox, op: OperatorIdentity, ho
         host_id,
         operator_id: op.operator_id,
     });
-    let policy = state.inner.auth.session_policy(host).await;
+    let mut policy = state.inner.auth.session_policy(host).await;
+    policy.guest = guest;
     let _ = host_tx.send(ServerMessage::IncomingSession {
         session_id,
         operator_id: op.operator_id,
@@ -557,7 +661,11 @@ async fn request_session(state: &AppState, tx: &Outbox, op: OperatorIdentity, ho
 fn counterpart(entry: &SessionEntry, peer: Peer) -> Option<&Outbox> {
     match peer {
         Peer::Host(h) if h.host_id == entry.host.host_id => Some(&entry.operator_tx),
-        Peer::Operator(o) if o.operator_id == entry.operator.operator_id => Some(&entry.host_tx),
+        Peer::Operator(o) | Peer::Guest { op: o, .. }
+            if o.operator_id == entry.operator.operator_id =>
+        {
+            Some(&entry.host_tx)
+        }
         _ => None,
     }
 }
