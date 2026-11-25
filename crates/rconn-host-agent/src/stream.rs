@@ -94,6 +94,7 @@ pub async fn run(
     let mut next_send = Instant::now();
 
     let mut scaler = AdaptiveScale::default();
+    let mut first_sent = false;
     while !stop.load(Ordering::Relaxed) {
         // Wake for: a new frame, a keyframe request, or the send slot of a frame we hold.
         let slot = tokio::time::Instant::from_std(next_send);
@@ -149,11 +150,19 @@ pub async fn run(
             enc.set_scale(scale);
         }
         if let Some(au) = encoded {
+            if !first_sent {
+                first_sent = true;
+                tracing::info!(
+                    bytes = au.len(),
+                    key = enc.last_was_key(),
+                    "first frame encoded, sending"
+                );
+            }
             stats.bytes += au.len();
             stats.frames += 1;
             stats.latency += frame.captured_at.elapsed();
             if let Err(e) = video.write(au, frame_budget).await {
-                tracing::info!(error = %e, "video track closed");
+                tracing::info!(error = %e, first_sent, "video track closed");
                 break;
             }
         }
@@ -183,6 +192,14 @@ fn capture_generation(
     while !stop.load(Ordering::Relaxed) {
         match capturer.next_frame(frame_budget) {
             Ok(Some(f)) => {
+                if !produced {
+                    tracing::info!(
+                        w = f.width,
+                        h = f.height,
+                        after_ms = last_frame_at.elapsed().as_millis() as u64,
+                        "first frame captured"
+                    );
+                }
                 produced = true;
                 last_frame_at = Instant::now();
                 warned = false;
