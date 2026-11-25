@@ -142,6 +142,9 @@ impl VideoEncoder {
             .bitrate(BitRate::from_bps(self.settings.bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(self.settings.max_fps))
             .complexity(Complexity::Low)
+            // Never let quality fall apart (blocky text/images): cap the quantizer. Costs
+            // bandwidth on busy screens, which screen sharing can afford.
+            .qp(openh264::encoder::QpRange::new(10, 32))
             // Not supported for screen content; openh264 warns and disables them anyway.
             .adaptive_quantization(false)
             .background_detection(false)

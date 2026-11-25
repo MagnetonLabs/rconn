@@ -239,9 +239,6 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
         closing: false,
         host,
         _close: Some(close),
-        seen_window: None,
-        resized_at: None,
-        snapped_to: None,
     }
 }
 
@@ -620,10 +617,6 @@ struct ViewerApp {
     host: HostId,
     /// Dropped with the tab, which ends the session.
     _close: Option<tokio::sync::watch::Sender<()>>,
-    /// Window size last seen, when the user last resized it, and our pending snap size.
-    seen_window: Option<Vec2>,
-    resized_at: Option<Instant>,
-    snapped_to: Option<Vec2>,
 }
 
 /// The local pointer icon for a host pointer shape.
@@ -772,30 +765,6 @@ pub fn window_size_for(remote: Vec2, monitor: Option<Vec2>) -> Vec2 {
         (remote.x * scale).round(),
         (remote.y * scale).round() + chrome,
     )
-}
-
-/// After the user resizes the window, the window size that removes the black bars:
-/// same width with the picture's height, or (if that won't fit on screen) the same
-/// height with the picture's width. `None` when it already fits (within 2 points).
-pub fn snap_to_picture(
-    window: Vec2,
-    picture_area: Vec2,
-    remote: Vec2,
-    monitor: Option<Vec2>,
-) -> Option<Vec2> {
-    let aspect = remote.x / remote.y;
-    let chrome_h = window.y - picture_area.y;
-    let want_h = (picture_area.x / aspect).round();
-    let max_h = monitor.map_or(f32::INFINITY, |m| m.y * 0.95);
-    let size = if want_h + chrome_h <= max_h {
-        Vec2::new(window.x, want_h + chrome_h)
-    } else {
-        Vec2::new(
-            (picture_area.y * aspect).round() + (window.x - picture_area.x),
-            window.y,
-        )
-    };
-    ((size - window).length() > 2.0).then_some(size)
 }
 
 /// Largest rect with `aspect` (w/h) centred in `area`.
@@ -1123,50 +1092,6 @@ impl ViewerApp {
             });
             if fullscreen {
                 self.floating_bar(ui, area, &stats);
-            } else if let Some(t) = &self.texture {
-                // After the user resizes the window, snap it once to the picture's shape.
-                let (window, monitor, dragging, maximized) = ui.ctx().input(|i| {
-                    let v = i.viewport();
-                    (
-                        v.inner_rect.map(|r| r.size()),
-                        v.monitor_size,
-                        i.pointer.any_down(),
-                        v.maximized.unwrap_or(false),
-                    )
-                });
-                if let Some(window) = window {
-                    let changed = self.seen_window.is_none_or(|w| (w - window).length() > 2.0);
-                    if changed {
-                        self.seen_window = Some(window);
-                        // Our own snap landing: nothing more to do.
-                        let ours = self
-                            .snapped_to
-                            .take()
-                            .is_some_and(|s| (s - window).length() < 8.0);
-                        self.resized_at = (!ours).then(Instant::now);
-                    } else if !dragging
-                        && !maximized
-                        && self
-                            .resized_at
-                            .is_some_and(|t| t.elapsed() > Duration::from_millis(300))
-                    {
-                        self.resized_at = None; // at most one snap per resize
-                        let [w, h] = t.size();
-                        if let Some(size) = snap_to_picture(
-                            window,
-                            area.size(),
-                            Vec2::new(w as f32, h as f32),
-                            monitor,
-                        ) {
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                            self.snapped_to = Some(size);
-                        }
-                    }
-                    if self.resized_at.is_some() {
-                        ui.ctx().request_repaint_after(Duration::from_millis(350));
-                    }
-                }
             }
             if let Some(image) = image {
                 self.forward_input(ui, image);
@@ -1214,35 +1139,6 @@ mod tests {
             (picture.x / picture.y - remote.x / remote.y).abs() < 0.01,
             "same shape: no bars"
         );
-    }
-
-    #[test]
-    fn snapping_removes_black_bars_after_a_resize() {
-        let remote = Vec2::new(1496.0, 938.0);
-        // Window made wider than the picture: grow/shrink the height to match.
-        let s = snap_to_picture(
-            Vec2::new(1400.0, 800.0),
-            Vec2::new(1400.0, 728.0),
-            remote,
-            Some(Vec2::new(1800.0, 1100.0)),
-        )
-        .unwrap();
-        assert_eq!(
-            s,
-            Vec2::new(1400.0, (1400.0_f32 / (1496.0 / 938.0)).round() + 72.0)
-        );
-        // Already the right shape: nothing to do.
-        assert!(snap_to_picture(s, Vec2::new(1400.0, s.y - 72.0), remote, None).is_none());
-        // Too tall for the screen: narrow the window instead.
-        let t = snap_to_picture(
-            Vec2::new(1700.0, 900.0),
-            Vec2::new(1700.0, 828.0),
-            remote,
-            Some(Vec2::new(1800.0, 950.0)),
-        )
-        .unwrap();
-        assert_eq!(t.y, 900.0);
-        assert!((t.x - (828.0_f32 * 1496.0 / 938.0).round()).abs() < 1.0);
     }
 
     #[test]
@@ -1418,9 +1314,6 @@ mod render_tests {
             closing: false,
             host: HostId(uuid::Uuid::nil()),
             _close: None,
-            seen_window: None,
-            resized_at: None,
-            snapped_to: None,
         }
     }
 
