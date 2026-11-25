@@ -541,7 +541,7 @@ impl StatusPublisher {
                 system_file: self.settings.clone(),
                 ..Default::default()
             })
-            .is_ok_and(|s| !s.settings().access_password.is_empty());
+            .is_ok_and(|s| !s.settings().access_password.trim().is_empty());
         let s = rconn_core::status::HostStatus {
             missing_permissions: missing_permissions(),
             access_password,

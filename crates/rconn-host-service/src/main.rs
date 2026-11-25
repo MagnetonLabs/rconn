@@ -23,6 +23,8 @@ enum Cmd {
     /// Change one host setting (admin). Refused during a session, for keys locked by fleet
     /// policy, and for invalid values. Example: `set hidden_mode indicator`.
     Set { key: String, value: String },
+    /// Clear one host setting back to its default (admin), e.g. `unset access_password`.
+    Unset { key: String },
     /// Set the access password (admin): anyone with this computer's ID and the password can
     /// connect without an account. Read from the first line of stdin, never the command
     /// line; an empty line turns access by password off.
@@ -110,6 +112,21 @@ fn main() -> Result<()> {
                 "access password {}",
                 if verifier.is_empty() { "off" } else { "set" }
             );
+            Ok(())
+        }
+        Cmd::Unset { key } => {
+            let dir = paths::data_dir();
+            rconn_core::settings::write_setting(
+                rconn_core::settings::SettingsLayers {
+                    system_file: Some(dir.join("host.toml")),
+                    ..Default::default()
+                },
+                &key,
+                "",
+                rconn_core::settings::Writer::Admin,
+                dir.join("session.active").exists(),
+            )?;
+            println!("{key} cleared");
             Ok(())
         }
         Cmd::Set { key, value } => {

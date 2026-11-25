@@ -97,7 +97,7 @@ pub fn open(gate: &Gate, verifier: &str, session: SessionId) -> (Option<HostChec
     if let Some(retry_after_secs) = locked_for() {
         return refuse(GuestRefusal::TooManyAttempts { retry_after_secs });
     }
-    if verifier.is_empty() {
+    if verifier.trim().is_empty() {
         return refuse(GuestRefusal::NotEnabled);
     }
     match HostCheck::start(verifier, session) {

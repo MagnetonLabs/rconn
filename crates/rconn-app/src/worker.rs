@@ -415,10 +415,12 @@ impl Worker {
         let (host_data, service) = (self.paths.host_data.clone(), self.paths.service_exe.clone());
         let result = tokio::task::spawn_blocking(move || {
             if cfg!(windows) {
-                rconn_host_settings::platform::run_elevated_wait(
-                    &service,
-                    &["set", "access_password", &verifier],
-                )
+                let args: &[&str] = if verifier.is_empty() {
+                    &["unset", "access_password"]
+                } else {
+                    &["set", "access_password", &verifier]
+                };
+                rconn_host_settings::platform::run_elevated_wait(&service, args)
             } else {
                 rconn_core::settings::write_setting(
                     rconn_core::settings::SettingsLayers {
