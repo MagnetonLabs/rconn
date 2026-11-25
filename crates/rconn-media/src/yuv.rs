@@ -181,6 +181,18 @@ fn convert_band(src: &[u8], src_width: usize, w: usize, y: &mut [u8], u: &mut [u
     }
 }
 
+impl I420 {
+    /// The same picture as NV12 (Y plane, then interleaved U/V), as Media Foundation wants.
+    pub fn to_nv12(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.data.len());
+        out.extend_from_slice(self.y());
+        for (u, v) in self.u().iter().zip(self.v()) {
+            out.extend([*u, *v]);
+        }
+        out
+    }
+}
+
 impl YUVSource for I420 {
     fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)

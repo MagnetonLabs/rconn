@@ -5118,6 +5118,7 @@ dependencies = [
 name = "rconn-media"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "block2 0.6.2",
  "dispatch2",
  "objc2 0.6.5",

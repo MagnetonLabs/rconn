@@ -4,6 +4,8 @@
 pub mod capture;
 pub mod cisco;
 pub mod codec;
+#[cfg(windows)]
+pub mod mf;
 #[cfg(all(windows, target_arch = "aarch64"))]
 mod opus_shim;
 pub mod video;

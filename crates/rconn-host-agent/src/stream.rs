@@ -156,6 +156,7 @@ pub async fn run(
                 tracing::info!(
                     bytes = au.len(),
                     key = enc.last_was_key(),
+                    engine = enc.engine_name(),
                     "first frame encoded, sending"
                 );
             }

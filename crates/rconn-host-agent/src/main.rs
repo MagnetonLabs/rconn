@@ -85,8 +85,10 @@ struct Cli {
     /// Directory for runtime state (the `session.active` marker that locks settings).
     #[arg(long, env = "RCONN_STATE_DIR")]
     state_dir: Option<PathBuf>,
-    /// Largest streamed size; bigger desktops are halved to fit.
-    #[arg(long, default_value = "1920x1080")]
+    /// Largest streamed size; bigger desktops are halved to fit. Windows encodes with Media
+    /// Foundation, fast enough for full 4K-class desktops (sharp text); elsewhere openh264
+    /// needs the halving to keep up.
+    #[arg(long, default_value = if cfg!(windows) { "3840x2400" } else { "1920x1080" })]
     max_size: String,
     /// Local UDP sockets for ICE.
     #[arg(long, default_value = "0.0.0.0:0")]

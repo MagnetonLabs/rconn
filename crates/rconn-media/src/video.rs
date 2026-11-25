@@ -102,11 +102,22 @@ impl Default for EncoderSettings {
 
 /// Screen-content H.264 encoder tuned for latency: no B-frames (Baseline profile via
 /// openh264), low complexity, keyframes only on request, frame skipping under pressure.
+/// The H.264 encoder doing the work.
+enum Engine {
+    OpenH264(Box<Encoder>),
+    /// Windows' built-in encoder: 3.5-7x faster than openh264 on a measured 8-core VM,
+    /// and the GPU's encoder where a vendor registers one.
+    #[cfg(windows)]
+    MediaFoundation(crate::mf::MfH264Encoder),
+}
+
 pub struct VideoEncoder {
     api_path: std::path::PathBuf,
     settings: EncoderSettings,
     dims: Option<(usize, usize)>,
-    encoder: Option<Encoder>,
+    encoder: Option<Engine>,
+    /// Name of the engine last built (for logs).
+    engine_name: String,
     yuv: Option<I420>,
     /// Fraction of the captured size to encode (1.0 = full); lowered when the CPU is busy.
     scale: f32,
@@ -127,6 +138,7 @@ impl VideoEncoder {
             settings,
             dims: None,
             encoder: None,
+            engine_name: String::new(),
             yuv: None,
             scale: 1.0,
             last_was_key: false,
@@ -134,7 +146,29 @@ impl VideoEncoder {
         })
     }
 
-    fn build(&self, width: usize, height: usize) -> Result<Encoder, CodecError> {
+    fn build(&mut self, width: usize, height: usize) -> Result<Engine, CodecError> {
+        #[cfg(windows)]
+        match crate::mf::MfH264Encoder::new(
+            width as u32,
+            height as u32,
+            self.settings.max_fps.round().max(1.0) as u32,
+            self.settings.bitrate_bps,
+        ) {
+            Ok(mf) => {
+                self.engine_name = format!("Media Foundation ({})", mf.name());
+                return Ok(Engine::MediaFoundation(mf));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Media Foundation encoder unavailable; using openh264")
+            }
+        }
+        self.engine_name = "openh264".into();
+        Ok(Engine::OpenH264(Box::new(
+            self.build_openh264(width, height)?,
+        )))
+    }
+
+    fn build_openh264(&self, width: usize, height: usize) -> Result<Encoder, CodecError> {
         let api: OpenH264API = crate::codec::load_openh264(&self.api_path)?;
         let cfg = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
@@ -183,10 +217,20 @@ impl VideoEncoder {
     /// Change the target bitrate. Rebuilding costs one keyframe, so callers should only do
     /// it on meaningful changes (see `should_retarget`).
     pub fn set_bitrate(&mut self, bps: u32) {
-        if bps != self.settings.bitrate_bps {
-            self.settings.bitrate_bps = bps;
-            self.encoder = None; // rebuilt lazily; the first frame out is an IDR
+        if bps == self.settings.bitrate_bps {
+            return;
         }
+        self.settings.bitrate_bps = bps;
+        match &mut self.encoder {
+            #[cfg(windows)]
+            Some(Engine::MediaFoundation(mf)) => mf.set_bitrate(bps), // live, no keyframe
+            _ => self.encoder = None, // openh264: rebuilt lazily; the first frame out is an IDR
+        }
+    }
+
+    /// Which encoder is in use ("Media Foundation (...)" or "openh264").
+    pub fn engine_name(&self) -> &str {
+        &self.engine_name
     }
 
     /// Encode one frame into an Annex-B access unit. `None` means the rate controller
@@ -209,18 +253,31 @@ impl VideoEncoder {
         let yuv = self.yuv.as_mut().expect("allocated above");
         // Odd edges are cropped by converting only the even-sized top-left region.
         yuv.fill_from_bgra_scaled(&frame.bgra, frame.width, frame.height);
-        let encoder = self.encoder.as_mut().expect("built above");
-        if std::mem::take(&mut self.force_key) {
-            encoder.force_intra_frame();
-        }
-        let bits = encoder
-            .encode(&*yuv)
-            .map_err(|e| CodecError::OpenH264(e.to_string()))?;
-        self.last_was_key = matches!(
-            bits.frame_type(),
-            openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
-        );
-        let out = bits.to_vec();
+        let force_key = std::mem::take(&mut self.force_key);
+        let out = match self.encoder.as_mut().expect("built above") {
+            Engine::OpenH264(encoder) => {
+                if force_key {
+                    encoder.force_intra_frame();
+                }
+                let bits = encoder
+                    .encode(&*yuv)
+                    .map_err(|e| CodecError::OpenH264(e.to_string()))?;
+                self.last_was_key = matches!(
+                    bits.frame_type(),
+                    openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
+                );
+                bits.to_vec()
+            }
+            #[cfg(windows)]
+            Engine::MediaFoundation(mf) => {
+                if force_key {
+                    mf.force_keyframe();
+                }
+                let out = mf.encode(&yuv.to_nv12())?;
+                self.last_was_key = has_idr(&out);
+                out
+            }
+        };
         Ok(if out.is_empty() { None } else { Some(out) })
     }
 
@@ -228,6 +285,13 @@ impl VideoEncoder {
     pub fn last_was_key(&self) -> bool {
         self.last_was_key
     }
+}
+
+/// Does this Annex-B access unit contain an IDR slice (NAL type 5)?
+pub fn has_idr(annex_b: &[u8]) -> bool {
+    annex_b
+        .windows(4)
+        .any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 5)
 }
 
 /// Should a bandwidth estimate move the encoder? Only on a >25% change, so GCC jitter
