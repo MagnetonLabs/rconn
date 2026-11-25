@@ -3,6 +3,7 @@
 //! here in phases 4 and 7.
 
 mod audio;
+mod awake;
 mod cursor;
 mod hostkind;
 mod indicator;
@@ -253,6 +254,8 @@ async fn serve_session(
             ..Default::default()
         })?;
     let _marker = SessionMarker::new(cli.state_dir.as_ref(), &session.session_id);
+    // Wake the display and keep it on: a sleeping display gives screen capture nothing.
+    let _awake = awake::start();
     let show_indicator =
         settings.settings().shows_indicator(host_kind) || session.policy.show_indicator;
     tracing::info!(?host_kind, show_indicator, "session policy resolved");

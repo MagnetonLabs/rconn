@@ -443,7 +443,7 @@ async fn session(
         relay_only: args.relay_only,
     };
     let mut session = open_viewer_session(sig, args.host, opts).await?;
-    shared.lock().expect("ui state").status = "negotiating…".into();
+    shared.lock().expect("ui state").status = "connected, waiting for the picture…".into();
     repaint();
 
     // Data channel: keyframe request on open, then forward input as it comes.
