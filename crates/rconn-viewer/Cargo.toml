@@ -28,6 +28,7 @@ eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "de
 egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
 cpal = "0.18.2"
 openidconnect = "4"
+arboard = { version = "3.7", default-features = false }
 
 [lints]
 workspace = true

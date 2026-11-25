@@ -211,7 +211,7 @@ impl Window {
     }
 }
 
-fn save_png(path: &Path, f: &DecodedFrame) -> Result<()> {
+pub(crate) fn save_png(path: &Path, f: &DecodedFrame) -> Result<()> {
     let file =
         std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut enc = png::Encoder::new(

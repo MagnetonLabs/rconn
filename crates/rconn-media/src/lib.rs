@@ -7,3 +7,4 @@ pub mod codec;
 #[cfg(all(windows, target_arch = "aarch64"))]
 mod opus_shim;
 pub mod video;
+pub mod yuv;

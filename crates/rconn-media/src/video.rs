@@ -1,13 +1,14 @@
 //! H.264 encode/decode for screen content, on Cisco's openh264.
 
 use crate::codec::CodecError;
+use crate::yuv::I420;
 use openh264::OpenH264API;
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
     SpsPpsStrategy, UsageType,
 };
-use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
+use openh264::formats::YUVSource;
 use std::time::Instant;
 
 /// A captured frame: tightly packed BGRA, `width * 4` bytes per row.
@@ -41,21 +42,33 @@ impl Frame {
         let (w, h) = (self.width / 2, self.height / 2);
         let stride = self.width * 4;
         let mut out = vec![0u8; w * h * 4];
-        for y in 0..h {
-            let r0 = &self.bgra[(2 * y) * stride..(2 * y) * stride + stride];
-            let r1 = &self.bgra[(2 * y + 1) * stride..(2 * y + 1) * stride + stride];
-            let dst = &mut out[y * w * 4..(y + 1) * w * 4];
-            for x in 0..w {
-                for c in 0..4 {
-                    let i = 8 * x + c;
-                    let sum = u16::from(r0[i])
-                        + u16::from(r0[i + 4])
-                        + u16::from(r1[i])
-                        + u16::from(r1[i + 4]);
-                    dst[4 * x + c] = ((sum + 2) / 4) as u8;
-                }
+        // Bands of output rows, one per core.
+        let cores = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(8);
+        let band = h.div_ceil(cores).max(1);
+        std::thread::scope(|s| {
+            for (i, dst_band) in out.chunks_mut(band * w * 4).enumerate() {
+                let src = &self.bgra;
+                s.spawn(move || {
+                    for (j, dst) in dst_band.chunks_exact_mut(w * 4).enumerate() {
+                        let y = i * band + j;
+                        let r0 = &src[(2 * y) * stride..(2 * y) * stride + stride];
+                        let r1 = &src[(2 * y + 1) * stride..(2 * y + 1) * stride + stride];
+                        for x in 0..w {
+                            for c in 0..4 {
+                                let k = 8 * x + c;
+                                let sum = u16::from(r0[k])
+                                    + u16::from(r0[k + 4])
+                                    + u16::from(r1[k])
+                                    + u16::from(r1[k + 4]);
+                                dst[4 * x + c] = ((sum + 2) / 4) as u8;
+                            }
+                        }
+                    }
+                });
             }
-        }
+        });
         Frame {
             width: w,
             height: h,
@@ -94,7 +107,7 @@ pub struct VideoEncoder {
     settings: EncoderSettings,
     dims: Option<(usize, usize)>,
     encoder: Option<Encoder>,
-    yuv: Option<YUVBuffer>,
+    yuv: Option<I420>,
     force_key: bool,
 }
 
@@ -167,20 +180,12 @@ impl VideoEncoder {
         }
         if self.dims != Some((w, h)) || self.encoder.is_none() {
             self.encoder = Some(self.build(w, h)?);
-            self.yuv = Some(YUVBuffer::new(w, h));
+            self.yuv = Some(I420::new(w, h));
             self.dims = Some((w, h));
         }
         let yuv = self.yuv.as_mut().expect("allocated above");
-        if w == frame.width && h == frame.height {
-            yuv.read_rgb(BgraSliceU8::new(&frame.bgra, (w, h)));
-        } else {
-            // Crop odd edges: copy the even-sized region row by row.
-            let mut cropped = Vec::with_capacity(w * h * 4);
-            for row in frame.bgra.chunks_exact(frame.width * 4).take(h) {
-                cropped.extend_from_slice(&row[..w * 4]);
-            }
-            yuv.read_rgb(BgraSliceU8::new(&cropped, (w, h)));
-        }
+        // Odd edges are cropped by converting only the even-sized top-left region.
+        yuv.fill_from_bgra(&frame.bgra, frame.width);
         let encoder = self.encoder.as_mut().expect("built above");
         if std::mem::take(&mut self.force_key) {
             encoder.force_intra_frame();

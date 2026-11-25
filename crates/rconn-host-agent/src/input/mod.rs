@@ -37,6 +37,10 @@ pub trait Injector {
     fn button(&mut self, button: MouseButton, pressed: bool);
     fn wheel(&mut self, dx: f32, dy: f32);
     fn key(&mut self, hid_usage: u16, pressed: bool);
+    /// Type text as keystrokes (default: unsupported, ignored).
+    fn text(&mut self, _text: &str) {
+        tracing::info!("typing text isn't supported on this OS yet");
+    }
     /// Is Caps Lock on right now? (Default: unknown, treated as off.)
     fn caps_lock_on(&mut self) -> bool {
         false
@@ -106,6 +110,10 @@ fn run(rx: mpsc::Receiver<InputEvent>) {
             InputEvent::Key { hid_usage, pressed } => {
                 held.key(hid_usage, pressed);
                 inj.key(hid_usage, pressed);
+            }
+            InputEvent::Text(text) => {
+                let text: String = text.chars().take(4096).collect();
+                inj.text(&text);
             }
         }
     }

@@ -3,6 +3,7 @@
 //! here in phases 4 and 7.
 
 mod audio;
+mod cursor;
 mod hostkind;
 mod indicator;
 mod input;
@@ -342,6 +343,7 @@ async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests, cl
         }
     }
     let input = input::InputSink::start();
+    let mut cursor_shapes = cursor::watch();
     let (clip, mut local_clip) = if clipboard {
         let (c, rx) = ClipboardSync::start();
         (Some(c), rx)
@@ -362,6 +364,7 @@ async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests, cl
                 Some(DataChannelEvent::OnMessage(msg)) => match DataMessage::decode(&msg.data) {
                     Ok(DataMessage::Control(Control::Ping(n))) => send(DataMessage::Control(Control::Pong(n))).await,
                     Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
+                    Ok(DataMessage::Control(Control::Action(action))) => host_action(action),
                     Ok(DataMessage::Input(ev)) => input.send(ev),
                     Ok(DataMessage::Clipboard(text)) => match &clip {
                         Some(c) => c.apply_remote(text),
@@ -374,6 +377,7 @@ async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests, cl
                 _ => {}
             },
             Some(text) = local_clip.recv() => send(DataMessage::Clipboard(text)).await,
+            Some(shape) = cursor_shapes.recv() => send(DataMessage::Control(Control::Cursor(shape))).await,
         }
     }
 }
@@ -493,4 +497,69 @@ fn request_permissions() {
             let _ = CGRequestPostEventAccess();
         }
     }
+}
+
+/// A toolbar action from the viewer.
+fn host_action(action: rconn_core::protocol::HostAction) {
+    use rconn_core::protocol::HostAction;
+    tracing::info!(?action, "viewer requested an action");
+    let result = match action {
+        HostAction::LockScreen => lock_screen(),
+        HostAction::Restart => restart_computer(),
+    };
+    if let Err(e) = result {
+        tracing::warn!(?action, error = %e, "action failed");
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI: LockWorkStation, desktop attachment
+fn lock_screen() -> Result<()> {
+    use windows::Win32::System::Shutdown::LockWorkStation;
+    use windows::Win32::System::StationsAndDesktops::{
+        DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, OpenInputDesktop, SetThreadDesktop,
+    };
+    // LockWorkStation must come from a thread on the interactive desktop.
+    std::thread::spawn(|| unsafe {
+        let _ = OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(0x1000_0000),
+        )
+        .and_then(|d| SetThreadDesktop(d));
+        LockWorkStation()
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("lock thread panicked"))??;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn lock_screen() -> Result<()> {
+    // Same as Ctrl+Cmd+Q: the login window's "suspend" puts the Mac on the lock screen.
+    let status = std::process::Command::new(
+        "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession",
+    )
+    .arg("-suspend")
+    .status()?;
+    anyhow::ensure!(status.success(), "CGSession -suspend failed");
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn lock_screen() -> Result<()> {
+    anyhow::bail!("locking isn't supported on this OS")
+}
+
+fn restart_computer() -> Result<()> {
+    #[cfg(windows)]
+    let status = std::process::Command::new("shutdown")
+        .args(["/r", "/t", "5", "/c", "Restart requested from rconn"])
+        .status()?;
+    #[cfg(not(windows))]
+    let status = std::process::Command::new("osascript")
+        .args(["-e", "tell application \"System Events\" to restart"])
+        .status()?;
+    anyhow::ensure!(status.success(), "restart command failed");
+    Ok(())
 }

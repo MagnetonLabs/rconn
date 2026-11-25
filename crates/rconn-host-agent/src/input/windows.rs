@@ -12,11 +12,11 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    SendInput, VIRTUAL_KEY, VK_CAPITAL,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
+    MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_CAPITAL,
 };
 
 const WHEEL_DELTA: f32 = 120.0;
@@ -79,6 +79,42 @@ impl SendInputInjector {
 }
 
 impl Injector for SendInputInjector {
+    fn text(&mut self, text: &str) {
+        let enter = rconn_core::hid::usage::ENTER;
+        for line in text.split_inclusive('\n') {
+            let (body, newline) = match line.strip_suffix('\n') {
+                Some(b) => (b.trim_end_matches('\r'), true),
+                None => (line, false),
+            };
+            // Each UTF-16 unit as a Unicode key press: independent of the keyboard layout.
+            for unit in body.encode_utf16() {
+                for up in [false, true] {
+                    let flags = if up {
+                        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                    } else {
+                        KEYEVENTF_UNICODE
+                    };
+                    self.send(INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VIRTUAL_KEY(0),
+                                wScan: unit,
+                                dwFlags: flags,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    });
+                }
+            }
+            if newline {
+                self.key(enter, true);
+                self.key(enter, false);
+            }
+        }
+    }
+
     fn caps_lock_on(&mut self) -> bool {
         if !self.attached {
             self.attach();

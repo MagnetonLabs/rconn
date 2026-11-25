@@ -242,7 +242,7 @@ pub enum DataMessage {
     Control(Control),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
     /// Absolute pointer position, normalized to 0.0..=1.0 across the captured display,
     /// so the viewer doesn't need the host's pixel size.
@@ -265,6 +265,9 @@ pub enum InputEvent {
         hid_usage: u16,
         pressed: bool,
     },
+    /// Type this text as keystrokes (layout-independent), e.g. the viewer's clipboard
+    /// where pasting isn't possible (login screen). Capped at 4096 characters by the host.
+    Text(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +286,39 @@ pub enum Control {
     /// Round-trip probe; peer echoes `Pong` with the same value.
     Ping(u64),
     Pong(u64),
+    /// Host -> viewer: the host's mouse pointer changed shape. The viewer shows it with its
+    /// own (instant) pointer, so the pointer never lags behind the video.
+    Cursor(CursorShape),
+    /// Viewer -> host: a one-off action from the toolbar.
+    Action(HostAction),
+}
+
+/// Toolbar actions the host performs on request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostAction {
+    /// Show the OS lock screen.
+    LockScreen,
+    /// Restart the computer (after a few seconds' notice).
+    Restart,
+}
+
+/// Standard pointer shapes (custom app cursors show as `Arrow`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorShape {
+    Arrow,
+    Text,
+    Hand,
+    ResizeHorizontal,
+    ResizeVertical,
+    ResizeNwSe,
+    ResizeNeSw,
+    Move,
+    Wait,
+    Progress,
+    NotAllowed,
+    Crosshair,
+    /// The host hid its pointer (e.g. while typing).
+    Hidden,
 }
 
 // ---------------------------------------------------------------------------

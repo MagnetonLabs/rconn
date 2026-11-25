@@ -165,12 +165,14 @@ pub fn run(args: ConnectArgs) -> Result<()> {
     let name = args.name.clone();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(args.mute));
     let muted_audio = muted.clone();
+    let shared_cursor: Arc<Mutex<Option<rconn_core::protocol::CursorShape>>> = Arc::default();
+    let cursor_for_session = shared_cursor.clone();
     let shared = Arc::new(Mutex::new(Shared {
         status: "connecting…".into(),
         ..Default::default()
     }));
     let (input_tx, input_rx) = mpsc::unbounded_channel::<InputEvent>();
-    let (kf_ui, kf_from_ui) = mpsc::unbounded_channel::<()>();
+    let (kf_ui, kf_from_ui) = mpsc::unbounded_channel::<Control>();
     let ctx_slot: Arc<Mutex<Option<egui::Context>>> = Arc::default();
 
     // Background session.
@@ -182,6 +184,7 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             let result = rt.block_on(session(
                 args,
                 muted_audio,
+                cursor_for_session,
                 sh.clone(),
                 input_rx,
                 kf_from_ui,
@@ -229,6 +232,10 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 chrome: None,
                 reveal_until: None,
                 fit_window: false,
+                cursor: shared_cursor,
+                last_frame: None,
+                confirm_restart: false,
+                toast: None,
             }))
         }),
     )
@@ -238,9 +245,10 @@ pub fn run(args: ConnectArgs) -> Result<()> {
 async fn session(
     args: ConnectArgs,
     muted: Arc<std::sync::atomic::AtomicBool>,
+    shared_cursor: Arc<Mutex<Option<rconn_core::protocol::CursorShape>>>,
     shared: Arc<Mutex<Shared>>,
     mut input: mpsc::UnboundedReceiver<InputEvent>,
-    mut kf_from_ui: mpsc::UnboundedReceiver<()>,
+    mut kf_from_ui: mpsc::UnboundedReceiver<Control>,
     ctx: Arc<Mutex<Option<egui::Context>>>,
 ) -> Result<()> {
     let repaint = || {
@@ -255,6 +263,15 @@ async fn session(
 
     // Data channel: keyframe request on open, then forward input as it comes.
     let dc = session.data.clone();
+    let cursor = shared_cursor.clone();
+    let repaint_cursor = {
+        let ctx = ctx.clone();
+        move || {
+            if let Some(c) = ctx.lock().expect("ctx").as_ref() {
+                c.request_repaint();
+            }
+        }
+    };
     let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
     let dc_task = tokio::spawn(async move {
         let send = |dc: Arc<dyn webrtc::data_channel::DataChannel>, m: DataMessage| async move {
@@ -274,11 +291,14 @@ async fn session(
                         open = true;
                         send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
                     }
-                    Some(DataChannelEvent::OnMessage(msg)) => {
-                        if let Ok(DataMessage::Clipboard(text)) = DataMessage::decode(&msg.data) {
-                            clip.apply_remote(text);
+                    Some(DataChannelEvent::OnMessage(msg)) => match DataMessage::decode(&msg.data) {
+                        Ok(DataMessage::Clipboard(text)) => clip.apply_remote(text),
+                        Ok(DataMessage::Control(Control::Cursor(shape))) => {
+                            cursor.lock().expect("cursor").replace(shape);
+                            repaint_cursor();
                         }
-                    }
+                        _ => {}
+                    },
                     Some(DataChannelEvent::OnClose) | None => break,
                     _ => {}
                 },
@@ -287,8 +307,8 @@ async fn session(
                     Some(_) => {}
                     None => break,
                 },
-                Some(()) = kf_from_ui.recv() => if open {
-                    send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
+                Some(c) = kf_from_ui.recv() => if open {
+                    send(dc.clone(), DataMessage::Control(c)).await;
                 },
                 req = kf_rx.recv() => if req.is_some() && open {
                     send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
@@ -379,7 +399,8 @@ async fn session(
 struct ViewerApp {
     shared: Arc<Mutex<Shared>>,
     input: mpsc::UnboundedSender<InputEvent>,
-    keyframe: mpsc::UnboundedSender<()>,
+    /// Control messages for the host (keyframe requests, toolbar actions).
+    keyframe: mpsc::UnboundedSender<Control>,
     texture: Option<TextureHandle>,
     last_pointer: Option<(f32, f32)>,
     keys: KeyGate,
@@ -394,6 +415,35 @@ struct ViewerApp {
     reveal_until: Option<Instant>,
     /// Resize the window to the remote screen's shape on the next frame.
     fit_window: bool,
+    /// The host's pointer shape, shown with the local pointer over the picture.
+    cursor: Arc<Mutex<Option<rconn_core::protocol::CursorShape>>>,
+    /// The latest picture (for "Save screenshot").
+    last_frame: Option<DecodedFrame>,
+    /// "Restart remote computer" is waiting for confirmation.
+    confirm_restart: bool,
+    /// Short feedback shown in the toolbar, until the deadline.
+    toast: Option<(String, Instant)>,
+}
+
+/// The local pointer icon for a host pointer shape.
+fn cursor_icon(shape: rconn_core::protocol::CursorShape) -> egui::CursorIcon {
+    use egui::CursorIcon as I;
+    use rconn_core::protocol::CursorShape as C;
+    match shape {
+        C::Arrow => I::Default,
+        C::Text => I::Text,
+        C::Hand => I::PointingHand,
+        C::ResizeHorizontal => I::ResizeHorizontal,
+        C::ResizeVertical => I::ResizeVertical,
+        C::ResizeNwSe => I::ResizeNwSe,
+        C::ResizeNeSw => I::ResizeNeSw,
+        C::Move => I::Move,
+        C::Wait => I::Wait,
+        C::Progress => I::Progress,
+        C::NotAllowed => I::NotAllowed,
+        C::Crosshair => I::Crosshair,
+        C::Hidden => I::None,
+    }
 }
 
 impl ViewerApp {
@@ -551,6 +601,68 @@ impl ViewerApp {
             || ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false))
     }
 
+    fn notify(&mut self, text: String) {
+        self.toast = Some((text, Instant::now() + Duration::from_secs(4)));
+    }
+
+    /// Save the current picture as a PNG on the Desktop.
+    fn save_screenshot(&mut self) {
+        let Some(f) = self.last_frame.as_ref() else {
+            return self.notify("No picture yet".into());
+        };
+        let dir = std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("Desktop"))
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let safe: String = self
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let path = dir.join(format!("rconn-{safe}-{stamp}.png"));
+        let msg = match crate::watch::save_png(&path, f) {
+            Ok(()) => format!(
+                "Saved {}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ),
+            Err(e) => format!("Screenshot failed: {e}"),
+        };
+        self.notify(msg);
+    }
+
+    /// "Restart remote computer?" dialog.
+    fn restart_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_restart {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::unique("confirm-restart")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading(format!("Restart {}?", self.name));
+            ui.label("Anyone using it loses unsaved work. This session ends; reconnect after it starts up again.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let restart = egui::Button::new(egui::RichText::new("Restart").color(Color32::WHITE)).fill(DANGER);
+                if ui.add(restart).clicked() {
+                    let _ = self.keyframe.send(Control::Action(rconn_core::protocol::HostAction::Restart));
+                    self.confirm_restart = false;
+                    self.toast = Some(("Restarting in 5 s".into(), Instant::now() + Duration::from_secs(6)));
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_restart = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.confirm_restart = false;
+        }
+    }
+
     fn send_combo(&self, keys: &[u16]) {
         for &k in keys {
             self.send(key_event(k, true));
@@ -588,12 +700,39 @@ impl ViewerApp {
         })
         .response
         .on_hover_text("Send keys your Mac would keep for itself");
+        ui.menu_button("⚡ Actions", |ui| {
+            if ui.button("📋 Type clipboard text").on_hover_text("Types your clipboard as keystrokes (works where paste doesn't, e.g. the login screen)").clicked() {
+                match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                    Ok(text) if !text.is_empty() => {
+                        let n = text.chars().count();
+                        self.send(InputEvent::Text(text));
+                        self.notify(format!("Typed {n} characters"));
+                    }
+                    _ => self.notify("Your clipboard has no text".into()),
+                }
+                ui.close();
+            }
+            if ui.button("📷 Save screenshot").clicked() {
+                self.save_screenshot();
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("🔒 Lock remote computer").clicked() {
+                let _ = self.keyframe.send(Control::Action(rconn_core::protocol::HostAction::LockScreen));
+                self.notify("Locking the remote computer".into());
+                ui.close();
+            }
+            if ui.button("🔁 Restart remote computer…").clicked() {
+                self.confirm_restart = true;
+                ui.close();
+            }
+        });
         if ui
             .button("🔄 Refresh")
             .on_hover_text("Ask the host for a fresh picture")
             .clicked()
         {
-            let _ = self.keyframe.send(());
+            let _ = self.keyframe.send(Control::RequestKeyframe);
         }
         let muted = self.muted.load(std::sync::atomic::Ordering::Relaxed);
         if ui
@@ -626,6 +765,12 @@ impl ViewerApp {
             .fill(DANGER);
         if ui.add(bye).clicked() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if let Some((text, until)) = &self.toast
+            && Instant::now() < *until
+        {
+            ui.label(egui::RichText::new(text).color(Color32::from_rgb(120, 200, 140)));
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
         }
         if self.keys.toolbar {
             ui.label(egui::RichText::new("Keyboard paused").color(Color32::GRAY))
@@ -703,6 +848,7 @@ impl ViewerApp {
                     self.fit_window = true; // first picture, or the remote resolution changed
                 }
             }
+            self.last_frame = Some(f);
         }
         let fullscreen = self.is_fullscreen(ui);
         if std::mem::take(&mut self.fit_window)
@@ -716,6 +862,8 @@ impl ViewerApp {
                 .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
         let stats = self.stats(fps, kbps);
+        let ctx = ui.ctx().clone();
+        self.restart_dialog(&ctx);
         if !fullscreen {
             self.chrome = None;
             egui::Panel::top("toolbar")
@@ -750,6 +898,13 @@ impl ViewerApp {
             }
             if let Some(image) = image {
                 self.forward_input(ui, image);
+                let over_picture = ui.ctx().pointer_hover_pos().is_some_and(|p| {
+                    image.contains(p) && !self.chrome.is_some_and(|r| r.contains(p))
+                });
+                let shape = *self.cursor.lock().expect("cursor");
+                if over_picture && let Some(shape) = shape {
+                    ui.ctx().set_cursor_icon(cursor_icon(shape));
+                }
             }
             if !status.is_empty() {
                 ui.painter().text(
@@ -957,6 +1112,10 @@ mod render_tests {
             chrome: None,
             reveal_until: None,
             fit_window: false,
+            cursor: Arc::default(),
+            last_frame: None,
+            confirm_restart: false,
+            toast: None,
         }
     }
 
