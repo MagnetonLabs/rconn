@@ -387,9 +387,20 @@ fn read_password() -> Result<String> {
 fn default_openh264() -> Result<std::path::PathBuf> {
     let name = rconn_media::cisco::current_binary_name()
         .ok_or_else(|| anyhow::anyhow!("no Cisco build for this platform"))?;
-    let beside = std::env::current_exe()?.with_file_name(name);
+    let exe = std::env::current_exe()?;
+    let beside = exe.with_file_name(name);
     if beside.exists() {
         return Ok(beside);
+    }
+    // macOS app bundle: Contents/Resources, kept byte-identical to Cisco's signed build
+    // (the openh264 loader checks Cisco's hash, so the bundle must not re-sign it).
+    if let Some(resources) = exe
+        .parent()
+        .and_then(|d| d.parent())
+        .map(|c| c.join("Resources").join(name))
+        && resources.exists()
+    {
+        return Ok(resources);
     }
     rconn_media::cisco::local_binary_path()
         .ok_or_else(|| anyhow::anyhow!("openh264 not found; pass --openh264"))

@@ -10,8 +10,10 @@ trap 'rm -rf "$work"' EXIT
 
 app="$work/dmg/rconn.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$stage/rconn" "$stage/rconn-viewer" "$stage"/libopenh264-*.dylib "$app/Contents/MacOS/"
-cp "$here/rconn.icns" "$app/Contents/Resources/"
+cp "$stage/rconn" "$stage/rconn-viewer" "$app/Contents/MacOS/"
+# Cisco's openh264 goes in Resources, untouched: it is Cisco-signed, and the loader checks
+# its hash, so it must never be re-signed (no `codesign --deep`).
+cp "$stage"/libopenh264-*.dylib "$here/rconn.icns" "$app/Contents/Resources/"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -32,7 +34,12 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-codesign --force --deep --sign - "$app" >/dev/null
+codesign --force --sign - "$app/Contents/MacOS/rconn-viewer" 2>/dev/null
+codesign --force --sign - "$app" 2>/dev/null
+codesign --verify --strict "$app"
+for lib in "$stage"/libopenh264-*.dylib; do
+  cmp -s "$lib" "$app/Contents/Resources/$(basename "$lib")" || { echo "openh264 was modified: $lib" >&2; exit 1; }
+done
 ln -s /Applications "$work/dmg/Applications"
 rm -f "$out"
 hdiutil create -quiet -volname "rconn $version" -srcfolder "$work/dmg" -fs HFS+ -format UDZO "$out"
