@@ -63,7 +63,12 @@ pub struct DxgiCapturer {
     /// Copy the next acquired image even if DXGI marks it unchanged: right after
     /// (re)duplication it is the whole current desktop, and an idle screen sends no other.
     want_full: bool,
+    /// When this capturer started (for the no-first-frame fallback).
+    started: Instant,
 }
+
+/// With no first image from DXGI after this long, grab one through GDI instead.
+const FIRST_FRAME_FALLBACK: Duration = Duration::from_millis(500);
 
 // The COM objects are only used from the thread that owns the capturer at a time.
 unsafe impl Send for DxgiCapturer {}
@@ -109,6 +114,7 @@ impl DxgiCapturer {
                     dup: None,
                     staging: None,
                     want_full: true,
+                    started: Instant::now(),
                 });
             }
             Err(CaptureError::NoOutput)
@@ -189,6 +195,79 @@ impl DxgiCapturer {
     }
 }
 
+impl DxgiCapturer {
+    /// The whole output read through GDI (works when DXGI has no new image to give).
+    fn gdi_snapshot(&self) -> Result<Frame, CaptureError> {
+        use windows::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
+            CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
+            ReleaseDC, SRCCOPY, SelectObject,
+        };
+        let desc = unsafe { self.output.GetDesc() }.map_err(backend)?;
+        let r = desc.DesktopCoordinates;
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        if w <= 0 || h <= 0 {
+            return Err(CaptureError::Backend("output has no size".into()));
+        }
+        let mut bgra = vec![0u8; w as usize * h as usize * 4];
+        unsafe {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(mem, bmp.into());
+            let copied = BitBlt(
+                mem,
+                0,
+                0,
+                w,
+                h,
+                Some(screen),
+                r.left,
+                r.top,
+                SRCCOPY | CAPTUREBLT,
+            );
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h, // top-down rows
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let lines = GetDIBits(
+                mem,
+                bmp,
+                0,
+                h as u32,
+                Some(bgra.as_mut_ptr().cast()),
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            copied.map_err(backend)?;
+            if lines == 0 {
+                return Err(CaptureError::Backend("GetDIBits copied nothing".into()));
+            }
+        }
+        for px in bgra.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
+        Ok(Frame {
+            width: w as usize,
+            height: h as usize,
+            bgra,
+            captured_at: Instant::now(),
+        })
+    }
+}
+
 impl Capturer for DxgiCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
         let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
@@ -197,7 +276,22 @@ impl Capturer for DxgiCapturer {
         let mut resource: Option<IDXGIResource> = None;
         match unsafe { dup.AcquireNextFrame(ms, &mut info, &mut resource) } {
             Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                // Nothing presented yet (idle desktop; a VM whose window is hidden on the
+                // host Mac presents nothing at all): read the desktop directly once, so a
+                // new viewer always gets a picture.
+                if self.want_full && self.started.elapsed() > FIRST_FRAME_FALLBACK {
+                    let frame = self.gdi_snapshot()?;
+                    self.want_full = false;
+                    tracing::info!(
+                        w = frame.width,
+                        h = frame.height,
+                        "first picture taken via GDI (DXGI had none)"
+                    );
+                    return Ok(Some(frame));
+                }
+                return Ok(None);
+            }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                 // Desktop switch, resolution change, full-screen app: start over.
                 tracing::debug!("desktop duplication lost; recreating");

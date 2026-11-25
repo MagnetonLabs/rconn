@@ -12,10 +12,27 @@ use rconn_app::WINDOW_PORT;
 struct App {
     shared: worker::Shared,
     tx: tokio::sync::mpsc::UnboundedSender<home::Request>,
+    /// The window's close button was used (keep the tray icon); otherwise the whole app
+    /// was quit (Cmd+Q, Quit menu) and the icon goes too.
+    closed_by_window: bool,
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        if !self.closed_by_window {
+            #[cfg(any(windows, target_os = "macos"))]
+            if let Ok(mut s) =
+                std::net::TcpStream::connect(("127.0.0.1", rconn_app::tray::TRAY_PORT))
+            {
+                let _ = s.write_all(b"quit\n");
+            }
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if ui.input(|i| i.viewport().close_requested()) {
+            self.closed_by_window = true;
+        }
         let requests = home::draw(ui, &mut self.shared.lock().expect("home state"));
         for r in requests {
             let _ = self.tx.send(r);
@@ -98,7 +115,11 @@ fn main() -> anyhow::Result<()> {
                 }
             });
             let tx = worker::spawn(shared.clone(), ctx, paths);
-            Ok(Box::new(App { shared, tx }))
+            Ok(Box::new(App {
+                shared,
+                tx,
+                closed_by_window: false,
+            }))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))

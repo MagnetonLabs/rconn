@@ -25,9 +25,19 @@ struct Tray {
 }
 
 pub fn run(status_file: PathBuf) -> anyhow::Result<()> {
-    let Ok(_single) = std::net::TcpListener::bind(("127.0.0.1", TRAY_PORT)) else {
+    let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", TRAY_PORT)) else {
         return Ok(()); // already running
     };
+    // "quit" from the window (the app was quit with Cmd+Q / Quit): remove the icon too.
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for conn in listener.incoming().flatten() {
+            let mut line = String::new();
+            if std::io::BufReader::new(conn).read_line(&mut line).is_ok() && line.trim() == "quit" {
+                std::process::exit(0);
+            }
+        }
+    });
     #[allow(unused_mut)]
     let mut builder = EventLoop::builder();
     #[cfg(target_os = "macos")]
