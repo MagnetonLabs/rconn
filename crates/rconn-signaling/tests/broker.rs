@@ -116,6 +116,7 @@ async fn connect_host(url: &str) -> (Ws, HostId) {
             host_id,
             cert_pem: "test".into(),
             client_nonce: vec![0; 32],
+            label: None,
         },
     )
     .await;
@@ -237,6 +238,7 @@ async fn bad_host_proof_is_refused_and_closed() {
             host_id: HostId::new(),
             cert_pem: "x".into(),
             client_nonce: vec![0; 32],
+            label: None,
         },
     )
     .await;

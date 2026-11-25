@@ -58,6 +58,7 @@ async fn run() {
             host_id,
             key: &key,
             cert_pem: &cert,
+            label: None,
         },
     )
     .await

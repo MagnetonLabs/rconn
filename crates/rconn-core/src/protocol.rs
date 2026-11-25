@@ -39,6 +39,9 @@ pub enum ClientMessage {
         host_id: HostId,
         cert_pem: String,
         client_nonce: Vec<u8>,
+        /// Human-readable name shown in viewers' computer lists (e.g. the hostname).
+        #[serde(default)]
+        label: Option<String>,
     },
     /// Signature, with the host cert's private key, over
     /// [`crate::fleet::host_proof_transcript`]. Proves possession at the application layer,
@@ -66,6 +69,8 @@ pub enum ClientMessage {
         protocol_version: u16,
         id_token: String,
     },
+    /// Operator asks which of the org's hosts are online. Answered with [`ServerMessage::Hosts`].
+    ListHosts,
     /// Operator asks to open a session to a host.
     RequestSession { host_id: HostId },
     /// SDP / ICE relayed to the other side of a session.
@@ -96,6 +101,10 @@ pub enum ServerMessage {
         /// Optional features this server supports. See [`SERVER_CAPABILITIES`].
         #[serde(default)]
         capabilities: Vec<String>,
+    },
+    /// Answer to `ListHosts`: the org's online hosts.
+    Hosts {
+        hosts: Vec<HostInfo>,
     },
     /// Answer to `GetLoginOptions`.
     LoginOptions {
@@ -133,6 +142,13 @@ pub enum ServerMessage {
     /// it; anything that changes auth or policy semantics bumps `PROTOCOL_VERSION` instead.
     #[serde(other)]
     Unknown,
+}
+
+/// One entry in a viewer's computer list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostInfo {
+    pub host_id: HostId,
+    pub label: Option<String>,
 }
 
 /// Where and as whom the viewer runs the OIDC flow.
@@ -333,6 +349,7 @@ mod tests {
                 host_id: HostId::new(),
                 cert_pem: "-----BEGIN CERTIFICATE-----".into(),
                 client_nonce: vec![7; CHALLENGE_LEN],
+                label: None,
             },
             ClientMessage::HostProof {
                 signature: vec![1, 2, 3],

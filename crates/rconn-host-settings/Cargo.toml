@@ -1,0 +1,27 @@
+[package]
+name = "rconn-host-settings"
+description = "Settings window for the rconn host (admin)."
+license = "LicenseRef-Proprietary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rconn-settings"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rconn-core.workspace = true
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
+tempfile.workspace = true

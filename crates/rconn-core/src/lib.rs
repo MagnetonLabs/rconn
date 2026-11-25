@@ -6,6 +6,7 @@ pub mod hid;
 pub mod ids;
 pub mod protocol;
 pub mod settings;
+pub mod status;
 pub mod tls;
 
 /// Bumped on any incompatible change to [`protocol`]. Peers refuse a mismatched major.

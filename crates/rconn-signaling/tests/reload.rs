@@ -51,6 +51,7 @@ async fn host_hello(
             host_id: id,
             cert_pem: cert.into(),
             client_nonce: cn.clone(),
+            label: None,
         },
     )
     .await;

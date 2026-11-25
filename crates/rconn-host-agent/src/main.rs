@@ -75,6 +75,9 @@ struct Cli {
     /// Host settings file (the service passes ProgramData\\rconn\\host.toml).
     #[arg(long, env = "RCONN_SETTINGS")]
     settings: Option<PathBuf>,
+    /// User-readable status file for the local app (the service passes one).
+    #[arg(long, env = "RCONN_STATUS_FILE")]
+    status_file: Option<PathBuf>,
     /// Directory for runtime state (the `session.active` marker that locks settings).
     #[arg(long, env = "RCONN_STATE_DIR")]
     state_dir: Option<PathBuf>,
@@ -156,6 +159,7 @@ async fn main() -> Result<()> {
     );
 
     let host_kind = hostkind::detect();
+    let status = StatusPublisher::new(cli.status_file.clone(), host_id, &server);
     let trust = ServerTrust::from_fingerprint(cli.fingerprint.as_deref());
     // Reconnect forever with capped backoff: an unattended host must come back by itself.
     let mut backoff = Duration::from_secs(1);
@@ -165,21 +169,27 @@ async fn main() -> Result<()> {
             host_id,
             key: &key,
             cert_pem: &cert,
+            label: None,
         };
         match SignalingClient::connect_host(&server, &trust, creds).await {
             Ok(sig) => {
                 backoff = Duration::from_secs(1);
                 tracing::info!("connected to signaling");
+                status.set_online(true);
                 let opts = PeerOptions {
                     udp_addrs: cli.udp.clone(),
                     relay_only: false,
                 };
                 let cli2 = cli.clone();
                 let openh264 = openh264.clone();
+                let status2 = status.clone();
                 let handler: SessionHandler = Arc::new(move |session: HostSession| {
-                    let (cli, openh264) = (cli2.clone(), openh264.clone());
+                    let (cli, openh264, status) = (cli2.clone(), openh264.clone(), status2.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = serve_session(session, &cli, openh264, host_kind).await {
+                        status.set_session(true);
+                        let result = serve_session(session, &cli, openh264, host_kind).await;
+                        status.set_session(false);
+                        if let Err(e) = result {
                             tracing::warn!(error = %e, "session failed");
                         }
                     });
@@ -190,6 +200,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => tracing::warn!(error = %e, "connect failed"),
         }
+        status.set_online(false);
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
@@ -355,6 +366,81 @@ async fn serve_channel(dc: Arc<dyn DataChannel>, keyframes: KeyframeRequests, cl
                 _ => {}
             },
             Some(text) = local_clip.recv() => send(DataMessage::Clipboard(text)).await,
+        }
+    }
+}
+
+/// This computer's name, shown in viewers' computer lists.
+fn machine_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().trim_end_matches(".local").to_owned())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unnamed computer".into())
+}
+
+/// Publishes `HostStatus` for the local app; a no-op without `--status-file`.
+#[derive(Clone)]
+struct StatusPublisher {
+    path: Option<PathBuf>,
+    base: rconn_core::status::HostStatus,
+    state: Arc<std::sync::Mutex<(bool, bool)>>, // (online, session_active)
+}
+
+impl StatusPublisher {
+    fn new(path: Option<PathBuf>, host_id: HostId, server: &str) -> Self {
+        let base = rconn_core::status::HostStatus {
+            host_id: host_id.to_string(),
+            short_code: host_id.short_code(),
+            label: machine_name(),
+            server: server.to_owned(),
+            ..Default::default()
+        };
+        let p = Self {
+            path,
+            base,
+            state: Arc::default(),
+        };
+        p.publish();
+        // Heartbeat so the app can tell a dead agent from an idle one.
+        let hb = p.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                hb.publish();
+            }
+        });
+        p
+    }
+    fn set_online(&self, v: bool) {
+        self.state.lock().expect("status").0 = v;
+        self.publish();
+    }
+    fn set_session(&self, v: bool) {
+        self.state.lock().expect("status").1 = v;
+        self.publish();
+    }
+    fn publish(&self) {
+        let Some(path) = &self.path else { return };
+        let (online, session_active) = *self.state.lock().expect("status");
+        let updated = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let s = rconn_core::status::HostStatus {
+            online,
+            session_active,
+            updated,
+            ..self.base.clone()
+        };
+        if let Err(e) = s.write(path) {
+            tracing::debug!(error = %e, "could not write status file");
         }
     }
 }

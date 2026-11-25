@@ -87,6 +87,7 @@ async fn run(relay_only: bool) {
             host_id,
             key: &key,
             cert_pem: &cert,
+            label: None,
         },
     )
     .await

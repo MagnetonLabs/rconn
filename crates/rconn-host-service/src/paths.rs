@@ -11,3 +11,9 @@ pub fn data_dir() -> PathBuf {
         PathBuf::from("/Library/Application Support/rconn")
     }
 }
+
+/// User-readable status for the local app ("This computer").
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn status_dir() -> PathBuf {
+    data_dir().with_file_name("rconn-status")
+}

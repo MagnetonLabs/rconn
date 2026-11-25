@@ -27,6 +27,8 @@ pub struct HostCredentials<'a> {
     pub host_id: HostId,
     pub key: &'a HostKey,
     pub cert_pem: &'a str,
+    /// Name shown in viewers' computer lists (usually the hostname).
+    pub label: Option<String>,
 }
 
 impl SignalingClient {
@@ -44,6 +46,7 @@ impl SignalingClient {
                 host_id: creds.host_id,
                 cert_pem: creds.cert_pem.to_owned(),
                 client_nonce: client_nonce.to_vec(),
+                label: creds.label.clone(),
             },
         )
         .await?;
@@ -106,6 +109,23 @@ impl SignalingClient {
             ServerMessage::LoginToken { token, expires_at } => Ok((token, expires_at)),
             ServerMessage::Error { message, .. } => bail!("login failed: {message}"),
             other => bail!("unexpected login reply: {other:?}"),
+        }
+    }
+
+    /// The org's online computers (needs an operator token).
+    pub async fn list_hosts(
+        url: &str,
+        trust: &ServerTrust,
+        token: &str,
+    ) -> Result<Vec<rconn_core::protocol::HostInfo>> {
+        let mut c = Self::connect_operator(url, trust, token).await?;
+        c.send(&ClientMessage::ListHosts).await?;
+        loop {
+            match c.recv().await? {
+                ServerMessage::Hosts { hosts } => return Ok(hosts),
+                ServerMessage::Error { message, .. } => bail!("{message}"),
+                _ => continue,
+            }
         }
     }
 

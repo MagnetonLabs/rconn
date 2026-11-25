@@ -33,7 +33,7 @@ pub const NAME: &str = "rconn-host";
 const DISPLAY: &str = "rconn host";
 const LOG_LIMIT: u64 = 10 * 1024 * 1024;
 
-pub use crate::paths::data_dir;
+pub use crate::paths::{data_dir, status_dir};
 
 /// Everything needed to launch the agent, read fresh each launch so config edits apply
 /// at the next (re)start without restarting the service.
@@ -68,7 +68,14 @@ fn agent_launch() -> Result<AgentLaunch> {
         "--max-kbps".into(),
         settings.settings().max_bitrate_kbps.to_string(),
     ];
+    let status_dir = status_dir();
+    let _ = std::fs::create_dir_all(&status_dir);
     args.extend([
+        "--status-file".into(),
+        status_dir
+            .join("status.json")
+            .to_string_lossy()
+            .into_owned(),
         "--settings".into(),
         dir.join("host.toml").to_string_lossy().into_owned(),
         "--state-dir".into(),
@@ -289,6 +296,20 @@ pub fn configure(
         os("*S-1-5-18:(OI)(CI)F"),
         os("/grant:r"),
         os("*S-1-5-32-544:(OI)(CI)F"),
+        os("/Q"),
+    ])?;
+    // Status for the local app: readable by Users (no secrets), writable by SYSTEM only.
+    let sdir = status_dir();
+    std::fs::create_dir_all(&sdir)?;
+    icacls(&[
+        sdir.as_os_str(),
+        os("/inheritance:r"),
+        os("/grant:r"),
+        os("*S-1-5-18:(OI)(CI)F"),
+        os("/grant:r"),
+        os("*S-1-5-32-544:(OI)(CI)F"),
+        os("/grant:r"),
+        os("*S-1-5-32-545:(OI)(CI)RX"),
         os("/Q"),
     ])?;
     let children = dir.join("*");

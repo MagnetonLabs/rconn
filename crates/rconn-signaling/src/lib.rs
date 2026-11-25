@@ -52,6 +52,7 @@ struct Inner {
 #[derive(Default)]
 struct Registry {
     hosts: HashMap<HostId, (HostIdentity, Outbox)>,
+    labels: HashMap<HostId, String>,
     sessions: HashMap<SessionId, SessionEntry>,
 }
 
@@ -141,6 +142,7 @@ enum Phase {
         cert_pem: String,
         client_nonce: Vec<u8>,
         nonce: [u8; CHALLENGE_LEN],
+        label: Option<String>,
     },
     Ready(Peer),
 }
@@ -236,6 +238,7 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                 host_id,
                 cert_pem,
                 client_nonce,
+                label,
             },
         ) => {
             if !check_version(tx, protocol_version) {
@@ -258,6 +261,7 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                 cert_pem,
                 client_nonce,
                 nonce,
+                label,
             })
         }
         (
@@ -266,6 +270,7 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                 cert_pem,
                 client_nonce,
                 nonce,
+                label,
             },
             ClientMessage::HostProof { signature },
         ) => {
@@ -288,6 +293,13 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                         .await
                         .hosts
                         .insert(host_id, (identity, tx.clone()));
+                    {
+                        let mut reg = state.inner.registry.lock().await;
+                        match label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+                            Some(l) => reg.labels.insert(host_id, l.chars().take(64).collect()),
+                            None => reg.labels.remove(&host_id),
+                        };
+                    }
                     state.audit(AuditEvent::HostOnline {
                         org_id: identity.org_id,
                         host_id,
@@ -408,6 +420,21 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                 }
             }
             Next::Close(Phase::New)
+        }
+        (Phase::Ready(Peer::Operator(op)), ClientMessage::ListHosts) => {
+            let reg = state.inner.registry.lock().await;
+            let mut hosts: Vec<_> = reg
+                .hosts
+                .values()
+                .filter(|(h, _)| h.org_id == op.org_id)
+                .map(|(h, _)| rconn_core::protocol::HostInfo {
+                    host_id: h.host_id,
+                    label: reg.labels.get(&h.host_id).cloned(),
+                })
+                .collect();
+            hosts.sort_by(|a, b| a.label.cmp(&b.label));
+            let _ = tx.send(ServerMessage::Hosts { hosts });
+            Next::Continue(Phase::Ready(Peer::Operator(op)))
         }
         (Phase::Ready(Peer::Operator(op)), ClientMessage::RequestSession { host_id }) => {
             request_session(state, tx, op, host_id).await;

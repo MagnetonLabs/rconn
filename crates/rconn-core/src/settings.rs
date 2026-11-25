@@ -315,12 +315,15 @@ pub fn write_setting(
     let mut table: toml::Table = text
         .parse()
         .map_err(|e: toml::de::Error| SetError::Invalid(e.to_string()))?;
-    let parsed = if let Ok(b) = value.parse::<bool>() {
-        toml::Value::Boolean(b)
+    // An empty value clears the setting (back to its default / auto).
+    let parsed = if value.is_empty() {
+        None
+    } else if let Ok(b) = value.parse::<bool>() {
+        Some(toml::Value::Boolean(b))
     } else if let Ok(i) = value.parse::<i64>() {
-        toml::Value::Integer(i)
+        Some(toml::Value::Integer(i))
     } else {
-        toml::Value::String(value.to_owned())
+        Some(toml::Value::String(value.to_owned()))
     };
     let mut parts: Vec<&str> = key.split('.').collect();
     let leaf = parts.pop().expect("split yields at least one part");
@@ -332,7 +335,14 @@ pub fn write_setting(
             .as_table_mut()
             .ok_or_else(|| SetError::Invalid(format!("{p} is not a table")))?;
     }
-    node.insert(leaf.to_owned(), parsed);
+    match parsed {
+        Some(v) => {
+            node.insert(leaf.to_owned(), v);
+        }
+        None => {
+            node.remove(leaf);
+        }
+    }
     let new_text = toml::to_string(&table).map_err(|e| SetError::Invalid(e.to_string()))?;
 
     // Validate the candidate exactly as it would be loaded.
