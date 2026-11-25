@@ -419,30 +419,30 @@ pub struct DecodedFrame {
     pub rgba: Vec<u8>,
 }
 
-/// H.264 decoder: the Mac's hardware decoder (VideoToolbox) where available, Cisco's
+/// H.264 decoder: Apple's hardware decoder (VideoToolbox) where available, Cisco's
 /// openh264 otherwise. `RCONN_DECODER=openh264` forces software, for comparisons.
 pub struct VideoDecoder {
     engine: DecEngine,
     /// For falling back to software if the hardware decoder refuses a stream.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
     openh264_path: std::path::PathBuf,
 }
 
 enum DecEngine {
     OpenH264(Box<Decoder>),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     VideoToolbox(crate::vt::VtDecoder),
 }
 
 impl VideoDecoder {
     pub fn new(openh264_path: &std::path::Path) -> Result<Self, CodecError> {
         let software = std::env::var("RCONN_DECODER").is_ok_and(|v| v == "openh264");
-        let engine = if cfg!(target_os = "macos") && !software {
-            #[cfg(target_os = "macos")]
+        let engine = if cfg!(any(target_os = "macos", target_os = "ios")) && !software {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 DecEngine::VideoToolbox(crate::vt::VtDecoder::new())
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             unreachable!()
         } else {
             Self::openh264(openh264_path)?
@@ -463,7 +463,7 @@ impl VideoDecoder {
     pub fn engine_name(&self) -> &'static str {
         match self.engine {
             DecEngine::OpenH264(_) => "openh264 (software)",
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             DecEngine::VideoToolbox(_) => "VideoToolbox (hardware)",
         }
     }
@@ -471,7 +471,7 @@ impl VideoDecoder {
     /// Decode one Annex-B access unit. `None` until the decoder has a full picture.
     pub fn decode(&mut self, annex_b: &[u8]) -> Result<Option<DecodedFrame>, CodecError> {
         match &mut self.engine {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             DecEngine::VideoToolbox(vt) => {
                 let mut rgba = Vec::new();
                 match vt.decode(annex_b, &mut rgba) {

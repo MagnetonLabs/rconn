@@ -498,7 +498,7 @@ async fn session(
     let mut exchange = args
         .guest
         .as_ref()
-        .map(|g| crate::access::Exchange::new(g.password.clone(), session.session_id));
+        .map(|g| rconn_peer::guest::Exchange::new(g.password.clone(), session.session_id));
     shared.lock().expect("ui state").status = if exchange.is_some() {
         "checking the access password…".into()
     } else {
@@ -550,8 +550,8 @@ async fn session(
                         Ok(DataMessage::Guest(m)) => {
                             if let Some(ex) = exchange.as_mut() {
                                 match ex.handle(m).await {
-                                    crate::access::Step::Send(reply) => send(dc.clone(), reply).await,
-                                    crate::access::Step::Accepted => {
+                                    rconn_peer::guest::Step::Send(reply) => send(dc.clone(), reply).await,
+                                    rconn_peer::guest::Step::Accepted => {
                                         status_shared.lock().expect("ui state").status =
                                             "access password accepted, waiting for the picture…".into();
                                         if let Some(c) = status_ctx.lock().expect("ctx").as_ref() {
@@ -559,7 +559,7 @@ async fn session(
                                         }
                                         send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
                                     }
-                                    crate::access::Step::Refused(why) => {
+                                    rconn_peer::guest::Step::Refused(why) => {
                                         if let Some(tx) = refused_tx.take() {
                                             let _ = tx.send(why);
                                         }
