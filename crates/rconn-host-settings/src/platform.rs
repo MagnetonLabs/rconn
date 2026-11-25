@@ -19,9 +19,22 @@ pub fn default_data_dir() -> std::path::PathBuf {
         let base = std::env::var_os("ProgramData")
             .map_or_else(|| r"C:\ProgramData".into(), std::path::PathBuf::from);
         base.join("rconn")
-    } else {
+    } else if cfg!(target_os = "macos") {
         "/Library/Application Support/rconn".into()
+    } else {
+        linux_host_dir()
     }
+}
+
+/// Linux: the host runs per user (like the Mac's LaunchAgent), with its identity and
+/// settings in `$XDG_CONFIG_HOME/rconn/host` (the app's config folder, `host` inside).
+fn linux_host_dir() -> std::path::PathBuf {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(std::env::temp_dir);
+    config.join("rconn").join("host")
 }
 
 /// "Running", "Stopped", "Not installed", ...
@@ -61,7 +74,16 @@ pub fn restart_agent() -> Result<(), String> {
         };
     }
     if !cfg!(windows) {
-        return Err("Restarting the agent isn't supported on this OS yet".into());
+        // Per-user systemd unit set up by the app (see rconn-app's userhost).
+        let out = quiet("systemctl")
+            .args(["--user", "restart", "rconn-host.service"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        return if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+        };
     }
     let out = quiet("taskkill")
         .args(["/IM", "rconn-host-agent.exe", "/F"])
@@ -76,6 +98,9 @@ pub fn restart_agent() -> Result<(), String> {
 
 /// Where the host agent publishes its status (readable without admin rights).
 pub fn status_file() -> std::path::PathBuf {
+    if !cfg!(any(windows, target_os = "macos")) {
+        return linux_host_dir().join("status.json");
+    }
     default_data_dir()
         .with_file_name("rconn-status")
         .join("status.json")

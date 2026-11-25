@@ -44,9 +44,9 @@ pub enum Request {
     /// Open the admin settings window (UAC prompt on Windows).
     OpenHostSettings,
     RestartHostAgent,
-    /// macOS: make this Mac a host ("Allow connections to this computer").
+    /// macOS and Linux: make this computer a host ("Allow connections to this computer").
     EnableHost,
-    /// macOS: stop being a host (the identity is kept).
+    /// macOS and Linux: stop being a host (the identity is kept).
     DisableHost,
     /// macOS: open System Settings at this permission ("Screen Recording", "Accessibility").
     OpenPermission(String),
@@ -115,7 +115,7 @@ impl Home {
             notice: None,
             busy: None,
             host_settings: None,
-            can_host_here: cfg!(target_os = "macos"),
+            can_host_here: cfg!(unix),
         }
     }
 
@@ -192,8 +192,10 @@ fn this_computer(ui: &mut egui::Ui, h: &Home, out: &mut Vec<Request>) {
         }
         ui.add_space(6.0);
         ui.label(
-            RichText::new(if h.signed_in {
+            RichText::new(if h.signed_in && cfg!(target_os = "macos") {
                 "Gives this Mac an ID on your server. macOS will then ask you to allow Screen Recording and Accessibility."
+            } else if h.signed_in {
+                "Gives this computer an ID on your server and starts the host when you log in."
             } else {
                 "Sign in first (⚙ Settings)."
             })

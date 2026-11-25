@@ -1,6 +1,7 @@
 //! Detect whether this host is a VM or a physical machine (drives the indicator default).
 
 use rconn_core::settings::{HostKind, classify_host};
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
 
 pub fn detect() -> HostKind {
@@ -59,9 +60,15 @@ fn signals() -> (String, String, bool) {
             .trim()
             .to_owned()
     };
+    // x86 guests carry a "hypervisor" CPU flag; Xen and some ARM hypervisors expose
+    // /sys/hypervisor/type. The DMI vendor (Parallels, QEMU, VMware...) covers the rest.
+    let hv = std::path::Path::new("/sys/hypervisor/type").exists()
+        || read("/proc/cpuinfo")
+            .lines()
+            .any(|l| l.starts_with("flags") && l.split_whitespace().any(|f| f == "hypervisor"));
     (
         read("/sys/class/dmi/id/sys_vendor"),
         read("/sys/class/dmi/id/product_name"),
-        false,
+        hv,
     )
 }

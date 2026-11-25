@@ -2,11 +2,11 @@
 
 pub mod home;
 pub mod icon;
-#[cfg(target_os = "macos")]
-pub mod machost;
 pub mod profile;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod tray;
+#[cfg(unix)]
+pub mod userhost;
 pub mod worker;
 
 /// Held by the open window; a second launch (or the tray) talks to it here.

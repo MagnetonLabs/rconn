@@ -61,8 +61,9 @@ impl Paths {
                 .with_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX))
         };
         let config = profile::config_dir();
-        // macOS: the app sets the host up per user (see machost); Windows: the installer.
-        let (status_file, host_data) = if cfg!(target_os = "macos") {
+        // macOS and Linux: the app sets the host up per user (see userhost); Windows: the
+        // installer.
+        let (status_file, host_data) = if cfg!(unix) {
             (config.join("host").join("status.json"), config.join("host"))
         } else {
             (
@@ -155,9 +156,9 @@ impl Worker {
     /// Re-read this computer's status (and, every few ticks, its settings).
     fn refresh_local(&self, settings_too: bool) {
         let status = HostStatus::read(&self.paths.status_file);
-        // macOS: installed once the app wrote host.toml; Windows: the admin-only folder
-        // exists (its contents aren't visible to ordinary users).
-        let installed = if cfg!(target_os = "macos") {
+        // macOS/Linux: installed once the app wrote host.toml; Windows: the admin-only
+        // folder exists (its contents aren't visible to ordinary users).
+        let installed = if cfg!(unix) {
             self.paths.host_data.join("host.toml").exists()
         } else {
             self.paths.host_data.exists()
@@ -323,8 +324,8 @@ impl Worker {
             }
             Request::EnableHost => self.enable_host().await,
             Request::DisableHost => {
-                #[cfg(target_os = "macos")]
-                crate::machost::uninstall(&self.paths.host_data);
+                #[cfg(unix)]
+                crate::userhost::uninstall(&self.paths.host_data);
                 self.home(|h| {
                     h.this = None;
                     h.host_settings = None;
@@ -333,7 +334,7 @@ impl Worker {
             }
             Request::OpenPermission(name) => {
                 #[cfg(target_os = "macos")]
-                crate::machost::open_permission_settings(&name);
+                crate::userhost::open_permission_settings(&name);
                 let _ = name;
             }
             Request::RestartHostAgent => match rconn_host_settings::platform::restart_agent() {
@@ -346,34 +347,39 @@ impl Worker {
         }
     }
 
-    /// macOS: get an id from the server for this Mac (reusing a saved one), then start the
-    /// host agent as a login item.
+    /// macOS and Linux: get an id from the server for this computer (reusing a saved one),
+    /// then start the host agent at login.
     async fn enable_host(&self) {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(unix))]
         self.notice("Use the Rconn host installer on this OS", true);
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         {
+            let this = if cfg!(target_os = "macos") {
+                "this Mac"
+            } else {
+                "this computer"
+            };
             let Some(token) = self.token() else {
                 return self.notice("Sign in first (⚙ Settings)", true);
             };
-            self.home(|h| h.busy = Some("Setting up connections to this Mac…".into()));
+            self.home(|h| h.busy = Some(format!("Setting up connections to {this}…")));
             let (server, trust, fp) = self.server();
             let dir = self.paths.host_data.clone();
-            if !crate::machost::has_identity(&dir) {
+            if !crate::userhost::has_identity(&dir) {
                 let key = match rconn_core::fleet::HostKey::generate() {
                     Ok(k) => k,
                     Err(e) => return self.notice(format!("Couldn't create a key: {e}"), true),
                 };
                 match SignalingClient::enroll_host(&server, &trust, &token, &key).await {
                     Ok((id, cert)) => {
-                        if let Err(e) = crate::machost::save_identity(
+                        if let Err(e) = crate::userhost::save_identity(
                             &dir,
                             &id.to_string(),
                             &cert,
                             &key.to_pem(),
                         ) {
                             return self
-                                .notice(format!("Couldn't save this Mac's identity: {e}"), true);
+                                .notice(format!("Couldn't save {this}'s identity: {e}"), true);
                         }
                     }
                     Err(e) => return self.notice(format!("The server refused: {e:#}"), true),
@@ -382,10 +388,14 @@ impl Worker {
             let agent = std::env::current_exe()
                 .unwrap_or_default()
                 .with_file_name("rconn-host-agent");
-            match crate::machost::install(&agent, &dir, &server, fp.as_deref()) {
+            match crate::userhost::install(&agent, &dir, &server, fp.as_deref()) {
                 Ok(()) => {
                     self.notice(
-                        "This Mac now accepts connections. Allow the macOS permissions when asked.",
+                        if cfg!(target_os = "macos") {
+                            "This Mac now accepts connections. Allow the macOS permissions when asked."
+                        } else {
+                            "This computer now accepts connections."
+                        },
                         false,
                     );
                     self.refresh_local(true);
