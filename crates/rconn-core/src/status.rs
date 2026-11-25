@@ -10,6 +10,9 @@ pub struct HostStatus {
     pub short_code: String,
     pub label: String,
     pub server: String,
+    /// The pinned server key (`sha256:...`), if any. Public: lets the local app connect too.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     /// Connected to the server and reachable.
     pub online: bool,
     /// An operator is connected right now.
@@ -36,5 +39,26 @@ impl HostStatus {
     /// Older than this, the agent is probably not running.
     pub fn is_fresh(&self, now_unix: u64) -> bool {
         now_unix.saturating_sub(self.updated) < 90
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_and_ages() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("status.json");
+        let s = HostStatus {
+            short_code: "067 425 387".into(),
+            online: true,
+            updated: 100,
+            ..Default::default()
+        };
+        s.write(&p).unwrap();
+        assert_eq!(HostStatus::read(&p), Some(s.clone()));
+        assert!(s.is_fresh(150));
+        assert!(!s.is_fresh(1000));
     }
 }

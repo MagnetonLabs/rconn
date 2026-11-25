@@ -2,6 +2,18 @@
 
 use std::process::Command;
 
+/// A command that never flashes a console window (this is a GUI program).
+fn quiet(program: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut c = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
 pub fn default_data_dir() -> std::path::PathBuf {
     if cfg!(windows) {
         let base = std::env::var_os("ProgramData")
@@ -17,7 +29,7 @@ pub fn service_state() -> String {
     if !cfg!(windows) {
         return "n/a on this OS".into();
     }
-    let Ok(out) = Command::new("sc").args(["query", "rconn-host"]).output() else {
+    let Ok(out) = quiet("sc").args(["query", "rconn-host"]).output() else {
         return "unknown".into();
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -37,7 +49,7 @@ pub fn restart_agent() -> Result<(), String> {
     if !cfg!(windows) {
         return Err("Restarting the agent is Windows-only for now".into());
     }
-    let out = Command::new("taskkill")
+    let out = quiet("taskkill")
         .args(["/IM", "rconn-host-agent.exe", "/F"])
         .output()
         .map_err(|e| e.to_string())?;
@@ -48,13 +60,24 @@ pub fn restart_agent() -> Result<(), String> {
     }
 }
 
+/// Where the host agent publishes its status (readable without admin rights).
+pub fn status_file() -> std::path::PathBuf {
+    default_data_dir()
+        .with_file_name("rconn-status")
+        .join("status.json")
+}
+
 /// Start this program again with administrator rights (shows the UAC prompt).
 pub fn relaunch_elevated() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    run_elevated(&std::env::current_exe().map_err(|e| e.to_string())?)
+}
+
+/// Start `exe` with administrator rights (shows the UAC prompt).
+pub fn run_elevated(exe: &std::path::Path) -> Result<(), String> {
     if !cfg!(windows) {
         return Err("Run with sudo on this OS".into());
     }
-    Command::new("powershell")
+    quiet("powershell")
         .args([
             "-NoProfile",
             "-Command",

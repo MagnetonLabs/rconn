@@ -159,7 +159,12 @@ async fn main() -> Result<()> {
     );
 
     let host_kind = hostkind::detect();
-    let status = StatusPublisher::new(cli.status_file.clone(), host_id, &server);
+    let status = StatusPublisher::new(
+        cli.status_file.clone(),
+        host_id,
+        &server,
+        cli.fingerprint.clone(),
+    );
     let trust = ServerTrust::from_fingerprint(cli.fingerprint.as_deref());
     // Reconnect forever with capped backoff: an unattended host must come back by itself.
     let mut backoff = Duration::from_secs(1);
@@ -394,12 +399,18 @@ struct StatusPublisher {
 }
 
 impl StatusPublisher {
-    fn new(path: Option<PathBuf>, host_id: HostId, server: &str) -> Self {
+    fn new(
+        path: Option<PathBuf>,
+        host_id: HostId,
+        server: &str,
+        fingerprint: Option<String>,
+    ) -> Self {
         let base = rconn_core::status::HostStatus {
             host_id: host_id.to_string(),
             short_code: host_id.short_code(),
             label: machine_name(),
             server: server.to_owned(),
+            fingerprint,
             ..Default::default()
         };
         let p = Self {

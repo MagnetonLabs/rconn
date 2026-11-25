@@ -27,6 +27,8 @@ Var PinField
 Var IdentityField
 
 !define MUI_ABORTWARNING
+!define MUI_ICON "${__FILEDIR__}\rconn.ico"
+!define MUI_UNICON "${__FILEDIR__}\rconn.ico"
 !insertmacro MUI_PAGE_WELCOME
 Page custom ServerPage ServerPageLeave
 !insertmacro MUI_PAGE_INSTFILES
@@ -98,17 +100,22 @@ Section "rconn host" SecHost
     Abort
   ${EndIf}
 
-  ; Upgrade in place: remove a running service first.
+  ; Upgrade in place: remove a running service and close the app first.
   ${If} ${FileExists} "$INSTDIR\rconn-host-service.exe"
     nsExec::ExecToLog '"$INSTDIR\rconn-host-service.exe" uninstall'
     Pop $0
   ${EndIf}
+  nsExec::ExecToLog 'taskkill /IM rconn.exe /F'
+  Pop $0
 
   SetOutPath "$INSTDIR"
   File "${SRC}\host\rconn-host-service.exe"
   File "${SRC}\host\rconn-host-agent.exe"
   File "${SRC}\host\openh264-*.dll"
   File "${SRC}\viewer\rconn-viewer.exe"
+  File "${SRC}\viewer\rconn.exe"
+  File "${SRC}\host\rconn-settings.exe"
+  File "${__FILEDIR__}\rconn.ico"
 
   ${If} $Pin == ""
     nsExec::ExecToLog '"$INSTDIR\rconn-host-service.exe" configure --server "$Server" --identity-from "$Identity"'
@@ -130,17 +137,29 @@ Section "rconn host" SecHost
     Abort
   ${EndIf}
 
+  ; Start Menu + desktop for everyone; the tray icon starts at every login.
+  SetShellVarContext all
+  CreateShortcut "$SMPROGRAMS\rconn.lnk" "$INSTDIR\rconn.exe" "" "$INSTDIR\rconn.ico"
+  CreateShortcut "$SMPROGRAMS\rconn host settings.lnk" "$INSTDIR\rconn-settings.exe" "" "$INSTDIR\rconn.ico"
+  CreateShortcut "$DESKTOP\rconn.lnk" "$INSTDIR\rconn.exe" "" "$INSTDIR\rconn.ico"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "rconn" '"$INSTDIR\rconn.exe" --tray'
+
   WriteUninstaller "$INSTDIR\uninstall.exe"
   !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\rconn-host"
   WriteRegStr HKLM "${UNINST}" "DisplayName" "rconn host"
   WriteRegStr HKLM "${UNINST}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKLM "${UNINST}" "Publisher" "rconn"
   WriteRegStr HKLM "${UNINST}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "${UNINST}" "DisplayIcon" "$INSTDIR\rconn.ico"
   WriteRegStr HKLM "${UNINST}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKLM "${UNINST}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
   WriteRegDWORD HKLM "${UNINST}" "NoModify" 1
   WriteRegDWORD HKLM "${UNINST}" "NoRepair" 1
   DetailPrint "rconn host installed and running (service: rconn-host)."
+  ; Open the app as the signed-in user (not elevated): explorer starts it unelevated.
+  ${IfNot} ${Silent}
+    Exec '"$WINDIR\explorer.exe" "$INSTDIR\rconn.exe"'
+  ${EndIf}
 SectionEnd
 
 Section "Uninstall"
@@ -149,6 +168,16 @@ Section "Uninstall"
   Pop $0
   nsExec::ExecToLog 'taskkill /IM rconn-host-agent.exe /F'
   Pop $0
+  nsExec::ExecToLog 'taskkill /IM rconn.exe /F'
+  Pop $0
+  SetShellVarContext all
+  Delete "$SMPROGRAMS\rconn.lnk"
+  Delete "$SMPROGRAMS\rconn host settings.lnk"
+  Delete "$DESKTOP\rconn.lnk"
+  DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "rconn"
+  Delete "$INSTDIR\rconn.exe"
+  Delete "$INSTDIR\rconn-settings.exe"
+  Delete "$INSTDIR\rconn.ico"
   Delete "$INSTDIR\rconn-host-service.exe"
   Delete "$INSTDIR\rconn-host-agent.exe"
   Delete "$INSTDIR\openh264-*.dll"
@@ -157,5 +186,6 @@ Section "Uninstall"
   RMDir "$INSTDIR"
   ; Settings, host identity and logs (admin-only folder).
   RMDir /r "$COMMONPROGRAMDATA\rconn"
+  RMDir /r "$COMMONPROGRAMDATA\rconn-status"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\rconn-host"
 SectionEnd

@@ -1,0 +1,42 @@
+[package]
+name = "rconn-app"
+description = "rconn desktop app: this computer's ID, connect to computers, settings, tray."
+license = "LicenseRef-Proprietary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rconn"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+directories = "6"
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+png = "0.18"
+rconn-core.workspace = true
+rconn-host-settings = { version = "0.1.0", path = "../rconn-host-settings" }
+rconn-peer = { version = "0.1.0", path = "../rconn-peer" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = "0.26"
+winit = { version = "0.30", default-features = false }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
+tempfile.workspace = true
