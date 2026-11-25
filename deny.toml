@@ -32,6 +32,31 @@ allow = ["OFL-1.1", "Ubuntu-font-1.0"]
 crate = "option-ext"
 allow = ["MPL-2.0"]
 
+# uniffi (rconn-mobile's Swift bindings), MPL-2.0 like option-ext above: used unmodified.
+[[licenses.exceptions]]
+crate = "uniffi"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_core"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_internal_macros"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_macros"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_meta"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_pipeline"
+allow = ["MPL-2.0"]
+
 # Our own crates are publish = false, so their LicenseRef-Proprietary is skipped.
 [licenses.private]
 ignore = true
