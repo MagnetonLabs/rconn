@@ -71,6 +71,75 @@ impl I420 {
     }
 }
 
+impl I420 {
+    /// Like [`fill_from_bgra`](Self::fill_from_bgra), scaling a `src_width` x `src_height`
+    /// image down to this picture's size (nearest sample per pixel, chroma averaged).
+    pub fn fill_from_bgra_scaled(&mut self, bgra: &[u8], src_width: usize, src_height: usize) {
+        let (w, h) = (self.width, self.height);
+        if (w, h) == (src_width & !1, src_height & !1) {
+            return self.fill_from_bgra(bgra, src_width);
+        }
+        assert!(bgra.len() >= src_width * src_height * 4 && w <= src_width && h <= src_height);
+        let xs: Vec<usize> = (0..w).map(|x| x * src_width / w).collect();
+        let (y_plane, uv) = self.data.split_at_mut(w * h);
+        let (u_plane, v_plane) = uv.split_at_mut(w * h / 4);
+        let bands = threads().min(h / MIN_BAND_ROWS).max(1);
+        let band_rows = (h / bands).next_multiple_of(2).max(2);
+        let jobs = y_plane
+            .chunks_mut(band_rows * w)
+            .zip(u_plane.chunks_mut(band_rows / 2 * (w / 2)))
+            .zip(v_plane.chunks_mut(band_rows / 2 * (w / 2)))
+            .enumerate();
+        let xs = &xs;
+        std::thread::scope(|s| {
+            for (i, ((y, u), v)) in jobs {
+                s.spawn(move || {
+                    let rows = y.len() / w;
+                    for pair in 0..rows / 2 {
+                        let oy = i * band_rows + 2 * pair;
+                        let src_row = |r: usize| {
+                            let sy = (r * src_height / h).min(src_height - 1);
+                            &bgra[sy * src_width * 4..(sy + 1) * src_width * 4]
+                        };
+                        let (r0, r1) = (src_row(oy), src_row(oy + 1));
+                        let (y0, y1) = y[2 * pair * w..(2 * pair + 2) * w].split_at_mut(w);
+                        let half = w / 2;
+                        let (ur, vr) = (
+                            &mut u[pair * half..(pair + 1) * half],
+                            &mut v[pair * half..(pair + 1) * half],
+                        );
+                        let px = |row: &[u8], sx: usize| {
+                            (
+                                i32::from(row[4 * sx]),
+                                i32::from(row[4 * sx + 1]),
+                                i32::from(row[4 * sx + 2]),
+                            )
+                        };
+                        let luma = |p: (i32, i32, i32)| {
+                            (((66 * p.2 + 129 * p.1 + 25 * p.0 + 128) >> 8) + 16) as u8
+                        };
+                        for x in 0..half {
+                            let (sa, sb) = (xs[2 * x], xs[2 * x + 1]);
+                            let (a, b, c, d) = (px(r0, sa), px(r0, sb), px(r1, sa), px(r1, sb));
+                            y0[2 * x] = luma(a);
+                            y0[2 * x + 1] = luma(b);
+                            y1[2 * x] = luma(c);
+                            y1[2 * x + 1] = luma(d);
+                            let (bb, gg, rr) = (
+                                (a.0 + b.0 + c.0 + d.0 + 2) >> 2,
+                                (a.1 + b.1 + c.1 + d.1 + 2) >> 2,
+                                (a.2 + b.2 + c.2 + d.2 + 2) >> 2,
+                            );
+                            ur[x] = (((-38 * rr - 74 * gg + 112 * bb + 128) >> 8) + 128) as u8;
+                            vr[x] = (((112 * rr - 94 * gg - 18 * bb + 128) >> 8) + 128) as u8;
+                        }
+                    }
+                });
+            }
+        });
+    }
+}
+
 /// Convert rows into one band of the Y/U/V planes (`y.len() / w` rows, even).
 fn convert_band(src: &[u8], src_width: usize, w: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
     let stride = src_width * 4;
@@ -189,6 +258,30 @@ mod tests {
             .max()
             .unwrap();
         assert!(worst <= 2, "Y differs by up to {worst}");
+    }
+
+    #[test]
+    fn scaled_conversion_samples_the_right_pixels() {
+        // Left half black, right half white: scaled to 3/4 the split stays in the middle.
+        let (sw, sh) = (400, 200);
+        let src: Vec<u8> = (0..sw * sh)
+            .flat_map(|i| {
+                if i % sw < sw / 2 {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 255, 255, 255]
+                }
+            })
+            .collect();
+        let mut p = I420::new(300, 150);
+        p.fill_from_bgra_scaled(&src, sw, sh);
+        let row = &p.y()[75 * 300..76 * 300];
+        assert_eq!(row[10], 16, "black stays black");
+        assert_eq!(row[290], 235, "white stays white");
+        assert!(
+            (148..=152).contains(&row.iter().position(|&v| v > 128).unwrap()),
+            "edge in the middle"
+        );
     }
 
     /// `cargo test --release -p rconn-media yuv::tests::speed -- --ignored --nocapture`

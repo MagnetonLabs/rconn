@@ -93,6 +93,7 @@ pub async fn run(
     let mut retarget_at = Instant::now() + Duration::from_secs(1);
     let mut next_send = Instant::now();
 
+    let mut scaler = AdaptiveScale::default();
     while !stop.load(Ordering::Relaxed) {
         // Wake for: a new frame, a keyframe request, or the send slot of a frame we hold.
         let slot = tokio::time::Instant::from_std(next_send);
@@ -135,7 +136,16 @@ pub async fn run(
         sent = Some(frame.clone());
         let t0 = Instant::now();
         let encoded = enc.encode(&frame)?;
-        stats.encode += t0.elapsed();
+        let took = t0.elapsed();
+        stats.encode += took;
+        if let Some(scale) = scaler.observe(took, Instant::now()) {
+            tracing::info!(
+                scale,
+                encode_ms = took.as_secs_f32() * 1e3,
+                "adaptive resolution"
+            );
+            enc.set_scale(scale);
+        }
         if let Some(au) = encoded {
             stats.bytes += au.len();
             stats.frames += 1;
@@ -229,5 +239,96 @@ impl Stats {
             "stream"
         );
         *self = Self::default();
+    }
+}
+
+/// Lowers the encoded resolution while frames take too long to encode (busy CPU, video
+/// on screen) and restores it when encoding is quick again. Each change costs a
+/// keyframe, so changes are spaced out.
+#[derive(Debug)]
+pub struct AdaptiveScale {
+    scale: f32,
+    /// Smoothed encode time, ms.
+    avg_ms: f32,
+    last_change: Option<Instant>,
+}
+
+impl Default for AdaptiveScale {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            avg_ms: 0.0,
+            last_change: None,
+        }
+    }
+}
+
+impl AdaptiveScale {
+    const SLOW_MS: f32 = 30.0; // below ~30 fps
+    const FAST_MS: f32 = 12.0;
+    const STEP: f32 = 0.75;
+    const MIN: f32 = 0.5;
+
+    /// Record one encode; returns a new scale when it should change.
+    pub fn observe(&mut self, took: Duration, now: Instant) -> Option<f32> {
+        let ms = took.as_secs_f32() * 1e3;
+        self.avg_ms = if self.avg_ms == 0.0 {
+            ms
+        } else {
+            self.avg_ms * 0.8 + ms * 0.2
+        };
+        let since = self
+            .last_change
+            .map_or(Duration::MAX, |t| now.duration_since(t));
+        let next = if self.avg_ms > Self::SLOW_MS
+            && self.scale > Self::MIN
+            && since > Duration::from_secs(1)
+        {
+            (self.scale * Self::STEP).max(Self::MIN)
+        } else if self.avg_ms < Self::FAST_MS && self.scale < 1.0 && since > Duration::from_secs(3)
+        {
+            (self.scale / Self::STEP).min(1.0)
+        } else {
+            return None;
+        };
+        self.scale = next;
+        self.last_change = Some(now);
+        // The new size changes encode time; start averaging afresh.
+        self.avg_ms = 0.0;
+        Some(next)
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::*;
+
+    #[test]
+    fn slow_encodes_lower_the_scale_and_fast_ones_restore_it() {
+        let mut a = AdaptiveScale::default();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // Sustained 60 ms encodes: one step down, then (after 1 s) another, never below 0.5.
+        assert_eq!(a.observe(ms(60), t0), Some(0.75));
+        assert_eq!(
+            a.observe(ms(60), t0 + ms(200)),
+            None,
+            "too soon after a change"
+        );
+        assert_eq!(a.observe(ms(60), t0 + ms(1300)), Some(0.5625));
+        assert_eq!(a.observe(ms(60), t0 + ms(2600)), Some(0.5));
+        assert_eq!(a.observe(ms(60), t0 + ms(4000)), None, "floor");
+        // Quiet again: back up step by step (each after a run of quick frames, 3 s apart).
+        let mut t = t0 + ms(8000);
+        let mut steps = Vec::new();
+        for _ in 0..200 {
+            if let Some(s) = a.observe(ms(5), t) {
+                steps.push(s);
+            }
+            t += ms(100);
+        }
+        assert_eq!(steps.first(), Some(&(0.5 / 0.75)));
+        let last = *steps.last().unwrap();
+        assert_eq!(last, 1.0);
     }
 }

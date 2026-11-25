@@ -22,18 +22,21 @@ use tokio::sync::mpsc;
 use webrtc::data_channel::DataChannelEvent;
 use webrtc::media_stream::track_remote::TrackRemoteEvent;
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConnectArgs {
     pub server: String,
-    pub trust: ServerTrust,
+    /// Pinned server key (`sha256:...`), or None for a public certificate.
+    pub fingerprint: Option<String>,
     pub token: String,
     pub host: HostId,
     pub openh264: PathBuf,
-    pub opts: PeerOptions,
+    pub udp_addrs: Vec<String>,
+    pub relay_only: bool,
     /// Borderless, maximized window; the toolbar appears on the hotkey.
     pub chromeless: bool,
     /// Don't play the host's sound (can be switched in the toolbar).
     pub mute: bool,
-    /// Shown in the toolbar and title (the computer's name or ID).
+    /// Shown in the tab, toolbar and title (the computer's name or ID).
     pub name: String,
 }
 
@@ -160,8 +163,27 @@ struct Shared {
     kbps: f32,
 }
 
-pub fn run(args: ConnectArgs) -> Result<()> {
+/// Local port of the open session window: later connections become tabs in it.
+pub const VIEWER_PORT: u16 = 47_393;
+
+/// If a session window is already open, hand `args` to it as a new tab.
+/// Returns false when there is none (the caller then opens the window).
+pub fn hand_off(args: &ConnectArgs) -> bool {
+    use std::io::Write;
+    let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", VIEWER_PORT)) else {
+        return false;
+    };
+    let Ok(mut line) = serde_json::to_string(args) else {
+        return false;
+    };
+    line.push('\n');
+    s.write_all(line.as_bytes()).is_ok()
+}
+
+/// Start a session in the background; the returned tab shows it.
+fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> ViewerApp {
     let chromeless = args.chromeless;
+    let host = args.host;
     let name = args.name.clone();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(args.mute));
     let muted_audio = muted.clone();
@@ -173,38 +195,84 @@ pub fn run(args: ConnectArgs) -> Result<()> {
     }));
     let (input_tx, input_rx) = mpsc::unbounded_channel::<InputEvent>();
     let (kf_ui, kf_from_ui) = mpsc::unbounded_channel::<Control>();
-    let ctx_slot: Arc<Mutex<Option<egui::Context>>> = Arc::default();
-
-    // Background session.
-    let (sh, ctx2) = (shared.clone(), ctx_slot.clone());
-    std::thread::Builder::new()
-        .name("rconn-session".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            let result = rt.block_on(session(
-                args,
-                muted_audio,
-                cursor_for_session,
-                sh.clone(),
-                input_rx,
-                kf_from_ui,
-                ctx2.clone(),
-            ));
-            let mut s = sh.lock().expect("ui state");
-            s.status = match result {
-                Ok(()) => "session ended".into(),
-                Err(e) => format!("error: {e:#}"),
-            };
-            if let Some(ctx) = ctx2.lock().expect("ctx").as_ref() {
-                ctx.request_repaint();
+    // Dropping the tab drops `close`, which ends the session and its runtime.
+    let (close, mut closed) = tokio::sync::watch::channel(());
+    let (sh, ctx2) = (shared.clone(), ctx_slot);
+    let spawned = std::thread::Builder::new().name("rconn-session".into()).spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let result = rt.block_on(async {
+            tokio::select! {
+                r = session(args, muted_audio, cursor_for_session, sh.clone(), input_rx, kf_from_ui, ctx2.clone()) => Some(r),
+                _ = closed.changed() => None, // tab closed
             }
-        })?;
+        });
+        let Some(result) = result else { return };
+        sh.lock().expect("ui state").status = match result {
+            Ok(()) => "session ended".into(),
+            Err(e) => format!("error: {e:#}"),
+        };
+        if let Some(ctx) = ctx2.lock().expect("ctx").as_ref() {
+            ctx.request_repaint();
+        }
+    });
+    if let Err(e) = spawned {
+        shared.lock().expect("ui state").status = format!("error: {e}");
+    }
+    ViewerApp {
+        shared,
+        input: input_tx,
+        keyframe: kf_ui,
+        texture: None,
+        last_pointer: None,
+        keys: KeyGate::default(),
+        fullscreen: false,
+        chromeless,
+        name,
+        muted,
+        chrome: None,
+        reveal_until: None,
+        fit_window: false,
+        cursor: shared_cursor,
+        last_frame: None,
+        confirm_restart: false,
+        toast: None,
+        closing: false,
+        host,
+        _close: Some(close),
+        last_snap: None,
+    }
+}
 
+/// Open the session window with a first tab; it blocks until the window closes.
+/// Later `rconn-viewer connect` runs add tabs to it (see [`hand_off`]).
+pub fn run(args: ConnectArgs) -> Result<()> {
+    let chromeless = args.chromeless;
+    let title = format!("rconn — {}", args.name);
+    let ctx_slot: Arc<Mutex<Option<egui::Context>>> = Arc::default();
+    let (tab_tx, tab_rx) = std::sync::mpsc::channel::<ConnectArgs>();
+    if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", VIEWER_PORT)) {
+        let ctx = ctx_slot.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for conn in listener.incoming().flatten() {
+                let mut line = String::new();
+                if std::io::BufReader::new(conn).read_line(&mut line).is_ok()
+                    && let Ok(args) = serde_json::from_str::<ConnectArgs>(&line)
+                {
+                    let _ = tab_tx.send(args);
+                    if let Some(c) = ctx.lock().expect("ctx").as_ref() {
+                        c.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        c.request_repaint();
+                    }
+                }
+            }
+        });
+    }
     let options = eframe::NativeOptions {
         viewport: {
             let v = egui::ViewportBuilder::default()
                 .with_inner_size([1280.0, 800.0])
-                .with_title(format!("rconn — {name}"));
+                .with_title(title);
             if chromeless {
                 v.with_decorations(false).with_maximized(true)
             } else {
@@ -218,28 +286,138 @@ pub fn run(args: ConnectArgs) -> Result<()> {
         options,
         Box::new(move |cc| {
             *ctx_slot.lock().expect("ctx") = Some(cc.egui_ctx.clone());
-            Ok(Box::new(ViewerApp {
-                shared,
-                input: input_tx,
-                keyframe: kf_ui,
-                texture: None,
-                last_pointer: None,
-                keys: KeyGate::default(),
-                fullscreen: false,
-                chromeless,
-                name,
-                muted,
-                chrome: None,
-                reveal_until: None,
-                fit_window: false,
-                cursor: shared_cursor,
-                last_frame: None,
-                confirm_restart: false,
-                toast: None,
+            let first = open_tab(args, ctx_slot.clone());
+            Ok(Box::new(Window {
+                tabs: vec![first],
+                active: 0,
+                incoming: tab_rx,
+                ctx_slot,
             }))
         }),
     )
     .map_err(|e| anyhow!("window: {e}"))
+}
+
+/// The session window: one tab per remote computer.
+struct Window {
+    tabs: Vec<ViewerApp>,
+    active: usize,
+    incoming: std::sync::mpsc::Receiver<ConnectArgs>,
+    ctx_slot: Arc<Mutex<Option<egui::Context>>>,
+}
+
+const TABS_H: f32 = 32.0;
+
+impl Window {
+    fn switch_to(&mut self, i: usize) {
+        if i == self.active || i >= self.tabs.len() {
+            return;
+        }
+        // Keys held on the tab we leave would stay down on that computer.
+        let old = &mut self.tabs[self.active];
+        for ev in old.keys.release_all() {
+            old.send(ev);
+        }
+        self.active = i;
+        self.tabs[i].fit_window = true;
+    }
+
+    fn tab_strip(&mut self, ui: &mut egui::Ui) {
+        let mut switch = None;
+        egui::Panel::top("tabs")
+            .exact_size(TABS_H)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .inner_margin(egui::Margin::symmetric(8, 3)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    for (i, tab) in self.tabs.iter_mut().enumerate() {
+                        let active = i == self.active;
+                        let frame = egui::Frame::new()
+                            .fill(if active {
+                                ui.visuals().panel_fill
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::symmetric(10, 3));
+                        frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let color = if active {
+                                    Color32::from_rgb(80, 150, 255)
+                                } else {
+                                    Color32::GRAY
+                                };
+                                ui.label(egui::RichText::new("🖥").color(color));
+                                let text = egui::RichText::new(&tab.name);
+                                let text = if active { text.strong() } else { text };
+                                if ui
+                                    .add(egui::Label::new(text).sense(Sense::click()))
+                                    .clicked()
+                                {
+                                    switch = Some(i);
+                                }
+                                if ui
+                                    .small_button("❌")
+                                    .on_hover_text("Disconnect and close this tab")
+                                    .clicked()
+                                {
+                                    tab.closing = true;
+                                }
+                            });
+                        });
+                    }
+                });
+            });
+        if let Some(i) = switch {
+            self.switch_to(i);
+        }
+    }
+}
+
+impl eframe::App for Window {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        while let Ok(args) = self.incoming.try_recv() {
+            // Already open: show that tab rather than a second session to the same computer.
+            match self
+                .tabs
+                .iter()
+                .position(|t| t.host == args.host && !t.closing)
+            {
+                Some(i) => self.switch_to(i),
+                None => {
+                    self.tabs.push(open_tab(args, self.ctx_slot.clone()));
+                    let last = self.tabs.len() - 1;
+                    self.switch_to(last);
+                }
+            }
+        }
+        // Remove closed tabs (dropping a tab ends its session); keep the same tab active.
+        let active = self.active;
+        let removed_before = self.tabs.iter().take(active).filter(|t| t.closing).count();
+        self.tabs.retain(|t| !t.closing);
+        if self.tabs.is_empty() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        self.active = active
+            .saturating_sub(removed_before)
+            .min(self.tabs.len() - 1);
+        let fullscreen = self.tabs[self.active].is_fullscreen(ui);
+        if !fullscreen {
+            self.tab_strip(ui);
+        }
+        let tab = &mut self.tabs[self.active];
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                "rconn — {}",
+                tab.name
+            )));
+        tab.draw(ui);
+    }
 }
 
 async fn session(
@@ -256,8 +434,13 @@ async fn session(
             c.request_repaint();
         }
     };
-    let sig = SignalingClient::connect_operator(&args.server, &args.trust, &args.token).await?;
-    let mut session = open_viewer_session(sig, args.host, args.opts).await?;
+    let trust = ServerTrust::from_fingerprint(args.fingerprint.as_deref());
+    let sig = SignalingClient::connect_operator(&args.server, &trust, &args.token).await?;
+    let opts = PeerOptions {
+        udp_addrs: args.udp_addrs.clone(),
+        relay_only: args.relay_only,
+    };
+    let mut session = open_viewer_session(sig, args.host, opts).await?;
     shared.lock().expect("ui state").status = "negotiating…".into();
     repaint();
 
@@ -423,6 +606,14 @@ struct ViewerApp {
     confirm_restart: bool,
     /// Short feedback shown in the toolbar, until the deadline.
     toast: Option<(String, Instant)>,
+    /// Disconnect was pressed; the window removes this tab.
+    closing: bool,
+    /// The computer this tab shows.
+    host: HostId,
+    /// Dropped with the tab, which ends the session.
+    _close: Option<tokio::sync::watch::Sender<()>>,
+    /// When the window was last snapped to the picture's shape.
+    last_snap: Option<Instant>,
 }
 
 /// The local pointer icon for a host pointer shape.
@@ -564,12 +755,37 @@ fn map_button(b: egui::PointerButton) -> Option<MouseButton> {
 /// Window size showing a `remote`-sized screen with no black bars: 1:1 when it fits,
 /// else scaled down to 90% of the display, plus the toolbar.
 pub fn window_size_for(remote: Vec2, monitor: Option<Vec2>) -> Vec2 {
-    let max = monitor.unwrap_or(Vec2::new(1600.0, 1000.0)) * 0.9 - Vec2::new(0.0, BAR_H);
+    let chrome = BAR_H + TABS_H;
+    let max = monitor.unwrap_or(Vec2::new(1600.0, 1000.0)) * 0.9 - Vec2::new(0.0, chrome);
     let scale = (max.x / remote.x).min(max.y / remote.y).min(1.0);
     Vec2::new(
         (remote.x * scale).round(),
-        (remote.y * scale).round() + BAR_H,
+        (remote.y * scale).round() + chrome,
     )
+}
+
+/// After the user resizes the window, the window size that removes the black bars:
+/// same width with the picture's height, or (if that won't fit on screen) the same
+/// height with the picture's width. `None` when it already fits (within 2 points).
+pub fn snap_to_picture(
+    window: Vec2,
+    picture_area: Vec2,
+    remote: Vec2,
+    monitor: Option<Vec2>,
+) -> Option<Vec2> {
+    let aspect = remote.x / remote.y;
+    let chrome_h = window.y - picture_area.y;
+    let want_h = (picture_area.x / aspect).round();
+    let max_h = monitor.map_or(f32::INFINITY, |m| m.y * 0.95);
+    let size = if want_h + chrome_h <= max_h {
+        Vec2::new(window.x, want_h + chrome_h)
+    } else {
+        Vec2::new(
+            (picture_area.y * aspect).round() + (window.x - picture_area.x),
+            window.y,
+        )
+    };
+    ((size - window).length() > 2.0).then_some(size)
 }
 
 /// Largest rect with `aspect` (w/h) centred in `area`.
@@ -764,7 +980,7 @@ impl ViewerApp {
         let bye = egui::Button::new(egui::RichText::new("❌ Disconnect").color(Color32::WHITE))
             .fill(DANGER);
         if ui.add(bye).clicked() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            self.closing = true;
         }
         if let Some((text, until)) = &self.toast
             && Instant::now() < *until
@@ -843,9 +1059,11 @@ impl ViewerApp {
             match &mut self.texture {
                 Some(t) if t.size() == [f.width, f.height] => t.set(img, TextureOptions::LINEAR),
                 _ => {
+                    // Fit the window to the first picture only: later size changes are the
+                    // host trading resolution for speed, and keep the same shape.
+                    self.fit_window |= self.texture.is_none();
                     self.texture =
                         Some(ui.ctx().load_texture("screen", img, TextureOptions::LINEAR));
-                    self.fit_window = true; // first picture, or the remote resolution changed
                 }
             }
             self.last_frame = Some(f);
@@ -895,6 +1113,29 @@ impl ViewerApp {
             });
             if fullscreen {
                 self.floating_bar(ui, area, &stats);
+            } else if let Some(t) = &self.texture {
+                // Keep the window the picture's shape (no black bars) once a resize ends.
+                let (window, monitor, dragging) = ui.ctx().input(|i| {
+                    (
+                        i.viewport().inner_rect.map(|r| r.size()),
+                        i.viewport().monitor_size,
+                        i.pointer.any_down(),
+                    )
+                });
+                let settled = self
+                    .last_snap
+                    .is_none_or(|t| t.elapsed() > Duration::from_millis(400));
+                let [w, h] = t.size();
+                if !dragging
+                    && settled
+                    && let Some(window) = window
+                    && let Some(size) =
+                        snap_to_picture(window, area.size(), Vec2::new(w as f32, h as f32), monitor)
+                {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    self.last_snap = Some(Instant::now());
+                }
             }
             if let Some(image) = image {
                 self.forward_input(ui, image);
@@ -919,12 +1160,6 @@ impl ViewerApp {
     }
 }
 
-impl eframe::App for ViewerApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.draw(ui);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,9 +1168,13 @@ mod tests {
     fn window_matches_the_remote_shape_and_fits_the_display() {
         let remote = Vec2::new(1496.0, 938.0);
         let big = window_size_for(remote, Some(Vec2::new(3000.0, 2000.0)));
-        assert_eq!(big, Vec2::new(1496.0, 938.0 + BAR_H), "1:1 when it fits");
+        assert_eq!(
+            big,
+            Vec2::new(1496.0, 938.0 + BAR_H + TABS_H),
+            "1:1 when it fits"
+        );
         let small = window_size_for(remote, Some(Vec2::new(1440.0, 900.0)));
-        let picture = Vec2::new(small.x, small.y - BAR_H);
+        let picture = Vec2::new(small.x, small.y - BAR_H - TABS_H);
         assert!(
             small.x <= 1296.0 && small.y <= 810.0,
             "within 90% of the display: {small:?}"
@@ -944,6 +1183,35 @@ mod tests {
             (picture.x / picture.y - remote.x / remote.y).abs() < 0.01,
             "same shape: no bars"
         );
+    }
+
+    #[test]
+    fn snapping_removes_black_bars_after_a_resize() {
+        let remote = Vec2::new(1496.0, 938.0);
+        // Window made wider than the picture: grow/shrink the height to match.
+        let s = snap_to_picture(
+            Vec2::new(1400.0, 800.0),
+            Vec2::new(1400.0, 728.0),
+            remote,
+            Some(Vec2::new(1800.0, 1100.0)),
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            Vec2::new(1400.0, (1400.0_f32 / (1496.0 / 938.0)).round() + 72.0)
+        );
+        // Already the right shape: nothing to do.
+        assert!(snap_to_picture(s, Vec2::new(1400.0, s.y - 72.0), remote, None).is_none());
+        // Too tall for the screen: narrow the window instead.
+        let t = snap_to_picture(
+            Vec2::new(1700.0, 900.0),
+            Vec2::new(1700.0, 828.0),
+            remote,
+            Some(Vec2::new(1800.0, 950.0)),
+        )
+        .unwrap();
+        assert_eq!(t.y, 900.0);
+        assert!((t.x - (828.0_f32 * 1496.0 / 938.0).round()).abs() < 1.0);
     }
 
     #[test]
@@ -1116,6 +1384,10 @@ mod render_tests {
             last_frame: None,
             confirm_restart: false,
             toast: None,
+            closing: false,
+            host: HostId(uuid::Uuid::nil()),
+            _close: None,
+            last_snap: None,
         }
     }
 
@@ -1131,6 +1403,37 @@ mod render_tests {
                 .unwrap();
         }
         harness.into_state()
+    }
+
+    #[test]
+    fn two_tabs_render_and_closing_one_keeps_the_other_active() {
+        let (_tx, incoming) = std::sync::mpsc::channel();
+        let mut second = app(false, false);
+        second.name = "BUILD-BOX".into();
+        let window = Window {
+            tabs: vec![app(false, false), second],
+            active: 1,
+            incoming,
+            ctx_slot: Arc::default(),
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 700.0))
+            .build_ui_state(
+                |ui, w: &mut Window| eframe::App::ui(w, ui, &mut eframe::Frame::_new_kittest()),
+                window,
+            );
+        harness.run_steps(3);
+        let image = harness.render().expect("offscreen render");
+        if let Some(dir) = std::env::var_os("RCONN_VIEWER_PNG_DIR") {
+            image
+                .save(std::path::Path::new(&dir).join("viewer-tabs.png"))
+                .unwrap();
+        }
+        let mut w = harness.into_state();
+        w.tabs[0].closing = true;
+        let (_, rx) = std::sync::mpsc::channel();
+        w.incoming = rx;
+        assert_eq!(w.tabs[w.active].name, "BUILD-BOX");
     }
 
     #[test]

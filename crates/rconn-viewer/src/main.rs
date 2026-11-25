@@ -156,18 +156,20 @@ async fn main() -> Result<()> {
             };
             let args = gui::ConnectArgs {
                 server: cli.server.clone(),
-                trust: trust(&cli),
+                fingerprint: cli.fingerprint.clone(),
                 token: token_for(&cli)?,
                 host: HostId(*host),
                 openh264,
-                opts: PeerOptions {
-                    udp_addrs: udp.clone(),
-                    relay_only: *relay_only,
-                },
+                udp_addrs: udp.clone(),
+                relay_only: *relay_only,
                 chromeless: *chromeless,
                 mute: *mute,
                 name: name.clone().unwrap_or_else(|| HostId(*host).short_code()),
             };
+            // A session window is already open: add a tab to it instead of a new window.
+            if gui::hand_off(&args) {
+                return Ok(());
+            }
             // eframe must own the main thread (macOS requirement); it blocks until closed.
             return gui::run(args);
         }

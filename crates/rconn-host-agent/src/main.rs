@@ -165,6 +165,7 @@ async fn main() -> Result<()> {
 
     let host_kind = hostkind::detect();
     request_permissions();
+    raise_priority();
     let status = StatusPublisher::new(
         cli.status_file.clone(),
         host_id,
@@ -564,4 +565,19 @@ fn restart_computer() -> Result<()> {
         .status()?;
     anyhow::ensure!(status.success(), "restart command failed");
     Ok(())
+}
+
+/// Run above ordinary apps so a busy machine (video playing, builds) can't starve
+/// capture and encoding, which is what makes a remote session stutter.
+fn raise_priority() {
+    #[cfg(windows)]
+    #[allow(unsafe_code)] // Win32 FFI: SetPriorityClass on our own process
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, HIGH_PRIORITY_CLASS, SetPriorityClass,
+        };
+        if let Err(e) = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) {
+            tracing::warn!(error = %e, "could not raise process priority");
+        }
+    }
 }
