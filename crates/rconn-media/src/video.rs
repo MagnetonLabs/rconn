@@ -69,8 +69,11 @@ impl Frame {
 pub struct EncoderSettings {
     pub bitrate_bps: u32,
     pub max_fps: f32,
-    /// Worker threads; 0 lets openh264 decide.
+    /// Worker threads; 0 lets openh264 decide. Threads only help with several slices.
     pub threads: u16,
+    /// Cut each frame into slices of at most this many bytes (lets openh264 encode slices
+    /// on several cores, and keeps each slice within one network packet). None: one slice.
+    pub slice_bytes: Option<u32>,
 }
 
 impl Default for EncoderSettings {
@@ -79,6 +82,7 @@ impl Default for EncoderSettings {
             bitrate_bps: 4_000_000,
             max_fps: 30.0,
             threads: 0,
+            slice_bytes: None,
         }
     }
 }
@@ -128,6 +132,10 @@ impl VideoEncoder {
             .intra_frame_period(IntraFramePeriod::from_num_frames(0))
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
             .num_threads(self.settings.threads);
+        let cfg = match self.settings.slice_bytes {
+            Some(n) => cfg.max_slice_len(n),
+            None => cfg,
+        };
         let _ = (width, height); // dimensions are taken from the first frame by openh264
         Encoder::with_api_config(api, cfg).map_err(|e| CodecError::OpenH264(e.to_string()))
     }

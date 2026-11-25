@@ -82,6 +82,7 @@ pub async fn run(
             bitrate_bps: (target.get() as u32).min(cfg.max_bitrate_bps),
             max_fps: cfg.max_fps as f32,
             threads: 0,
+            slice_bytes: None,
         },
     )?;
     let mut last: Option<Arc<Frame>> = None;

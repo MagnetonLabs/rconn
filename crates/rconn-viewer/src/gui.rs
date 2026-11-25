@@ -36,10 +36,17 @@ pub struct ConnectArgs {
 }
 
 /// The local hotkey that toggles the toolbar: Ctrl+Alt+Shift+M. Never sent to the host.
-pub const HOTKEY_HINT: &str = "Ctrl+Alt+Shift+M";
+pub const HOTKEY_HINT: &str = if cfg!(target_os = "macos") {
+    "Control+Option+Shift+M"
+} else {
+    "Ctrl+Alt+Shift+M"
+};
+
+const MAC: bool = cfg!(target_os = "macos");
+const LETTER_A: u16 = rconn_core::hid::usage::A;
 
 /// Decides which key events reach the host, and tracks what the host thinks is held so it
-/// can be released when the toolbar takes over the keyboard.
+/// can be released when the toolbar takes over the keyboard or the window loses focus.
 #[derive(Default)]
 pub struct KeyGate {
     pub toolbar: bool,
@@ -47,12 +54,29 @@ pub struct KeyGate {
 }
 
 pub enum KeyAction {
-    /// Forward to the host.
-    Send(InputEvent),
+    /// Forward these to the host, in order.
+    Send(Vec<InputEvent>),
     /// Toolbar toggled; release these keys on the host first.
     Toggled(Vec<InputEvent>),
     /// Swallow (toolbar is open, or unmapped key).
     Drop,
+}
+
+fn key_event(hid_usage: u16, pressed: bool) -> InputEvent {
+    InputEvent::Key { hid_usage, pressed }
+}
+
+/// Is the modifier `hid` still down according to the viewer's own modifier state?
+/// `None` for keys that aren't modifiers.
+fn modifier_down(hid: u16, mods: egui::Modifiers) -> Option<bool> {
+    use rconn_core::hid::usage as u;
+    match hid {
+        // On a Mac, Command is sent as Control (so Cmd+C copies on Windows).
+        u::CONTROL_LEFT | u::CONTROL_RIGHT => Some(mods.ctrl || (MAC && mods.mac_cmd)),
+        u::SHIFT_LEFT | u::SHIFT_RIGHT => Some(mods.shift),
+        u::ALT_LEFT | u::ALT_RIGHT => Some(mods.alt),
+        _ => None,
+    }
 }
 
 impl KeyGate {
@@ -63,29 +87,66 @@ impl KeyGate {
         repeat: bool,
         mods: egui::Modifiers,
     ) -> KeyAction {
+        use rconn_core::hid::usage as u;
         if key == egui::Key::M && pressed && mods.ctrl && mods.alt && mods.shift {
             self.toolbar = !self.toolbar;
-            let releases = std::mem::take(&mut self.held)
-                .into_iter()
-                .map(|hid_usage| InputEvent::Key {
-                    hid_usage,
-                    pressed: false,
-                })
-                .collect();
-            return KeyAction::Toggled(releases);
+            return KeyAction::Toggled(self.release_all());
         }
         if self.toolbar || repeat {
             return KeyAction::Drop;
         }
-        let Some(hid_usage) = to_hid(key) else {
+        let Some(mut hid_usage) = to_hid(key) else {
             return KeyAction::Drop;
         };
+        if MAC {
+            hid_usage = match hid_usage {
+                u::META_LEFT => u::CONTROL_LEFT,
+                u::META_RIGHT => u::CONTROL_RIGHT,
+                other => other,
+            };
+        }
+        // A modifier whose release we never saw (macOS drops some key-ups) is released now,
+        // so the host never keeps typing in capitals or with Ctrl stuck.
+        let mut out: Vec<InputEvent> = Vec::new();
+        let stale: Vec<u16> = self
+            .held
+            .iter()
+            .copied()
+            .filter(|&h| h != hid_usage && modifier_down(h, mods) == Some(false))
+            .collect();
+        for h in stale {
+            self.held.remove(&h);
+            out.push(key_event(h, false));
+        }
+        if MAC && hid_usage == u::CAPS_LOCK {
+            // macOS reports Caps Lock "down" when it turns on and "up" when it turns off;
+            // Windows toggles on each press, so send a full press for every change.
+            out.extend([key_event(hid_usage, true), key_event(hid_usage, false)]);
+            return KeyAction::Send(out);
+        }
         if pressed {
             self.held.insert(hid_usage);
         } else {
             self.held.remove(&hid_usage);
         }
-        KeyAction::Send(InputEvent::Key { hid_usage, pressed })
+        out.push(key_event(hid_usage, pressed));
+        KeyAction::Send(out)
+    }
+
+    /// Release everything the host thinks is held (focus lost, toolbar opened).
+    pub fn release_all(&mut self) -> Vec<InputEvent> {
+        std::mem::take(&mut self.held)
+            .into_iter()
+            .map(|h| key_event(h, false))
+            .collect()
+    }
+
+    /// A full key press for a shortcut the OS turned into an edit command (Cmd+C/X/V).
+    pub fn tap(&self, hid_usage: u16) -> Vec<InputEvent> {
+        if self.toolbar {
+            return Vec::new();
+        }
+        vec![key_event(hid_usage, true), key_event(hid_usage, false)]
     }
 }
 
@@ -156,6 +217,7 @@ pub fn run(args: ConnectArgs) -> Result<()> {
                 last_pointer: None,
                 keys: KeyGate::default(),
                 fullscreen: false,
+                chromeless,
             }))
         }),
     )
@@ -310,6 +372,8 @@ struct ViewerApp {
     last_pointer: Option<(f32, f32)>,
     keys: KeyGate,
     fullscreen: bool,
+    /// Borderless mode: no toolbar strip, only the hotkey toolbar.
+    chromeless: bool,
 }
 
 impl ViewerApp {
@@ -350,6 +414,29 @@ impl ViewerApp {
                         dy: lines.y,
                     });
                 }
+                egui::Event::WindowFocused(false) => {
+                    self.keys
+                        .release_all()
+                        .into_iter()
+                        .for_each(|ev| self.send(ev));
+                }
+                // Cmd/Ctrl+C, X, V arrive as edit commands, not keys: send the key itself
+                // (Ctrl is already held on the host).
+                egui::Event::Copy => self
+                    .keys
+                    .tap(LETTER_A + 2)
+                    .into_iter()
+                    .for_each(|ev| self.send(ev)),
+                egui::Event::Cut => self
+                    .keys
+                    .tap(LETTER_A + 23)
+                    .into_iter()
+                    .for_each(|ev| self.send(ev)),
+                egui::Event::Paste(_) => self
+                    .keys
+                    .tap(LETTER_A + 21)
+                    .into_iter()
+                    .for_each(|ev| self.send(ev)),
                 egui::Event::Key {
                     key,
                     physical_key,
@@ -362,7 +449,7 @@ impl ViewerApp {
                         .keys
                         .key(physical_key.unwrap_or(key), pressed, repeat, modifiers)
                     {
-                        KeyAction::Send(ev) => self.send(ev),
+                        KeyAction::Send(evs) => evs.into_iter().for_each(|ev| self.send(ev)),
                         KeyAction::Toggled(releases) => {
                             releases.into_iter().for_each(|ev| self.send(ev))
                         }
@@ -404,36 +491,50 @@ pub fn fit(area: Rect, size: Vec2) -> Rect {
 }
 
 impl ViewerApp {
+    fn toolbar_buttons(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button(if self.fullscreen {
+                "Exit full screen"
+            } else {
+                "🔳 Full screen"
+            })
+            .clicked()
+        {
+            self.fullscreen = !self.fullscreen;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        if ui.button("🔄 Refresh picture").clicked() {
+            let _ = self.keyframe.send(());
+        }
+        if ui.button("❌ Disconnect").clicked() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Floating toolbar (hotkey); owns the keyboard while open.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         egui::Area::new(egui::Id::unique("toolbar"))
             .anchor(egui::Align2::CENTER_TOP, [0.0, 8.0])
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        if ui
-                            .button(if self.fullscreen {
-                                "Exit full screen"
-                            } else {
-                                "Full screen"
-                            })
-                            .clicked()
-                        {
-                            self.fullscreen = !self.fullscreen;
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(
-                                    self.fullscreen,
-                                ));
-                        }
-                        if ui.button("Refresh picture").clicked() {
-                            let _ = self.keyframe.send(());
-                        }
-                        if ui.button("Disconnect").clicked() {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
+                        self.toolbar_buttons(ui);
                         ui.label(format!("{HOTKEY_HINT} to return"));
                     });
                 });
             });
+    }
+
+    /// Fixed strip above the picture in a normal window.
+    fn toolbar_strip(&mut self, ui: &mut egui::Ui, strip: Rect, stats: &str) {
+        let mut child =
+            ui.new_child(egui::UiBuilder::new().max_rect(strip.shrink2(Vec2::new(8.0, 4.0))));
+        child.horizontal_centered(|ui| {
+            self.toolbar_buttons(ui);
+            ui.separator();
+            ui.label(egui::RichText::new(stats).color(Color32::GRAY));
+        });
     }
 }
 
@@ -454,9 +555,28 @@ impl eframe::App for ViewerApp {
             }
         }
 
-        let area = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(area, 0.0, Color32::BLACK);
-        let (_, _) = ui.allocate_exact_size(area.size(), Sense::click_and_drag());
+        let full = ui.available_rect_before_wrap();
+        let strip_h = if self.chromeless || self.fullscreen {
+            0.0
+        } else {
+            34.0
+        };
+        let (strip, area) = full.split_top_bottom_at_y(full.min.y + strip_h);
+        ui.painter().rect_filled(full, 0.0, Color32::BLACK);
+        let (_, _) = ui.allocate_exact_size(full.size(), Sense::click_and_drag());
+        if strip_h > 0.0 {
+            ui.painter()
+                .rect_filled(strip, 0.0, ui.visuals().panel_fill);
+            let stats = match &self.texture {
+                Some(t) => format!(
+                    "{}x{} · {fps:.0} fps · {kbps:.0} kbps",
+                    t.size()[0],
+                    t.size()[1]
+                ),
+                None => String::new(),
+            };
+            self.toolbar_strip(ui, strip, &stats);
+        }
         if let Some(tex) = &self.texture {
             let [w, h] = tex.size();
             let image = fit(area, Vec2::new(w as f32, h as f32));
@@ -522,6 +642,8 @@ mod tests {
             panic!("hotkey not recognised")
         };
         assert_eq!(releases.len(), 2, "A and Ctrl were held on the host");
+        // (Ctrl was released by the toggle; the modifiers on the hotkey press itself are
+        // the viewer's, never forwarded.)
         assert!(g.toolbar);
         assert!(
             matches!(g.key(egui::Key::B, true, false, none), KeyAction::Drop),
@@ -535,6 +657,79 @@ mod tests {
         assert!(
             matches!(g.key(egui::Key::B, true, true, none), KeyAction::Drop),
             "repeats are the host's job"
+        );
+    }
+
+    fn keys(a: KeyAction) -> Vec<(u16, bool)> {
+        match a {
+            KeyAction::Send(v) | KeyAction::Toggled(v) => v
+                .into_iter()
+                .map(|e| match e {
+                    InputEvent::Key { hid_usage, pressed } => (hid_usage, pressed),
+                    other => panic!("{other:?}"),
+                })
+                .collect(),
+            KeyAction::Drop => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_shift_whose_release_was_lost_is_released_before_the_next_key() {
+        use rconn_core::hid::usage as u;
+        let mut g = KeyGate::default();
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let none = egui::Modifiers::default();
+        assert_eq!(
+            keys(g.key(egui::Key::ShiftLeft, true, false, shift)),
+            vec![(u::SHIFT_LEFT, true)]
+        );
+        // The Shift key-up never arrived; the next key says Shift isn't down.
+        assert_eq!(
+            keys(g.key(egui::Key::H, true, false, none)),
+            vec![(u::SHIFT_LEFT, false), (u::A + 7, true)]
+        );
+        assert_eq!(
+            keys(g.key(egui::Key::H, false, false, none)),
+            vec![(u::A + 7, false)]
+        );
+    }
+
+    #[test]
+    fn focus_loss_releases_everything_held() {
+        let mut g = KeyGate::default();
+        let none = egui::Modifiers::default();
+        g.key(egui::Key::A, true, false, none);
+        g.key(egui::Key::B, true, false, none);
+        assert_eq!(g.release_all().len(), 2);
+        assert!(g.release_all().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_caps_lock_changes_are_full_presses_and_cmd_is_ctrl() {
+        use rconn_core::hid::usage as u;
+        let mut g = KeyGate::default();
+        let none = egui::Modifiers::default();
+        let on = keys(g.key(egui::Key::CapsLock, true, false, none));
+        let off = keys(g.key(egui::Key::CapsLock, false, false, none));
+        assert_eq!(on, vec![(u::CAPS_LOCK, true), (u::CAPS_LOCK, false)]);
+        assert_eq!(off, on, "turning it off is a press too");
+        let cmd = egui::Modifiers {
+            mac_cmd: true,
+            command: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keys(g.key(egui::Key::SuperLeft, true, false, cmd)),
+            vec![(u::CONTROL_LEFT, true)]
+        );
+        assert_eq!(
+            keys(g.key(egui::Key::C, true, false, cmd)),
+            vec![(u::A + 2, true)],
+            "Ctrl stays held while Cmd is"
         );
     }
 }

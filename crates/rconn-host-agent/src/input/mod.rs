@@ -37,6 +37,10 @@ pub trait Injector {
     fn button(&mut self, button: MouseButton, pressed: bool);
     fn wheel(&mut self, dx: f32, dy: f32);
     fn key(&mut self, hid_usage: u16, pressed: bool);
+    /// Is Caps Lock on right now? (Default: unknown, treated as off.)
+    fn caps_lock_on(&mut self) -> bool {
+        false
+    }
 }
 
 /// Handle to a running injection thread. Dropping it releases held input and stops it.
@@ -80,6 +84,14 @@ fn run(rx: mpsc::Receiver<InputEvent>) {
         while rx.recv().is_ok() {}
         return;
     };
+    // Start every session with Caps Lock off: the viewer can't know the host's lock state,
+    // and a leftover Caps Lock makes everything type in capitals.
+    if inj.caps_lock_on() {
+        let caps = rconn_core::hid::usage::CAPS_LOCK;
+        inj.key(caps, true);
+        inj.key(caps, false);
+        tracing::info!("turned Caps Lock off for the session");
+    }
     let mut held = Held::default();
     while let Ok(ev) = rx.recv() {
         match ev {

@@ -64,6 +64,7 @@ fn encode_decode_preserves_the_picture() {
             bitrate_bps: 3_000_000,
             max_fps: 30.0,
             threads: 0,
+            slice_bytes: None,
         },
     )
     .unwrap();

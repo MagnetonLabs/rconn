@@ -11,12 +11,12 @@ use windows::Win32::System::StationsAndDesktops::{
     DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, OpenInputDesktop, SetThreadDesktop,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    SendInput, VIRTUAL_KEY,
+    SendInput, VIRTUAL_KEY, VK_CAPITAL,
 };
 
 const WHEEL_DELTA: f32 = 120.0;
@@ -79,6 +79,14 @@ impl SendInputInjector {
 }
 
 impl Injector for SendInputInjector {
+    fn caps_lock_on(&mut self) -> bool {
+        if !self.attached {
+            self.attach();
+        }
+        // Low bit of GetKeyState = toggle state.
+        unsafe { GetKeyState(i32::from(VK_CAPITAL.0)) & 1 == 1 }
+    }
+
     fn pointer_move(&mut self, x: f32, y: f32) {
         // Absolute coordinates are 0..=65535 across the primary display, which is what we
         // capture (output 0).

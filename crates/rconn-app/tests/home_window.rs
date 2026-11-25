@@ -133,3 +133,24 @@ fn renders_each_tab() {
     no_host.tab = Tab::Settings;
     render("home-not-a-host", no_host);
 }
+
+/// The session window's toolbar labels (rconn-viewer) render with the bundled fonts.
+#[test]
+fn session_toolbar_glyphs_render() {
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(600.0, 60.0))
+        .build_ui(|ui| {
+            ui.horizontal(|ui| {
+                for t in [
+                    "🔳 Full screen",
+                    "🔄 Refresh picture",
+                    "❌ Disconnect",
+                    "1496x938 · 45 fps",
+                ] {
+                    let _ = ui.button(t);
+                }
+            });
+        });
+    harness.run();
+    harness.render().expect("render");
+}

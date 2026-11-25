@@ -36,6 +36,7 @@ fn encode_threads_1080p() {
                 bitrate_bps: 6_000_000,
                 max_fps: 30.0,
                 threads,
+                slice_bytes: None,
             },
         )
         .unwrap();
