@@ -48,7 +48,16 @@ fn main() -> anyhow::Result<()> {
     if !args.iter().any(|a| a == "--no-tray")
         && let Ok(exe) = std::env::current_exe()
     {
-        let _ = std::process::Command::new(exe).arg("--tray").spawn();
+        // macOS: the helper app inside the bundle (its own app, so macOS doesn't mistake
+        // the menu-bar icon for an open rconn window).
+        let helper = exe
+            .parent()
+            .and_then(|d| d.parent())
+            .map(|c| c.join("Helpers/rconn-tray.app/Contents/MacOS/rconn-tray"));
+        let _ = match helper.filter(|h| h.exists()) {
+            Some(h) => std::process::Command::new(h).spawn(),
+            None => std::process::Command::new(exe).arg("--tray").spawn(),
+        };
     }
 
     let paths = Paths::installed();

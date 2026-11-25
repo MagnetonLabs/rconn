@@ -57,10 +57,28 @@ fn quit_app() {
     }
 }
 
+/// Open (or bring forward) the main window.
 fn open_window() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).spawn(); // single-instance: focuses an open window
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // macOS: this runs inside rconn.app/Contents/Helpers/rconn-tray.app; let macOS open
+    // the outer app, which also brings an already-open window forward.
+    if let Some(app) = exe.ancestors().find(|p| {
+        p.extension().is_some_and(|e| e == "app")
+            && p.file_name().is_some_and(|n| n != "rconn-tray.app")
+    }) {
+        let _ = std::process::Command::new("open").arg(app).spawn();
+        return;
     }
+    // Windows / unpackaged: the window binary sits next to this one.
+    let is_tray_binary = exe.file_stem().is_some_and(|s| s == "rconn-tray");
+    let window = if is_tray_binary {
+        exe.with_file_name(format!("rconn{}", std::env::consts::EXE_SUFFIX))
+    } else {
+        exe
+    };
+    let _ = std::process::Command::new(window).spawn(); // single-instance: focuses an open window
 }
 
 impl Tray {

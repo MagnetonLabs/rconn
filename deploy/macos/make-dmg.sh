@@ -11,6 +11,27 @@ trap 'rm -rf "$work"' EXIT
 app="$work/dmg/rconn.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$stage/rconn" "$stage/rconn-viewer" "$app/Contents/MacOS/"
+# Menu-bar icon: its own helper app (own bundle id, no Dock icon), so macOS still opens the
+# window when rconn is launched while the icon runs.
+helper="$app/Contents/Helpers/rconn-tray.app"
+mkdir -p "$helper/Contents/MacOS"
+cp "$stage/rconn-tray" "$helper/Contents/MacOS/"
+cat > "$helper/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>rconn tray</string>
+  <key>CFBundleIdentifier</key><string>app.rconn.tray</string>
+  <key>CFBundleExecutable</key><string>rconn-tray</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>${version}</string>
+  <key>CFBundleVersion</key><string>${version}</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+PLIST
 # Cisco's openh264 goes in Resources, untouched: it is Cisco-signed, and the loader checks
 # its hash, so it must never be re-signed (no `codesign --deep`).
 cp "$stage"/libopenh264-*.dylib "$here/rconn.icns" "$app/Contents/Resources/"
@@ -34,6 +55,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+codesign --force --sign - "$helper" 2>/dev/null
 codesign --force --sign - "$app/Contents/MacOS/rconn-viewer" 2>/dev/null
 codesign --force --sign - "$app" 2>/dev/null
 codesign --verify --strict "$app"

@@ -31,7 +31,7 @@ cargo build -q --release -p rconn-viewer -p rconn-app
 cargo build -q --release -p rconn-viewer -p rconn-app --target x86_64-apple-darwin
 stage=dist/rconn-macos
 mkdir -p "$stage"
-for bin in rconn-viewer rconn; do
+for bin in rconn-viewer rconn rconn-tray; do
   lipo -create -output "$stage/$bin" "target/release/$bin" "target/x86_64-apple-darwin/release/$bin"
 done
 cp "$(scripts/fetch-openh264.sh mac-arm64)" "$(scripts/fetch-openh264.sh mac-x64)" "$stage/"
