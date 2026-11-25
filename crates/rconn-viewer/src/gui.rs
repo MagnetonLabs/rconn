@@ -290,6 +290,7 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             *ctx_slot.lock().expect("ctx") = Some(cc.egui_ctx.clone());
             let first = open_tab(args, ctx_slot.clone());
             Ok(Box::new(Window {
+                title: String::new(),
                 tabs: vec![first],
                 active: 0,
                 incoming: tab_rx,
@@ -302,6 +303,8 @@ pub fn run(args: ConnectArgs) -> Result<()> {
 
 /// The session window: one tab per remote computer.
 struct Window {
+    /// Title last set on the OS window.
+    title: String,
     tabs: Vec<ViewerApp>,
     active: usize,
     incoming: std::sync::mpsc::Receiver<ConnectArgs>,
@@ -413,11 +416,14 @@ impl eframe::App for Window {
             self.tab_strip(ui);
         }
         let tab = &mut self.tabs[self.active];
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                "rconn — {}",
-                tab.name
-            )));
+        // Only on change: every viewport command makes egui repaint, so sending the title
+        // each frame would redraw the window nonstop (100%+ CPU).
+        let title = format!("rconn — {}", tab.name);
+        if self.title != title {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
         tab.draw(ui);
     }
 }
@@ -1438,6 +1444,7 @@ mod render_tests {
         let mut second = app(false, false);
         second.name = "BUILD-BOX".into();
         let window = Window {
+            title: String::new(),
             tabs: vec![app(false, false), second],
             active: 1,
             incoming,
