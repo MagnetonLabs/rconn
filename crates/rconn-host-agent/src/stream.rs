@@ -8,10 +8,10 @@
 //!   or when a large area changes (scrolling, video); small background changes (spinners,
 //!   blinking carets) are batched to a few frames per second.
 
+use crate::frames::Frames;
 use anyhow::Result;
 use rconn_media::capture::{Captured, Capturer};
 use rconn_media::video::{EncoderSettings, VideoEncoder, should_retarget};
-use rconn_media::yuv::I420;
 use rconn_peer::video::{TargetBitrate, VideoSender};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -196,7 +196,7 @@ fn run_generation(
 ) -> Result<bool> {
     let cfg = &ctx.cfg;
     let budget = Duration::from_secs(1) / cfg.max_fps.max(1);
-    let mut cap = make()?;
+    let cap = make()?;
     let mut enc = VideoEncoder::new(
         &cfg.openh264,
         EncoderSettings {
@@ -206,8 +206,8 @@ fn run_generation(
             slice_bytes: None,
         },
     )?;
-    let mut picture: Option<I420> = None;
-    let mut small: Option<I420> = None;
+    // The picture: in memory, or on the GPU on Windows when a hardware encoder takes it.
+    let mut frames = Frames::new(cap, &mut enc, cfg.max_size);
     let mut motion = false;
     let mut big_streak = 0u32;
     let mut last_big = Instant::now();
@@ -254,12 +254,12 @@ fn run_generation(
             .unwrap_or(Duration::from_millis(100))
             .clamp(Duration::from_millis(1), Duration::from_millis(100));
         let t0 = Instant::now();
-        match cap.next_into(timeout, &mut picture, cfg.max_size) {
+        match frames.next(timeout, cfg.max_size) {
             Ok(Some(c)) => {
                 stats.capture += t0.elapsed();
                 stats.captures += 1;
                 if !produced {
-                    let (w, h) = picture.as_ref().map_or((0, 0), I420::dimensions);
+                    let (w, h) = frames.dimensions().unwrap_or_default();
                     tracing::info!(
                         w,
                         h,
@@ -288,7 +288,7 @@ fn run_generation(
             }
             Err(e) => return Err(e.into()),
         }
-        let Some(pic) = picture.as_ref() else {
+        let Some((w, h)) = frames.dimensions() else {
             continue;
         };
 
@@ -301,7 +301,6 @@ fn run_generation(
         if force {
             enc.request_keyframe();
         }
-        let (w, h) = pic.dimensions();
         let may_halve = cfg.motion_half_res && w * h >= MOTION_MIN_PIXELS;
         // Motion over: one sharp full-size picture.
         let sharpen = motion && last_big.elapsed() >= MOTION_SETTLE;
@@ -350,13 +349,11 @@ fn run_generation(
             motion = true;
         }
         let t0 = Instant::now();
-        let encoded = if motion && may_halve {
-            pic.half_into(&mut small);
+        let half = motion && may_halve;
+        if half {
             stats.half += 1;
-            enc.encode_yuv(small.as_ref().expect("allocated by half_into"), None)?
-        } else {
-            enc.encode_yuv(pic, Some(rows))?
-        };
+        }
+        let encoded = frames.encode(&mut enc, half, rows)?;
         stats.encode += t0.elapsed();
         last_encode = Instant::now();
         if urgent {
@@ -397,7 +394,7 @@ fn run_generation(
                 break; // the session ended
             }
         }
-        stats.maybe_log(pic.dimensions(), ctx.target.get());
+        stats.maybe_log((w, h), ctx.target.get());
     }
     Ok(produced)
 }

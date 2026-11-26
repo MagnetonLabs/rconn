@@ -129,6 +129,17 @@ pub struct VideoEncoder {
     scale: f32,
     last_was_key: bool,
     force_key: bool,
+    /// Windows: encoders are built to read D3D11 textures on this device
+    /// ([`Self::use_gpu`]).
+    #[cfg(windows)]
+    gpu: Option<crate::d3d11::GpuDevice>,
+}
+
+/// A picture to encode: in memory, or (Windows) a texture on the GPU.
+enum Input<'a> {
+    Yuv(&'a I420, Option<(usize, usize)>),
+    #[cfg(windows)]
+    Gpu(&'a crate::d3d11::GpuFrame),
 }
 
 impl VideoEncoder {
@@ -152,10 +163,57 @@ impl VideoEncoder {
             scale: 1.0,
             last_was_key: false,
             force_key: false,
+            #[cfg(windows)]
+            gpu: None,
         })
     }
 
+    /// Windows: encode D3D11 textures on `gpu` from now on ([`Self::encode_gpu`]), with a
+    /// D3D11-aware hardware encoder, built and tested here for `size`. On error (no such
+    /// encoder) nothing changes.
+    #[cfg(windows)]
+    pub fn use_gpu(
+        &mut self,
+        gpu: &crate::d3d11::GpuDevice,
+        size: (usize, usize),
+    ) -> Result<(), CodecError> {
+        let mf = self.build_d3d11(gpu, size.0, size.1)?;
+        self.gpu = Some(gpu.clone());
+        self.encoder = Some(Engine::MediaFoundation(mf));
+        self.dims = Some(size);
+        self.spare = None;
+        self.headers.clear();
+        self.nv12.clear();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn build_d3d11(
+        &mut self,
+        gpu: &crate::d3d11::GpuDevice,
+        width: usize,
+        height: usize,
+    ) -> Result<crate::mf::MfH264Encoder, CodecError> {
+        let mf = crate::mf::MfH264Encoder::new_d3d11(
+            gpu,
+            width as u32,
+            height as u32,
+            self.settings.max_fps.round().max(1.0) as u32,
+            self.settings.bitrate_bps,
+            std::env::var("RCONN_TEXTURE_ENCODER").is_ok_and(|v| v == "software"),
+        )?;
+        self.engine_name = format!("Media Foundation D3D11 ({})", mf.name());
+        Ok(mf)
+    }
+
     fn build(&mut self, width: usize, height: usize) -> Result<Engine, CodecError> {
+        #[cfg(windows)]
+        if let Some(gpu) = self.gpu.clone() {
+            // Textures in: only a texture encoder will do (the caller falls back).
+            return Ok(Engine::MediaFoundation(
+                self.build_d3d11(&gpu, width, height)?,
+            ));
+        }
         #[cfg(windows)]
         match crate::mf::MfH264Encoder::new(
             width as u32,
@@ -272,7 +330,28 @@ impl VideoEncoder {
         yuv: &I420,
         changed_rows: Option<(usize, usize)>,
     ) -> Result<Option<Vec<u8>>, CodecError> {
-        let (w, h) = yuv.dimensions();
+        self.encode_input(yuv.dimensions(), Input::Yuv(yuv, changed_rows))
+    }
+
+    /// Windows: encode the GPU picture `frame` (the captured desktop) at `size` (even),
+    /// converted and scaled on the GPU. Needs [`Self::use_gpu`] first.
+    #[cfg(windows)]
+    pub fn encode_gpu(
+        &mut self,
+        frame: &crate::d3d11::GpuFrame,
+        size: (usize, usize),
+    ) -> Result<Option<Vec<u8>>, CodecError> {
+        if self.gpu.is_none() {
+            return Err(CodecError::OpenH264("encode_gpu without use_gpu".into()));
+        }
+        self.encode_input(size, Input::Gpu(frame))
+    }
+
+    fn encode_input(
+        &mut self,
+        (w, h): (usize, usize),
+        input: Input<'_>,
+    ) -> Result<Option<Vec<u8>>, CodecError> {
         if self.dims != Some((w, h)) || self.encoder.is_none() {
             // Switching between two sizes (full / half while things move) reuses the
             // encoder kept for the other size; its next frame must be a keyframe.
@@ -297,8 +376,8 @@ impl VideoEncoder {
             }
         }
         let force_key = std::mem::take(&mut self.force_key);
-        let out = match self.encoder.as_mut().expect("built above") {
-            Engine::OpenH264(encoder) => {
+        let out = match (self.encoder.as_mut().expect("built above"), input) {
+            (Engine::OpenH264(encoder), Input::Yuv(yuv, _)) => {
                 if force_key {
                     encoder.force_intra_frame();
                 }
@@ -312,7 +391,7 @@ impl VideoEncoder {
                 bits.to_vec()
             }
             #[cfg(windows)]
-            Engine::MediaFoundation(mf) => {
+            (Engine::MediaFoundation(mf), Input::Yuv(yuv, changed_rows)) => {
                 if force_key {
                     mf.force_keyframe();
                 }
@@ -321,8 +400,22 @@ impl VideoEncoder {
                 self.last_was_key = has_idr(&out);
                 out
             }
+            #[cfg(windows)]
+            (Engine::MediaFoundation(mf), Input::Gpu(frame)) => {
+                if force_key {
+                    mf.force_keyframe();
+                }
+                let out = mf.encode_frame(frame)?;
+                self.last_was_key = has_idr(&out);
+                out
+            }
+            #[cfg(windows)]
+            (Engine::OpenH264(_), Input::Gpu(_)) => {
+                return Err(CodecError::OpenH264(
+                    "openh264 can't encode GPU textures".into(),
+                ));
+            }
         };
-        let _ = changed_rows; // only the NV12 path can use it
         // A keyframe asked for (a viewer lost its picture) is owed until one comes out: the
         // rate controller may skip the frame it was asked of, and a viewer without a
         // picture has nothing to show until it gets one.

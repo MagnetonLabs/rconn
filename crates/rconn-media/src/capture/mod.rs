@@ -54,6 +54,13 @@ pub trait Capturer: Send {
         };
         Ok(convert_whole(frame, picture, max))
     }
+
+    /// The Desktop Duplication capturer behind this one, for keeping frames on the GPU
+    /// ([`dxgi::DxgiCapturer::enable_gpu`]).
+    #[cfg(windows)]
+    fn as_dxgi(&mut self) -> Option<&mut dxgi::DxgiCapturer> {
+        None
+    }
 }
 
 /// What [`Capturer::next_into`] changed.

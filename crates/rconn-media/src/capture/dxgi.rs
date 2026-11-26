@@ -69,7 +69,13 @@ pub struct DxgiCapturer {
     started: Instant,
     /// DXGI "access lost" count (logged sparingly).
     access_lost: u32,
+    /// Frames kept on the GPU (see [`gpu`]), when enabled.
+    gpu: Option<gpu::GpuState>,
 }
+
+/// Keeping frames on the GPU for a hardware encoder.
+#[path = "dxgi_gpu.rs"]
+mod gpu;
 
 /// With no first image from DXGI after this long, grab one through GDI instead.
 const FIRST_FRAME_FALLBACK: Duration = Duration::from_millis(500);
@@ -120,6 +126,7 @@ impl DxgiCapturer {
                     want_full: true,
                     started: Instant::now(),
                     access_lost: 0,
+                    gpu: None,
                 });
             }
             Err(CaptureError::NoOutput)
@@ -485,6 +492,10 @@ impl DxgiCapturer {
 }
 
 impl Capturer for DxgiCapturer {
+    fn as_dxgi(&mut self) -> Option<&mut DxgiCapturer> {
+        Some(self)
+    }
+
     fn next_into(
         &mut self,
         timeout: Duration,
