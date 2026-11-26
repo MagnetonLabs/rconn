@@ -78,20 +78,6 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
         .spacing([16.0, 8.0])
         .striped(true)
         .show(ui, |ui| {
-            row(ui, "Server URL", locks[0], |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut form.server_url)
-                        .desired_width(320.0)
-                        .hint_text("wss://server:443/v1/ws"),
-                )
-            });
-            row(ui, "Server pin", locks[1], |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut form.server_pin)
-                        .desired_width(320.0)
-                        .hint_text("sha256:… (empty for a public certificate)"),
-                )
-            });
             row(ui, "Session indicator", locks[2], |ui| {
                 egui::ComboBox::from_id_salt("hidden_mode")
                     .selected_text(match form.hidden_mode {
@@ -204,6 +190,19 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
                     .response
             });
         });
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new("Advanced: self-hosted server")
+        .id_salt("host_self_hosted_server")
+        .default_open(self_hosted(&form.server_url, &form.server_pin))
+        .show(ui, |ui| {
+            server_fields(
+                ui,
+                "host_server",
+                &mut form.server_url,
+                &mut form.server_pin,
+                [locks[0], locks[1]],
+            );
+        });
 
     if let Some(msg) = access_msg {
         m.messages = vec![msg];
@@ -243,6 +242,62 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
         ui.colored_label(color, text.as_str());
     }
     actions
+}
+
+/// A server other than the public one (or a pin) is set: show its fields open.
+pub fn self_hosted(url: &str, pin: &str) -> bool {
+    let url = url.trim();
+    !pin.trim().is_empty() || (!url.is_empty() && url != rconn_core::DEFAULT_SERVER)
+}
+
+/// Server URL and pin: only for a self-hosted server. The pin is only for one without a
+/// public certificate (its setup prints it); everyone else leaves both empty.
+pub fn server_fields(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    url: &mut String,
+    pin: &mut String,
+    locks: [Option<&'static str>; 2],
+) {
+    // Two columns: a text field in a middle column would shrink to last frame's width.
+    let fields = [
+        ("Server URL", url, "wss://your-server:443/v1/ws", locks[0]),
+        ("Server pin", pin, "sha256:… (usually empty)", locks[1]),
+    ];
+    egui::Grid::new(id_salt)
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            for (label, text, hint, lock) in fields {
+                let label_id = ui.label(label).id;
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        lock.is_none(),
+                        egui::TextEdit::singleline(text)
+                            .desired_width(340.0)
+                            .hint_text(hint),
+                    )
+                    .labelled_by(label_id);
+                    if let Some(why) = lock {
+                        ui.label(
+                            RichText::new(format!("🔒 {why}"))
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                    }
+                });
+                ui.end_row();
+            }
+        });
+    ui.label(
+        RichText::new(
+            "URL empty: the public Rconn server. Pin: leave empty unless your server's setup \
+             printed a pin (sha256:…).",
+        )
+        .small()
+        .color(Color32::GRAY),
+    );
+    ui.add_space(4.0);
 }
 
 /// One labelled setting. The control is linked to its label for screen readers.
