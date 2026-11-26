@@ -166,6 +166,18 @@ struct Shared {
     kbps: f32,
     /// Mean decode time per picture over the last second.
     decode_ms: f32,
+    /// Mean host time (capture to encoded) and receive time (first to last packet of a
+    /// frame) over the last second; host time only from hosts that tag their frames.
+    host_ms: Option<f32>,
+    receive_ms: f32,
+}
+
+/// Mean per-frame milliseconds in the stages the stats line shows.
+#[derive(Clone, Copy)]
+struct StageMs {
+    host: Option<f32>,
+    receive: f32,
+    decode: f32,
 }
 
 /// Local port of the open session window: later connections become tabs in it.
@@ -553,7 +565,8 @@ async fn session(
             }
         }
     };
-    let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
+    // Keyframe requests and frame feedback from the decode loop.
+    let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<Control>();
     // File transfer: its own channel, opened on first use once the session is let in.
     let (allowed_tx, allowed_rx) = tokio::sync::watch::channel(false);
     let files_repaint = {
@@ -648,8 +661,8 @@ async fn session(
                 Some(c) = kf_from_ui.recv() => if open {
                     send(dc.clone(), DataMessage::Control(c)).await;
                 },
-                req = kf_rx.recv() => if req.is_some() && open {
-                    send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
+                Some(c) = kf_rx.recv() => if open {
+                    send(dc.clone(), DataMessage::Control(c)).await;
                 },
             }
         }
@@ -712,6 +725,10 @@ async fn session(
     // Lost packets, decode errors, or video with no picture coming out of it: ask for a
     // fresh keyframe (throttled; each one costs the host a full-size encode).
     let mut need = KeyframeNeed::default();
+    // With a host that tags its frames: which frames arrived intact, and what to tell it
+    // (acknowledgements; a loss it can repair without a keyframe).
+    let mut integrity = rconn_peer::frames::Integrity::default();
+    let mut stages = rconn_peer::frames::StageTimes::default();
     // Wakes the loop without packets: a lost keyframe on a still screen sends nothing more.
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -729,17 +746,39 @@ async fn session(
                 need.data(Instant::now());
             }
             let aus = rx.push(pkt);
-            // Video data was lost for good: later pictures build on a broken one.
+            if let Some(d) = rx.take_assembly() {
+                stages.received(d);
+            }
+            // Video data was lost for good: later pictures build on a broken one. A host
+            // that tags its frames hears of it by frame id (below) and repairs it.
             if rx.take_loss() {
                 tracing::warn!("video packets lost");
-                need.lost();
+                if !integrity.active() {
+                    need.lost();
+                }
             }
             for au in aus {
                 bytes += au.len();
+                let tag = rconn_peer::frames::read(&au);
+                match &tag {
+                    Some(t) => {
+                        stages.host(t.host_us);
+                        rx.set_early_after_gaps(true);
+                        if integrity.frame(t) == rconn_peer::frames::Verdict::Skip {
+                            continue; // builds on a lost frame: wait for the repair
+                        }
+                    }
+                    None if integrity.active() => {
+                        integrity.untagged();
+                        continue;
+                    }
+                    None => {}
+                }
                 match dec.decode(&au) {
                     Ok(Some(f)) => {
                         frames += 1;
                         decode_time += f.decode_time;
+                        stages.decoded(f.decode_time);
                         need.picture();
                         let mut s = shared.lock().expect("ui state");
                         s.frame = Some(f);
@@ -750,14 +789,29 @@ async fn session(
                     Ok(None) => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "decode error");
-                        need.lost();
+                        match tag {
+                            Some(t) => integrity.decode_failed(t.id),
+                            None => need.lost(),
+                        }
                     }
                 }
             }
         }
+        if let Some(f) = integrity.poll(Instant::now()) {
+            if f.lost {
+                tracing::info!(
+                    last_good = f.decoded,
+                    "video frames lost; asking for a repair"
+                );
+            }
+            let _ = kf_tx.send(Control::FrameAck {
+                decoded: f.decoded,
+                lost: f.lost,
+            });
+        }
         if need.poll(Instant::now()) {
             tracing::warn!("no picture from the video; requesting keyframe");
-            let _ = kf_tx.send(());
+            let _ = kf_tx.send(Control::RequestKeyframe);
         }
         if since.elapsed() >= Duration::from_secs(1) {
             let secs = since.elapsed().as_secs_f32();
@@ -767,6 +821,9 @@ async fn session(
             if frames > 0 {
                 s.decode_ms = decode_time.as_secs_f32() * 1e3 / frames as f32;
             }
+            let (host_ms, receive_ms) = stages.take_second();
+            s.host_ms = host_ms;
+            s.receive_ms = receive_ms;
             drop(s);
             (frames, bytes, since) = (0, 0, Instant::now());
             decode_time = Duration::ZERO;
@@ -1144,10 +1201,17 @@ impl ViewerApp {
         }
     }
 
-    fn stats(&self, fps: f32, kbps: f32, decode_ms: f32) -> String {
+    fn stats(&self, fps: f32, kbps: f32, times: StageMs) -> String {
+        // Per-frame time in each stage: host (capture to encoded), receive (first to
+        // last packet), decode, upload.
+        let host = times
+            .host
+            .map_or(String::new(), |h| format!("host {h:.1} + "));
         match self.frame_size {
             Some([w, h]) => format!(
-                "{w}x{h}  ·  {fps:.0} fps  ·  {kbps:.0} kbps  ·  decode {decode_ms:.1} + upload {:.1} ms",
+                "{w}x{h}  ·  {fps:.0} fps  ·  {kbps:.0} kbps  ·  {host}receive {:.1} + decode {:.1} + upload {:.1} ms",
+                times.receive,
+                times.decode,
                 self.video.upload_ms()
             ),
             None => "connecting…".into(),
@@ -1369,9 +1433,14 @@ impl ViewerApp {
     }
 
     fn draw(&mut self, ui: &mut egui::Ui) {
-        let (new_frame, status, fps, kbps, decode_ms) = {
+        let (new_frame, status, fps, kbps, times) = {
             let mut s = self.shared.lock().expect("ui state");
-            (s.frame.take(), s.status.clone(), s.fps, s.kbps, s.decode_ms)
+            let times = StageMs {
+                host: s.host_ms,
+                receive: s.receive_ms,
+                decode: s.decode_ms,
+            };
+            (s.frame.take(), s.status.clone(), s.fps, s.kbps, times)
         };
         if let Some(f) = new_frame {
             // The YUV planes go to the GPU as they are (see `video_render`).
@@ -1393,7 +1462,7 @@ impl ViewerApp {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
-        let stats = self.stats(fps, kbps, decode_ms);
+        let stats = self.stats(fps, kbps, times);
         self.last_stats.clone_from(&stats);
         let ctx = ui.ctx().clone();
         self.restart_dialog(&ctx);
@@ -1661,6 +1730,8 @@ mod render_tests {
             fps: 29.0,
             kbps: 2400.0,
             decode_ms: 2.0,
+            host_ms: Some(6.0),
+            receive_ms: 3.0,
         }));
         let keys = KeyGate {
             toolbar: hotkey,

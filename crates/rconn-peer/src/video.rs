@@ -132,7 +132,7 @@ impl TargetBitrate {
     /// has fallen below that by the end, it starts again from it. Returns a ticket for
     /// [`Self::cancel_shield`].
     pub fn shield(&self, window: Duration) -> ShieldTicket {
-        let floor = self.get();
+        let floor = self.estimate();
         let mut s = self.shield.lock().expect("shield");
         let until = Instant::now() + window;
         // Only a shield this call started may be cancelled by it.
@@ -476,6 +476,13 @@ pub struct VideoReceiver {
     frame_end: Option<u16>,
     /// RTP timestamps of the frames handed out lately (each frame goes out once).
     delivered: VecDeque<u32>,
+    /// When the first packet of the frame in progress arrived.
+    frame_started: Option<Instant>,
+    /// First to last packet of the last frame completed in order (stats).
+    assembly: Option<Duration>,
+    /// Also hand out complete frames that follow a gap at once (see
+    /// [`Self::set_early_after_gaps`]).
+    early_after_gaps: bool,
 }
 
 impl Default for VideoReceiver {
@@ -494,6 +501,9 @@ impl Default for VideoReceiver {
             frame: Vec::new(),
             frame_end: None,
             delivered: VecDeque::new(),
+            frame_started: None,
+            assembly: None,
+            early_after_gaps: false,
         }
     }
 }
@@ -530,6 +540,9 @@ impl VideoReceiver {
         let (seq, ts) = (p.header.sequence_number, p.header.timestamp);
         // Right after the previous frame's end, or the stream's first packet.
         let follows_end = self.frame_end.is_none_or(|end| end == seq.wrapping_sub(1));
+        // After a gap, a frame starting with the first packet of a NAL unit may still be
+        // missing a leading NAL unit; tagged streams catch that (no tag, or an id gap).
+        let may_start = follows_end || self.early_after_gaps;
         if p.payload.is_empty() {
             // Padding: keeps the chain unbroken, belongs to no frame.
             if follows_end {
@@ -543,8 +556,9 @@ impl VideoReceiver {
         });
         if continues {
             self.frame.push(p.clone());
-        } else if follows_end && H264Packet::default().is_partition_head(&p.payload) {
+        } else if may_start && H264Packet::default().is_partition_head(&p.payload) {
             self.frame = vec![p.clone()];
+            self.frame_started = Some(Instant::now());
         } else {
             self.frame.clear();
         }
@@ -553,6 +567,9 @@ impl VideoReceiver {
         }
         self.frame_end = Some(seq);
         let frame = std::mem::take(&mut self.frame);
+        if !frame.is_empty() {
+            self.assembly = self.frame_started.take().map(|t| t.elapsed());
+        }
         if frame.is_empty() {
             return None;
         }
@@ -578,6 +595,21 @@ impl VideoReceiver {
 
     /// Were packets lost for good since the last call? (Then ask the host for a keyframe:
     /// later pictures build on the incomplete one.)
+    /// Hand out a complete frame at once even when packets before it were lost, instead
+    /// of after [`LOSS_GIVE_UP`]: for streams whose frames carry ids, where the viewer
+    /// knows from the ids what is missing and asks the host to repair it. Saves 250 ms
+    /// per loss; frames can then come out of order (a late retransmission), which the
+    /// ids also show.
+    pub fn set_early_after_gaps(&mut self, on: bool) {
+        self.early_after_gaps = on;
+    }
+
+    /// How long the last frame took to arrive, its first packet to its last (frames
+    /// completed in order; `None` since the last call otherwise).
+    pub fn take_assembly(&mut self) -> Option<Duration> {
+        self.assembly.take()
+    }
+
     pub fn take_loss(&mut self) -> bool {
         std::mem::take(&mut self.lost)
     }

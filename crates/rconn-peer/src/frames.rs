@@ -212,8 +212,16 @@ impl Integrity {
         }
     }
 
-    /// A tagged frame arrived (in order).
+    /// A tagged frame arrived.
     pub fn frame(&mut self, tag: &FrameTag) -> Verdict {
+        // Older than one already seen (a late retransmission after a repair was asked
+        // for): too late to show, and no news.
+        if self
+            .last_id
+            .is_some_and(|l| tag.id.wrapping_sub(l).wrapping_sub(1) > u32::MAX / 2)
+        {
+            return Verdict::Skip;
+        }
         let follows = self.last_id.is_some_and(|l| tag.id == l.wrapping_add(1));
         self.last_id = Some(tag.id);
         if tag.key {
@@ -234,6 +242,14 @@ impl Integrity {
         // A gap: frames between went missing (or the stream started without a keyframe).
         self.breaks();
         Verdict::Skip
+    }
+
+    /// A frame without a tag from a host that tags them: its first packets (the tag's)
+    /// were lost.
+    pub fn untagged(&mut self) {
+        if self.active() {
+            self.breaks();
+        }
     }
 
     /// The decoder could not make the frame `id` (it was handed as intact).
@@ -283,6 +299,82 @@ impl Integrity {
             });
         }
         None
+    }
+}
+
+/// The viewer's per-stage timing: host (capture to encoded, from the tags), receive
+/// (first to last packet of a frame), decode. Averaged per second for the stats line,
+/// and logged every 5 s.
+#[derive(Debug, Default)]
+pub struct StageTimes {
+    second: Sums,
+    log: Sums,
+    log_since: Option<Instant>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Sums {
+    host_us: u64,
+    hosts: u32,
+    receive: Duration,
+    receives: u32,
+    decode: Duration,
+    decodes: u32,
+}
+
+impl Sums {
+    fn ms(total_us: f64, n: u32) -> f32 {
+        (total_us / 1000.0 / f64::from(n.max(1))) as f32
+    }
+    fn host_ms(&self) -> Option<f32> {
+        (self.hosts > 0).then(|| Self::ms(self.host_us as f64, self.hosts))
+    }
+    fn receive_ms(&self) -> f32 {
+        Self::ms(self.receive.as_micros() as f64, self.receives)
+    }
+    fn decode_ms(&self) -> f32 {
+        Self::ms(self.decode.as_micros() as f64, self.decodes)
+    }
+}
+
+impl StageTimes {
+    pub fn host(&mut self, us: u32) {
+        for s in [&mut self.second, &mut self.log] {
+            s.host_us += u64::from(us);
+            s.hosts += 1;
+        }
+    }
+
+    pub fn received(&mut self, d: Duration) {
+        for s in [&mut self.second, &mut self.log] {
+            s.receive += d;
+            s.receives += 1;
+        }
+    }
+
+    pub fn decoded(&mut self, d: Duration) {
+        for s in [&mut self.second, &mut self.log] {
+            s.decode += d;
+            s.decodes += 1;
+        }
+        let since = *self.log_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= Duration::from_secs(5) {
+            let l = std::mem::take(&mut self.log);
+            tracing::info!(
+                host_ms = l.host_ms().map(|m| format!("{m:.1}")),
+                receive_ms = format!("{:.1}", l.receive_ms()),
+                decode_ms = format!("{:.1}", l.decode_ms()),
+                frames = l.decodes,
+                "video stages"
+            );
+            self.log_since = Some(Instant::now());
+        }
+    }
+
+    /// (host, receive) ms per frame over the last second; starts the next second.
+    pub fn take_second(&mut self) -> (Option<f32>, f32) {
+        let s = std::mem::take(&mut self.second);
+        (s.host_ms(), s.receive_ms())
     }
 }
 
@@ -350,6 +442,11 @@ mod tests {
         );
         assert!(g.poll(now + Duration::from_millis(300)).is_some(), "again");
         assert_eq!(g.frame(&t(18)), Verdict::Skip);
+        assert_eq!(
+            g.frame(&t(16)),
+            Verdict::Skip,
+            "late retransmission: too late"
+        );
         // A repair from a frame we never had does not heal.
         let bad = FrameTag {
             recovers_from: Some(16),
