@@ -181,6 +181,43 @@ unsafe extern "C" {
         alloc: CFTypeRef,
         out: *mut c_void,
     ) -> OSStatus;
+    static kVTVideoEncoderList_CodecType: CFTypeRef;
+    static kVTVideoEncoderList_IsHardwareAccelerated: CFTypeRef;
+    fn VTCopyVideoEncoderList(options: CFTypeRef, out: *mut CFTypeRef) -> OSStatus;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFNumberGetValue(number: CFTypeRef, kind: isize, value: *mut c_void) -> u8;
+}
+
+/// Is there a VideoToolbox encoder for `codec` (a hardware one, if `hardware`)? Read from
+/// the encoder list, without starting one.
+pub fn encoder_exists(codec: rconn_core::codec::VideoCodec, hardware: bool) -> bool {
+    let want = crate::vt::codec_type(codec);
+    // SAFETY: the list is ours (released by `Cf`); its dictionaries and values are only
+    // read while it lives.
+    unsafe {
+        let mut list: CFTypeRef = ptr::null();
+        if VTCopyVideoEncoderList(ptr::null(), &mut list) != 0 || list.is_null() {
+            return false;
+        }
+        let list = Cf(list);
+        (0..CFArrayGetCount(list.0)).any(|i| {
+            let e = CFArrayGetValueAtIndex(list.0, i);
+            let kind = CFDictionaryGetValue(e, kVTVideoEncoderList_CodecType);
+            let mut v = 0i32;
+            if kind.is_null()
+                || CFNumberGetValue(kind, kCFNumberSInt32Type, (&raw mut v).cast()) == 0
+                || v as u32 != want
+            {
+                return false;
+            }
+            !hardware
+                || CFDictionaryGetValue(e, kVTVideoEncoderList_IsHardwareAccelerated)
+                    == kCFBooleanTrue
+        })
+    }
 }
 
 const kCMVideoCodecType_H264: u32 = u32::from_be_bytes(*b"avc1");

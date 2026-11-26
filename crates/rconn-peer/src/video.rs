@@ -1,9 +1,11 @@
-//! Video over WebRTC: H.264 codec registration, send-side congestion control ([`Bwe`])
-//! with its estimate published for the encoder, and the H.264 track on each side.
+//! Video over WebRTC: codec registration (H.264, and HEVC/AV1 where both ends can),
+//! send-side congestion control ([`Bwe`]) with its estimate published for the encoder,
+//! and the video track on each side.
 
 use crate::bwe::{Bwe, PACING_FACTOR};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+pub use rconn_core::codec::VideoCodec;
 use rtc::interceptor::{
     BandwidthEstimator, CongestionControlBuilder, EstimatorStats, PacerBuilder, PacketReport,
     Registry, Slot, TwccReceiverBuilder, TwccSenderBuilder,
@@ -15,7 +17,7 @@ use rtc::peer_connection::configuration::interceptor_registry::{
     configure_twcc_receiver_only, register_default_interceptors,
 };
 use rtc::peer_connection::configuration::media_engine::{
-    MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine,
+    MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS, MediaEngine,
 };
 use rtc::rtp::codec::h264::H264Packet;
 use rtc::rtp::packetizer::Depacketizer;
@@ -36,6 +38,49 @@ use webrtc::rtp_transceiver::RtpSender;
 pub const H264_PAYLOAD_TYPE: u8 = 102;
 /// Constrained Baseline, level 3.1, non-interleaved packetization: what openh264 emits.
 const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+/// HEVC (RFC 7798) and AV1: offered only by viewers that decode them (0.1.7 on), so older
+/// peers never see these payload types.
+pub const H265_PAYLOAD_TYPE: u8 = 104;
+pub const AV1_PAYLOAD_TYPE: u8 = 105;
+
+/// The payload type each side registers `codec` under. The host answers with the
+/// viewer's numbers, and the viewer tells the codecs apart by them.
+pub fn payload_type(codec: VideoCodec) -> u8 {
+    match codec {
+        VideoCodec::H264 => H264_PAYLOAD_TYPE,
+        VideoCodec::H265 => H265_PAYLOAD_TYPE,
+        VideoCodec::Av1 => AV1_PAYLOAD_TYPE,
+    }
+}
+
+/// The codec registered under payload type `pt`.
+pub fn codec_of_payload_type(pt: u8) -> Option<VideoCodec> {
+    VideoCodec::LADDER
+        .into_iter()
+        .find(|&c| payload_type(c) == pt)
+}
+
+/// The video codecs an SDP lists (the `a=rtpmap` lines of its video sections).
+pub fn sdp_video_codecs(sdp: &str) -> Vec<VideoCodec> {
+    let mut out = Vec::new();
+    let mut video = false;
+    for line in sdp.lines() {
+        if let Some(m) = line.strip_prefix("m=") {
+            video = m.starts_with("video");
+        } else if let Some(map) = line.strip_prefix("a=rtpmap:")
+            && video
+            && let Some(name) = map.split_whitespace().nth(1)
+            && let Some(name) = name.split('/').next()
+            && let Some(c) = VideoCodec::LADDER
+                .into_iter()
+                .find(|c| c.rtpmap_name().eq_ignore_ascii_case(name))
+            && !out.contains(&c)
+        {
+            out.push(c);
+        }
+    }
+    out
+}
 
 pub const MIN_BITRATE_BPS: f64 = 300_000.0;
 /// High enough for a sharp full-resolution desktop from the first second; congestion
@@ -66,12 +111,21 @@ fn opus() -> RTCRtpCodec {
     }
 }
 
-fn h264() -> RTCRtpCodec {
+fn video_codec(codec: VideoCodec) -> RTCRtpCodec {
     RTCRtpCodec {
-        mime_type: MIME_TYPE_H264.to_owned(),
+        mime_type: match codec {
+            VideoCodec::H264 => MIME_TYPE_H264,
+            VideoCodec::H265 => MIME_TYPE_HEVC,
+            VideoCodec::Av1 => MIME_TYPE_AV1,
+        }
+        .to_owned(),
         clock_rate: 90_000,
         channels: 0,
-        sdp_fmtp_line: H264_FMTP.to_owned(),
+        sdp_fmtp_line: match codec {
+            VideoCodec::H264 => H264_FMTP,
+            _ => "",
+        }
+        .to_owned(),
         rtcp_feedback: vec![],
     }
 }
@@ -263,16 +317,24 @@ impl<E: BandwidthEstimator> BandwidthEstimator for Reporting<E> {
     }
 }
 
-/// Media engine (H.264) and interceptors (NACK, reports, TWCC + [`Bwe`] + pacer).
-pub fn media_stack() -> Result<(MediaEngine, Registry, TargetBitrate)> {
+/// Media engine (H.264 and the `extra` video codecs, Opus) and interceptors (NACK,
+/// reports, TWCC + [`Bwe`] + pacer). `extra`: what a viewer decodes, or a host encodes,
+/// besides H.264 (which every peer has).
+pub fn media_stack(extra: &[VideoCodec]) -> Result<(MediaEngine, Registry, TargetBitrate)> {
     let mut engine = MediaEngine::default();
-    engine.register_codec(
-        RTCRtpCodecParameters {
-            rtp_codec: h264(),
-            payload_type: H264_PAYLOAD_TYPE,
-        },
-        RtpCodecKind::Video,
-    )?;
+    // Best first: the order of the offer.
+    for codec in VideoCodec::LADDER {
+        if codec != VideoCodec::H264 && !extra.contains(&codec) {
+            continue;
+        }
+        engine.register_codec(
+            RTCRtpCodecParameters {
+                rtp_codec: video_codec(codec),
+                payload_type: payload_type(codec),
+            },
+            RtpCodecKind::Video,
+        )?;
+    }
     engine.register_codec(
         RTCRtpCodecParameters {
             rtp_codec: opus(),
@@ -320,18 +382,19 @@ pub fn media_stack() -> Result<(MediaEngine, Registry, TargetBitrate)> {
     Ok((engine, registry, target))
 }
 
-/// The host's outgoing H.264 track.
-/// A host-side outgoing media track (the screen's H.264, or the sound's Opus).
+/// The host's outgoing screen track, in the codec chosen for the session.
 pub struct VideoSender {
     track: Arc<TrackLocalStaticSample>,
     sender: Arc<dyn RtpSender>,
     started: Instant,
+    codec: VideoCodec,
 }
 
 impl VideoSender {
-    /// Attach a video track. Call on the answerer after `set_remote_description` and before
-    /// `create_answer`, so it binds to the viewer's recv-only transceiver.
-    pub async fn attach(pc: &dyn PeerConnection) -> Result<Self> {
+    /// Attach a video track sending `codec` (one the viewer offered). Call on the answerer
+    /// after `set_remote_description` and before `create_answer`, so it binds to the
+    /// viewer's recv-only transceiver.
+    pub async fn attach(pc: &dyn PeerConnection, codec: VideoCodec) -> Result<Self> {
         let ssrc: u32 = rand_u32();
         let track = Arc::new(TrackLocalStaticSample::new(
             Instant::now(),
@@ -345,7 +408,7 @@ impl VideoSender {
                         ssrc: Some(ssrc),
                         ..Default::default()
                     },
-                    codec: h264(),
+                    codec: video_codec(codec),
                     ..Default::default()
                 }],
             ),
@@ -358,20 +421,27 @@ impl VideoSender {
             track,
             sender,
             started: Instant::now(),
+            codec,
         })
     }
 
-    /// Send one Annex-B access unit lasting `duration`.
+    /// The codec this track sends.
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
+    }
+
+    /// Send one access unit (Annex-B for H.264/H.265, OBUs for AV1) lasting `duration`.
     pub async fn write(&self, access_unit: Vec<u8>, duration: Duration) -> Result<()> {
-        let pt = self
-            .sender
-            .get_parameters()
-            .await?
-            .rtp_parameters
-            .codecs
-            .first()
+        let codecs = self.sender.get_parameters().await?.rtp_parameters.codecs;
+        let pt = codecs
+            .iter()
+            .find(|c| {
+                c.rtp_codec
+                    .mime_type
+                    .eq_ignore_ascii_case(self.codec.mime())
+            })
             .map(|c| c.payload_type)
-            .ok_or_else(|| anyhow!("video sender has no negotiated codec yet"))?;
+            .ok_or_else(|| anyhow!("video sender has no negotiated {} yet", self.codec.name()))?;
         let ssrc = *self
             .track
             .ssrcs()

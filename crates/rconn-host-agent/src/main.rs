@@ -265,6 +265,8 @@ async fn main() -> Result<()> {
                 let opts = PeerOptions {
                     udp_addrs: cli.udp.clone(),
                     relay_only: false,
+                    // HEVC/AV1 where this machine encodes them in hardware.
+                    video_codecs: rconn_media::caps::encodable(),
                 };
                 let cli2 = cli.clone();
                 let openh264 = openh264.clone();

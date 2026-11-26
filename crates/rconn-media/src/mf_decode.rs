@@ -19,6 +19,7 @@
 #![allow(unsafe_code)]
 
 use crate::codec::CodecError;
+use rconn_core::codec::VideoCodec;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
@@ -32,16 +33,18 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264DecoderMFT, CODECAPI_AVDecVideoAcceleration_H264, CODECAPI_AVLowLatencyMode,
-    ICodecAPI, IMF2DBuffer, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType,
-    IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    ICodecAPI, IMF2DBuffer, IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer,
+    IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE,
     MF_SA_D3D11_AWARE, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFStartup,
+    MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFVideoArea, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoArea,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -51,6 +54,56 @@ use windows::core::Interface;
 
 fn err(what: &str, e: windows::core::Error) -> CodecError {
     CodecError::OpenH264(format!("Media Foundation decoder: {what}: {e}"))
+}
+
+/// The registered `codec` -> NV12 decoders, best first. HEVC and AV1 decoders come with
+/// Store extensions ("HEVC Video Extensions", "AV1 Video Extension"), so they may be
+/// missing on any machine.
+fn decoders(codec: VideoCodec) -> Vec<IMFActivate> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if MFStartup(MF_VERSION, MFSTARTUP_FULL).is_err() {
+            return Vec::new();
+        }
+        let input = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: crate::mf::subtype(codec),
+        };
+        let output = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_NV12,
+        };
+        let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        let flags = MFT_ENUM_FLAG_SYNCMFT
+            | MFT_ENUM_FLAG_ASYNCMFT
+            | MFT_ENUM_FLAG_HARDWARE
+            | MFT_ENUM_FLAG_LOCALMFT
+            | MFT_ENUM_FLAG_SORTANDFILTER;
+        if MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            flags,
+            Some(&input),
+            Some(&output),
+            &mut list,
+            &mut count,
+        )
+        .is_err()
+        {
+            return Vec::new();
+        }
+        // Each entry is owned (released when dropped), then the array is freed.
+        let owned = (0..count as usize)
+            .filter_map(|i| std::ptr::read(list.add(i)))
+            .collect();
+        windows::Win32::System::Com::CoTaskMemFree(Some(list.cast()));
+        owned
+    }
+}
+
+/// Is a `codec` decoder installed? H.264's is part of Windows.
+pub fn decoder_exists(codec: VideoCodec) -> bool {
+    codec == VideoCodec::H264 || !decoders(codec).is_empty()
 }
 
 /// The Direct3D 11 device the decoder works on, and a staging texture to read from.

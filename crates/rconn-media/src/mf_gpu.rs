@@ -7,6 +7,7 @@
 use super::{MfH264Encoder, err};
 use crate::codec::CodecError;
 use crate::d3d11::{Converter, GpuDevice, GpuFrame};
+use rconn_core::codec::VideoCodec;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFDXGIDeviceManager, MF_VERSION, MFCreateDXGIDeviceManager,
@@ -66,7 +67,8 @@ impl MfH264Encoder {
         }
         for hardware in kinds {
             let vendor = hardware.then_some(gpu.vendor_id);
-            for activate in Self::candidates(hardware, vendor).unwrap_or_default() {
+            for activate in Self::candidates(VideoCodec::H264, hardware, vendor).unwrap_or_default()
+            {
                 let started = Self::open(
                     activate,
                     hardware,

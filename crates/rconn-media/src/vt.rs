@@ -130,6 +130,28 @@ unsafe extern "C" {
     fn VTDecompressionSessionWaitForAsynchronousFrames(session: CFTypeRef) -> OSStatus;
     fn VTDecompressionSessionInvalidate(session: CFTypeRef);
     fn VTSessionSetProperty(session: CFTypeRef, key: CFTypeRef, value: CFTypeRef) -> OSStatus;
+    fn VTIsHardwareDecodeSupported(codec: u32) -> u8;
+}
+
+pub(crate) const kCMVideoCodecType_H264: u32 = u32::from_be_bytes(*b"avc1");
+pub(crate) const kCMVideoCodecType_HEVC: u32 = u32::from_be_bytes(*b"hvc1");
+pub(crate) const kCMVideoCodecType_AV1: u32 = u32::from_be_bytes(*b"av01");
+
+/// The Core Media codec type of `codec`.
+pub(crate) fn codec_type(codec: rconn_core::codec::VideoCodec) -> u32 {
+    use rconn_core::codec::VideoCodec;
+    match codec {
+        VideoCodec::H264 => kCMVideoCodecType_H264,
+        VideoCodec::H265 => kCMVideoCodecType_HEVC,
+        VideoCodec::Av1 => kCMVideoCodecType_AV1,
+    }
+}
+
+/// Does this machine have a hardware decoder for `codec`? (HEVC: Macs from 2017 and all
+/// Apple silicon; AV1: M3, A17 Pro and later.)
+pub fn hardware_decodes(codec: rconn_core::codec::VideoCodec) -> bool {
+    // SAFETY: a plain query.
+    unsafe { VTIsHardwareDecodeSupported(codec_type(codec)) != 0 }
 }
 
 const kCFNumberSInt32Type: isize = 3;

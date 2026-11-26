@@ -86,6 +86,7 @@ async fn rig(setting: bool, policy: bool) -> Rig {
     let opts = PeerOptions {
         udp_addrs: vec!["127.0.0.1:0".into()],
         relay_only: false,
+        ..Default::default()
     };
     let host_sig = SignalingClient::connect_host(
         &url,

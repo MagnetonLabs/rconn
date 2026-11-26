@@ -129,6 +129,7 @@ async fn connect(url: &str, code: &str, password: &str) -> Result<bool, String> 
     let opts = PeerOptions {
         udp_addrs: vec![LOOPBACK.into()],
         relay_only: false,
+        ..Default::default()
     };
     let (sig, host_id) = SignalingClient::connect_guest(url, &ServerTrust::WebPki, code)
         .await
@@ -204,6 +205,7 @@ async fn enroll_without_an_account_then_connect_by_password_or_by_asking() {
         let opts = PeerOptions {
             udp_addrs: vec![LOOPBACK.into()],
             relay_only: false,
+            ..Default::default()
         };
         let verifier = make_verifier("correct horse").unwrap();
         let mode = Arc::new(Mutex::new(Host::Password {

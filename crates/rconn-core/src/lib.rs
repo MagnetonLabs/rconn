@@ -1,6 +1,7 @@
 //! Shared types for rconn: identifiers, the signaling and data-channel protocol,
 //! and layered host settings with fleet-policy locking.
 
+pub mod codec;
 pub mod files;
 pub mod fleet;
 pub mod guest;

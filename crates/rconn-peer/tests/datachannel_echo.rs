@@ -80,6 +80,7 @@ async fn run(relay_only: bool) {
     let opts = PeerOptions {
         udp_addrs: vec![LOOPBACK.into()],
         relay_only,
+        ..Default::default()
     };
     let host_sig = SignalingClient::connect_host(
         &url,

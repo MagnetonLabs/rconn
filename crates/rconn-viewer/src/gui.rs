@@ -537,6 +537,8 @@ async fn session(
     let opts = PeerOptions {
         udp_addrs: args.udp_addrs.clone(),
         relay_only: args.relay_only,
+        // HEVC/AV1 where this machine decodes them (H.264 always).
+        video_codecs: rconn_media::caps::viewer_codecs(),
     };
     let mut session = open_viewer_session(sig, host, opts).await?;
     let mut exchange = args

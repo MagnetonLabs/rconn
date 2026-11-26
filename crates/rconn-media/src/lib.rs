@@ -3,6 +3,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod audio_monitor;
+pub mod caps;
 pub mod capture;
 #[cfg(not(target_os = "ios"))]
 pub mod cisco;
