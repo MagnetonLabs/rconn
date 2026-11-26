@@ -30,6 +30,37 @@ use tokio::sync::mpsc;
 const IDLE_GRACE: Duration = Duration::from_secs(3);
 /// After the person declines or stops sharing, don't ask again for this long.
 const DECLINE_COOLDOWN: Duration = Duration::from_secs(30);
+/// After this host changes the screen size, the screen stream ending is taken as a
+/// consequence of that for this long (a VM display may follow with changes of its own).
+const SCREEN_CHANGE_GRACE: Duration = Duration::from_secs(10);
+
+static SCREEN_CHANGE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// This host is about to change the screen size. GNOME ends the screen cast of a monitor
+/// whose size changes (the stream stops; the session may close): for a few seconds that
+/// is not taken as the person here stopping the sharing, and the session reopens with
+/// the restore token, without asking.
+pub fn expect_screen_change() {
+    *SCREEN_CHANGE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(std::time::Instant::now() + SCREEN_CHANGE_GRACE);
+}
+
+/// This host changed the screen size: reopen the session now (see
+/// [`expect_screen_change`]).
+pub fn screen_changed() {
+    expect_screen_change();
+    if let Some(tx) = THREAD.get() {
+        let _ = tx.send(Cmd::Renew(None));
+    }
+}
+
+/// Within a few seconds of this host changing the screen size.
+pub fn screen_changing() -> bool {
+    SCREEN_CHANGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|until| std::time::Instant::now() < until)
+}
 
 #[derive(Debug, Clone, Error)]
 pub enum PortalError {
@@ -67,6 +98,36 @@ pub struct StreamInfo {
     pub can_control: bool,
 }
 
+/// The stream's size while the screen changes size (the host fitting it to the viewer):
+/// the portal reports it once, at the start; afterwards it follows the size of the
+/// pictures, in proportion.
+#[derive(Debug, Default)]
+struct Sizes {
+    reported: Option<(i32, i32)>,
+    first_picture: Option<(usize, usize)>,
+    now: Option<(i32, i32)>,
+}
+
+impl Sizes {
+    fn new(reported: Option<(i32, i32)>) -> Self {
+        Self {
+            reported,
+            first_picture: None,
+            now: reported,
+        }
+    }
+
+    fn picture(&mut self, size: (usize, usize)) {
+        let first = *self.first_picture.get_or_insert(size);
+        let scale = |v: i32, now: usize, first: usize| {
+            (f64::from(v) * now as f64 / first.max(1) as f64).round() as i32
+        };
+        self.now = self
+            .reported
+            .map(|(w, h)| (scale(w, size.0, first.0), scale(h, size.1, first.1)));
+    }
+}
+
 /// One input event for the portal (Linux evdev codes).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputCmd {
@@ -88,11 +149,15 @@ enum Cmd {
     Input(u64, InputCmd),
     OpenPipeWire(u64, std_mpsc::Sender<Result<OwnedFd, PortalError>>),
     Closed(u64),
+    /// Close this generation's session (or the current one) so that the next lease opens
+    /// a fresh one: its screen stream ended with a screen size change.
+    Renew(Option<u64>),
 }
 
 struct Grant {
     generation: u64,
     stream: StreamInfo,
+    sizes: Arc<Mutex<Sizes>>,
     closed: Arc<AtomicBool>,
 }
 
@@ -100,13 +165,27 @@ struct Grant {
 pub struct Lease {
     generation: u64,
     stream: StreamInfo,
+    sizes: Arc<Mutex<Sizes>>,
     closed: Arc<AtomicBool>,
     tx: mpsc::UnboundedSender<Cmd>,
 }
 
 impl Lease {
+    /// The stream, with its current size.
     pub fn stream(&self) -> StreamInfo {
-        self.stream
+        let sizes = self.sizes.lock().unwrap_or_else(|e| e.into_inner());
+        StreamInfo {
+            size: sizes.now,
+            ..self.stream
+        }
+    }
+
+    /// The capturer saw a picture of this size (pointer positions follow size changes).
+    pub fn picture_size(&self, width: usize, height: usize) {
+        self.sizes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .picture((width, height));
     }
 
     /// The session ended (stopped at the computer, or the portal went away).
@@ -122,6 +201,12 @@ impl Lease {
             .map_err(|_| other("portal thread", "gone"))?;
         rx.recv_timeout(Duration::from_secs(10))
             .map_err(|_| other("OpenPipeWireRemote", "no answer"))?
+    }
+
+    /// This session's screen stream stopped after a screen size change: close it, so the
+    /// next lease opens a fresh one.
+    pub fn renew(&self) {
+        let _ = self.tx.send(Cmd::Renew(Some(self.generation)));
     }
 
     /// Queue an input event (sent in order; errors are logged by the portal thread).
@@ -167,6 +252,7 @@ pub fn acquire(timeout: Duration) -> Result<Lease, PortalError> {
     Ok(Lease {
         generation: grant.generation,
         stream: grant.stream,
+        sizes: grant.sizes,
         closed: grant.closed,
         tx,
     })
@@ -195,6 +281,7 @@ struct Live {
     sc: Screencast,
     session: Arc<Session<RemoteDesktop>>,
     stream: StreamInfo,
+    sizes: Arc<Mutex<Sizes>>,
     closed: Arc<AtomicBool>,
     watcher: tokio::task::JoinHandle<()>,
     users: usize,
@@ -258,6 +345,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, loopback: mpsc::UnboundedSend
                 let grant = Grant {
                     generation: l.generation,
                     stream: l.stream,
+                    sizes: l.sizes.clone(),
                     closed: l.closed.clone(),
                 };
                 // A caller that gave up waiting doesn't count as a user.
@@ -292,15 +380,34 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, loopback: mpsc::UnboundedSend
                 };
                 let _ = reply.send(r);
             }
+            Cmd::Renew(g) => {
+                if let Some(l) = live.take_if(|l| g.is_none_or(|g| g == l.generation)) {
+                    tracing::info!(
+                        generation = l.generation,
+                        "the screen changed size; reopening the portal session"
+                    );
+                    close(l).await;
+                }
+            }
             Cmd::Closed(g) => {
                 if let Some(l) = live.take_if(|l| l.generation == g) {
+                    l.closed.store(true, Ordering::Relaxed);
+                    l.watcher.abort();
+                    if screen_changing() {
+                        // Our own doing: the next lease reopens it with the restore
+                        // token, without asking.
+                        tracing::info!(
+                            generation = g,
+                            "the desktop ended screen sharing as the screen changed size; \
+                             reopening"
+                        );
+                        continue;
+                    }
                     tracing::warn!(
                         generation = g,
                         "the portal session was closed by the desktop (sharing stopped at \
                          this computer?)"
                     );
-                    l.closed.store(true, Ordering::Relaxed);
-                    l.watcher.abort();
                     declined_until = Some(tokio::time::Instant::now() + DECLINE_COOLDOWN);
                     ask_again = true;
                 }
@@ -443,6 +550,7 @@ async fn open(
         rd,
         sc,
         session,
+        sizes: Arc::new(Mutex::new(Sizes::new(stream.size))),
         stream,
         closed: Arc::new(AtomicBool::new(false)),
         watcher,
@@ -604,6 +712,24 @@ mod tests {
         std::fs::write(&path, "  \n").unwrap();
         assert_eq!(load_token(&path), None, "blank file");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_stream_size_follows_the_pictures() {
+        // HiDPI: the portal reports logical 960x506 for 1920x1012 pictures.
+        let mut s = Sizes::new(Some((960, 506)));
+        assert_eq!(s.now, Some((960, 506)));
+        s.picture((1920, 1012));
+        assert_eq!(s.now, Some((960, 506)));
+        // The screen was fitted to a viewer: 1616x1012.
+        s.picture((1616, 1012));
+        assert_eq!(s.now, Some((808, 506)));
+        s.picture((1920, 1012));
+        assert_eq!(s.now, Some((960, 506)));
+        // No size from the portal: still none.
+        let mut s = Sizes::new(None);
+        s.picture((1920, 1012));
+        assert_eq!(s.now, None);
     }
 
     #[test]

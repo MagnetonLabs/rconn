@@ -5395,6 +5395,7 @@ dependencies = [
  "webrtc",
  "windows",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]

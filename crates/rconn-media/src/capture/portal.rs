@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 /// How long the first call waits for the consent dialog before reporting "waiting".
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Paused this long right after a screen size change: the stream has ended.
+const STOPPED_AFTER: Duration = Duration::from_millis(500);
 /// More damage rectangles than this pending: treat the frame as wholly changed.
 const MAX_RECTS: usize = 64;
 
@@ -64,6 +66,9 @@ struct Latest {
     captured_at: Option<Instant>,
     error: Option<String>,
     frames: u64,
+    /// Since when the stream is paused: briefly while it starts; for good once GNOME
+    /// ends the screen cast of a monitor whose size changed.
+    paused_at: Option<Instant>,
 }
 
 /// One PipeWire buffer's pixels: `height` rows of `stride` bytes, 4 bytes per pixel.
@@ -355,6 +360,8 @@ fn pw_main(
         .add_local_listener_with_user_data(Negotiated::default())
         .state_changed(move |_, _, old, new| {
             tracing::debug!(?old, ?new, "PipeWire stream state");
+            s_state.latest.lock().expect("latest frame").paused_at =
+                matches!(new, pw::stream::StreamState::Paused).then(Instant::now);
             match new {
                 pw::stream::StreamState::Error(e) => s_state.fail(format!("stream error: {e}")),
                 pw::stream::StreamState::Unconnected => {
@@ -521,6 +528,18 @@ impl PortalCapturer {
             if self.lease.as_ref().is_some_and(Lease::is_closed) {
                 return Err(backend("capture", "the portal session was closed"));
             }
+            // GNOME stops the screen cast of a monitor whose size changed; a fresh session
+            // streams the new size.
+            if let Some(lease) = &self.lease
+                && l.paused_at.is_some_and(|t| t.elapsed() >= STOPPED_AFTER)
+                && portal::screen_changing()
+            {
+                lease.renew();
+                return Err(backend(
+                    "capture",
+                    "the screen stream stopped (new screen size)",
+                ));
+            }
             let have = l.width > 0 && (l.damage != Damage::None || self.want_full);
             if have {
                 return Ok(l);
@@ -540,6 +559,13 @@ impl PortalCapturer {
                 .0;
         }
     }
+
+    /// Pointer positions follow the screen's size (it changes when fitted to a viewer).
+    fn note_size(&self, width: usize, height: usize) {
+        if let Some(lease) = &self.lease {
+            lease.picture_size(width, height);
+        }
+    }
 }
 
 impl Capturer for PortalCapturer {
@@ -550,6 +576,7 @@ impl Capturer for PortalCapturer {
             return Ok(None);
         }
         l.damage = Damage::None;
+        self.note_size(l.width, l.height);
         let frame = Frame {
             width: l.width,
             height: l.height,
@@ -573,6 +600,7 @@ impl Capturer for PortalCapturer {
             return Ok(None);
         }
         let (w, h) = (l.width, l.height);
+        self.note_size(w, h);
         let (ew, eh) = (w & !1, h & !1);
         if ew == 0 || eh == 0 {
             return Ok(None);

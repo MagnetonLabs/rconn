@@ -2,7 +2,19 @@
 //! viewer reports its picture area in pixels and the host switches to the closest
 //! display mode. The original mode comes back when the session ends.
 //!
-//! Windows only for now; elsewhere requests are ignored (the viewer scales the picture).
+//! * Windows: `ChangeDisplaySettingsExW` (not saved; the registry mode comes back).
+//! * macOS: CoreGraphics display modes of the main display ([`macos`]).
+//! * Linux, GNOME on Wayland: Mutter's `DisplayConfig` D-Bus API ([`mutter`]).
+//! * Linux, X11: RandR on the primary output ([`randr`]).
+//!
+//! Only modes the display lists are used. Where fitting fails (another Wayland desktop,
+//! mirrored displays...) the session goes on and the viewer scales the picture.
+
+#[cfg(target_os = "macos")]
+mod macos;
+mod mutter;
+#[cfg(target_os = "linux")]
+mod randr;
 
 /// The screen-size change made for this session, undone on drop.
 #[derive(Default)]
@@ -11,8 +23,9 @@ pub struct Fit {
 }
 
 impl Fit {
-    /// Switch to the display mode closest to `width` x `height`.
-    pub fn apply(&mut self, width: u32, height: u32) {
+    /// Switch to the display mode closest to `width` x `height`. Returns the size set,
+    /// if the screen changed.
+    pub fn apply(&mut self, width: u32, height: u32) -> Option<(u32, u32)> {
         match imp::set(width, height) {
             Ok(Some((w, h))) => {
                 self.changed = true;
@@ -21,9 +34,16 @@ impl Fit {
                     set = format!("{w}x{h}"),
                     "screen fitted to the viewer's window"
                 );
+                Some((w, h))
             }
-            Ok(None) => tracing::debug!(width, height, "screen already fits"),
-            Err(e) => tracing::warn!(error = %e, width, height, "could not fit the screen"),
+            Ok(None) => {
+                tracing::debug!(width, height, "screen already fits");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, width, height, "could not fit the screen");
+                None
+            }
         }
     }
 
@@ -42,10 +62,98 @@ impl Drop for Fit {
     }
 }
 
+/// `--selftest-fit`: fit the screen to `want` as a viewer would and watch the captured
+/// picture for a few seconds, then put the screen back and watch again. Capture errors
+/// restart the capturer, as a session's stream does. On Wayland, the portal restore token
+/// in the host's `state_dir` (if given) avoids the consent dialog.
+pub fn selftest(want: (u32, u32), state_dir: Option<&std::path::Path>) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    use rconn_media::capture::{Capturer, primary_display};
+    use rconn_media::yuv::I420;
+    use std::time::{Duration, Instant};
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = state_dir {
+        rconn_media::portal::set_restore_token_path(dir.join("portal-restore-token"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = state_dir;
+    const WATCH: Duration = Duration::from_secs(8);
+    let mut cap: Option<Box<dyn Capturer>> = Some(primary_display()?);
+    let mut picture: Option<I420> = None;
+    let mut restarts = 0;
+    // The sizes captured within `WATCH` (each new one with its time), the last first.
+    let mut watch = |what: &str| -> Vec<((usize, usize), u128)> {
+        let start = Instant::now();
+        let mut seen: Vec<((usize, usize), u128)> = Vec::new();
+        while start.elapsed() < WATCH {
+            let c = match cap.as_mut() {
+                Some(c) => c,
+                None => match primary_display() {
+                    Ok(c) => cap.insert(c),
+                    Err(e) => {
+                        tracing::info!(error = %e, "capture not back yet");
+                        std::thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
+                },
+            };
+            match c.next_into(Duration::from_millis(100), &mut picture, (16384, 16384)) {
+                Ok(Some(_)) => {
+                    let size = picture.as_ref().map_or((0, 0), I420::dimensions);
+                    if seen.last().is_none_or(|&(s, _)| s != size) {
+                        seen.push((size, start.elapsed().as_millis()));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::info!(error = %e, what, "capture restarting");
+                    restarts += 1;
+                    cap = None;
+                    picture = None;
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+        seen
+    };
+    let show = |seen: &[((usize, usize), u128)]| {
+        seen.iter()
+            .map(|((w, h), ms)| format!("{w}x{h} at {ms} ms"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let first = watch("before");
+    let &(before, _) = first.last().context("no picture before fitting")?;
+    let mut fit = Fit::default();
+    let set = fit
+        .apply(want.0, want.1)
+        .context("the screen size was not changed (see the log above)")?;
+    let fitted = watch("fitted");
+    fit.restore();
+    let restored = watch("restored");
+    let report = format!(
+        "captured {}x{}; asked {}x{}, display set to {}x{}; then captured {}; restored, \
+         then captured {}; {restarts} capture restarts",
+        before.0,
+        before.1,
+        want.0,
+        want.1,
+        set.0,
+        set.1,
+        show(&fitted),
+        show(&restored)
+    );
+    let back = restored.last().map(|&(s, _)| s);
+    anyhow::ensure!(
+        fitted.last().is_some_and(|&(s, _)| s != before) && back == Some(before),
+        "screen fit failed: {report}"
+    );
+    Ok(format!("screen fit ok: {report}"))
+}
+
 /// Of `modes`, the one closest to `want`: among modes of a similar size (so the desktop
 /// is neither cramped nor tiny), the closest shape (black bars), then the nearest size.
 /// If no mode is of a similar size, the nearest size overall.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn closest(modes: &[(u32, u32)], want: (u32, u32)) -> Option<(u32, u32)> {
     let aspect = |(w, h): (u32, u32)| f64::from(w) / f64::from(h.max(1));
     let area_ratio = |m: (u32, u32)| {
@@ -67,6 +175,57 @@ pub fn closest(modes: &[(u32, u32)], want: (u32, u32)) -> Option<(u32, u32)> {
     similar
         .into_iter()
         .min_by(|&a, &b| (shape(a) * 50.0 + size(a)).total_cmp(&(shape(b) * 50.0 + size(b))))
+}
+
+/// A display mode: its size in pixels and refresh rate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mode {
+    pub width: u32,
+    pub height: u32,
+    pub hz: f64,
+}
+
+/// Of `modes`, the one to switch to for a viewer of `want` (see [`closest`]); of several
+/// with that size, the one with the refresh rate nearest `hz` (the current one).
+#[cfg_attr(windows, allow(dead_code))]
+pub fn pick_fit(modes: &[Mode], want: (u32, u32), hz: f64) -> Option<usize> {
+    let mut sizes: Vec<(u32, u32)> = modes.iter().map(|m| (m.width, m.height)).collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+    nearest_hz(modes, closest(&sizes, want)?, hz)
+}
+
+/// Of `modes`, the one that brings back `original` once the session ends: that size;
+/// else the same shape (a VM display that follows its window lists new modes as the
+/// window changes shape, and the window follows the shape back), nearest in size; else
+/// the display's `preferred` mode.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn pick_restore(modes: &[Mode], original: Mode, preferred: Option<usize>) -> Option<usize> {
+    if let Some(i) = nearest_hz(modes, (original.width, original.height), original.hz) {
+        return Some(i);
+    }
+    let aspect = |m: &Mode| f64::from(m.width) / f64::from(m.height.max(1));
+    let area = |m: &Mode| f64::from(m.width) * f64::from(m.height);
+    let shape = |m: &Mode| (aspect(m) / aspect(&original)).ln().abs();
+    let size = |m: &Mode| (area(m) / area(&original).max(1.0)).ln().abs();
+    modes
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| shape(m) < 0.02)
+        .min_by(|a, b| size(a.1).total_cmp(&size(b.1)))
+        .map(|(i, _)| i)
+        .or(preferred.filter(|&i| i < modes.len()))
+}
+
+/// The mode of `size` whose refresh rate is nearest `hz`.
+#[cfg_attr(windows, allow(dead_code))]
+fn nearest_hz(modes: &[Mode], size: (u32, u32), hz: f64) -> Option<usize> {
+    modes
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| (m.width, m.height) == size)
+        .min_by(|a, b| (a.1.hz - hz).abs().total_cmp(&(b.1.hz - hz).abs()))
+        .map(|(i, _)| i)
 }
 
 #[cfg(windows)]
@@ -180,10 +339,32 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+use macos as imp;
+
+#[cfg(target_os = "linux")]
+mod imp {
+    /// GNOME on Wayland through Mutter; X11 desktops through RandR (on Wayland, RandR
+    /// would only change what X clients see).
+    pub fn set(width: u32, height: u32) -> Result<Option<(u32, u32)>, String> {
+        if rconn_media::capture::uses_portal() {
+            super::mutter::set(width, height)
+        } else {
+            super::randr::set(width, height)
+        }
+    }
+
+    /// Each puts back only what it changed.
+    pub fn restore() {
+        super::mutter::restore();
+        super::randr::restore();
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod imp {
     pub fn set(_width: u32, _height: u32) -> Result<Option<(u32, u32)>, String> {
-        Err("fitting the screen to the viewer is Windows-only for now".into())
+        Err("fitting the screen to the viewer is not supported on this system".into())
     }
 
     pub fn restore() {}
@@ -191,7 +372,47 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::closest;
+    use super::{Mode, closest, pick_fit, pick_restore};
+
+    fn mode(width: u32, height: u32, hz: f64) -> Mode {
+        Mode { width, height, hz }
+    }
+
+    #[test]
+    fn fits_with_the_current_refresh_rate() {
+        let modes = [
+            mode(1920, 1080, 60.0),
+            mode(1920, 1080, 59.94),
+            mode(1920, 1200, 59.95),
+            mode(1280, 720, 60.0),
+        ];
+        assert_eq!(pick_fit(&modes, (1900, 1070), 59.94), Some(1));
+        assert_eq!(pick_fit(&modes, (1900, 1070), 60.0), Some(0));
+        assert_eq!(pick_fit(&modes, (1900, 1190), 60.0), Some(2));
+        assert_eq!(pick_fit(&[], (1900, 1190), 60.0), None);
+    }
+
+    #[test]
+    fn restores_the_size_else_the_shape_else_the_preferred_mode() {
+        let modes = [
+            mode(4096, 2160, 60.0),
+            mode(1920, 1080, 60.0),
+            mode(1920, 1012, 59.98),
+            mode(1616, 1012, 59.98),
+        ];
+        // The original size is still listed.
+        assert_eq!(
+            pick_restore(&modes, mode(1920, 1012, 59.98), Some(3)),
+            Some(2)
+        );
+        // A Parallels VM replaced its 1920x1012 window mode with 1616x1012 (the shape the
+        // viewer had): the original shape comes back through 4096x2160.
+        let vm = [modes[0], modes[1], modes[3]];
+        assert_eq!(pick_restore(&vm, mode(1920, 1012, 59.98), Some(2)), Some(0));
+        // Nothing of that shape: the preferred mode.
+        assert_eq!(pick_restore(&vm, mode(1000, 1000, 60.0), Some(2)), Some(2));
+        assert_eq!(pick_restore(&vm, mode(1000, 1000, 60.0), None), None);
+    }
 
     #[test]
     fn picks_the_same_shape_then_the_nearest_size() {
