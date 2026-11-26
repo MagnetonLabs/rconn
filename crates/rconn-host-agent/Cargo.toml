@@ -46,3 +46,5 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 
 [dev-dependencies]
 tempfile.workspace = true
+# Paused clock for the resize-coalescing tests.
+tokio = { version = "1.54.1", features = ["full", "test-util"] }

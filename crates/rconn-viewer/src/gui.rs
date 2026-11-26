@@ -14,7 +14,7 @@ use rconn_peer::rtc::{PeerEvent, PeerOptions};
 use rconn_peer::session::open_viewer_session;
 use rconn_peer::signaling::SignalingClient;
 use rconn_peer::trust::ServerTrust;
-use rconn_peer::video::VideoReceiver;
+use rconn_peer::video::{KeyframeNeed, VideoReceiver};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -187,6 +187,10 @@ pub fn hand_off(args: &ConnectArgs) -> bool {
 fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> ViewerApp {
     let chromeless = args.chromeless;
     let host = args.host;
+    let prefs_path = crate::prefs::default_path();
+    let match_resolution = prefs_path
+        .as_deref()
+        .is_some_and(|p| crate::prefs::load(p, host).match_resolution);
     let name = args.name.clone();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(args.mute));
     let muted_audio = muted.clone();
@@ -241,8 +245,9 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
         fit_window: false,
         cursor: shared_cursor,
         last_frame: None,
-        fit_sent: None,
-        fit_pending: None,
+        fit: FitRequest::default(),
+        match_resolution,
+        prefs_path,
         last_stats: String::new(),
         confirm_restart: false,
         toast: None,
@@ -696,53 +701,63 @@ async fn session(
     let mut rx = VideoReceiver::default();
     let mut dec = VideoDecoder::new(&args.openh264)?;
     let (mut frames, mut bytes, mut since) = (0u32, 0usize, Instant::now());
-    let mut last_kf_request: Option<Instant> = None;
+    // Lost packets, decode errors, or video with no picture coming out of it: ask for a
+    // fresh keyframe (throttled; each one costs the host a full-size encode).
+    let mut need = KeyframeNeed::default();
+    // Wakes the loop without packets: a lost keyframe on a still screen sends nothing more.
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let Some(ev) = track.poll().await else { break };
-        let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
-            continue;
+        let pkt = tokio::select! {
+            ev = track.poll() => match ev {
+                None => break,
+                Some(TrackRemoteEvent::OnRtpPacket(pkt)) => Some(pkt),
+                Some(_) => None,
+            },
+            _ = tick.tick() => None,
         };
-        let aus = rx.push(pkt);
-        // Video data was lost for good: later pictures build on a broken one, so start
-        // over from a fresh keyframe (throttled like decode errors).
-        if rx.take_loss()
-            && last_kf_request.is_none_or(|t: Instant| t.elapsed() >= Duration::from_millis(300))
-        {
-            tracing::warn!("video packets lost; requesting keyframe");
-            let _ = kf_tx.send(());
-            last_kf_request = Some(Instant::now());
-        }
-        for au in aus {
-            bytes += au.len();
-            match dec.decode(&au) {
-                Ok(Some(f)) => {
-                    frames += 1;
-                    let mut s = shared.lock().expect("ui state");
-                    s.frame = Some(f);
-                    s.status.clear();
-                    drop(s);
-                    repaint();
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    // Ask for a fresh keyframe, but not on every broken frame: each one
-                    // costs the host a full-size encode.
-                    if last_kf_request
-                        .is_none_or(|t: Instant| t.elapsed() >= Duration::from_millis(300))
-                    {
-                        tracing::warn!(error = %e, "decode error; requesting keyframe");
-                        let _ = kf_tx.send(());
-                        last_kf_request = Some(Instant::now());
+        if let Some(pkt) = pkt {
+            if !pkt.payload.is_empty() {
+                need.data(Instant::now());
+            }
+            let aus = rx.push(pkt);
+            // Video data was lost for good: later pictures build on a broken one.
+            if rx.take_loss() {
+                tracing::warn!("video packets lost");
+                need.lost();
+            }
+            for au in aus {
+                bytes += au.len();
+                match dec.decode(&au) {
+                    Ok(Some(f)) => {
+                        frames += 1;
+                        need.picture();
+                        let mut s = shared.lock().expect("ui state");
+                        s.frame = Some(f);
+                        s.status.clear();
+                        drop(s);
+                        repaint();
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(error = %e, "decode error");
+                        need.lost();
                     }
                 }
             }
+        }
+        if need.poll(Instant::now()) {
+            tracing::warn!("no picture from the video; requesting keyframe");
+            let _ = kf_tx.send(());
         }
         if since.elapsed() >= Duration::from_secs(1) {
             let secs = since.elapsed().as_secs_f32();
             let mut s = shared.lock().expect("ui state");
             s.fps = frames as f32 / secs;
             s.kbps = bytes as f32 * 8.0 / secs / 1000.0;
+            drop(s);
             (frames, bytes, since) = (0, 0, Instant::now());
+            repaint(); // the toolbar's numbers, also when no picture comes
         }
     }
     dc_task.abort();
@@ -750,6 +765,66 @@ async fn session(
     files_task.abort();
     session.close().await;
     Ok(())
+}
+
+/// The window must keep a size this long before the remote screen follows it.
+const FIT_SETTLE: Duration = Duration::from_millis(400);
+/// Smaller differences from the size last asked for are not worth a mode switch.
+const FIT_MIN_CHANGE: u32 = 16;
+
+/// What [`FitRequest::update`] says to do.
+#[derive(Debug, PartialEq)]
+enum FitStep {
+    /// Ask the host for this size now.
+    Send((u32, u32)),
+    /// Look again after this long.
+    Wait(Duration),
+    Idle,
+}
+
+/// Debounces "fit the remote screen to this window": each mode switch blanks the remote
+/// screen and restarts its capture, so only a size the window has kept for
+/// [`FIT_SETTLE`], and not one a few pixels from the last, is sent.
+#[derive(Debug, Default)]
+struct FitRequest {
+    /// The size last asked for.
+    sent: Option<(u32, u32)>,
+    /// A new size and since when the window has had it.
+    pending: Option<((u32, u32), Instant)>,
+}
+
+impl FitRequest {
+    fn update(&mut self, want: (u32, u32), now: Instant) -> FitStep {
+        if let Some(sent) = self.sent
+            && sent.0.abs_diff(want.0) < FIT_MIN_CHANGE
+            && sent.1.abs_diff(want.1) < FIT_MIN_CHANGE
+        {
+            self.pending = None;
+            return FitStep::Idle;
+        }
+        match self.pending {
+            Some((size, since)) if size == want => {
+                let held = now.saturating_duration_since(since);
+                if held >= FIT_SETTLE {
+                    self.sent = Some(want);
+                    self.pending = None;
+                    FitStep::Send(want)
+                } else {
+                    FitStep::Wait(FIT_SETTLE - held)
+                }
+            }
+            _ => {
+                self.pending = Some((want, now));
+                FitStep::Wait(FIT_SETTLE)
+            }
+        }
+    }
+
+    /// Forget what was asked; whether anything had been (so the host should restore).
+    fn reset(&mut self) -> bool {
+        self.pending = None;
+        self.sent.take().is_some()
+    }
 }
 
 struct ViewerApp {
@@ -775,10 +850,13 @@ struct ViewerApp {
     cursor: Arc<Mutex<Option<rconn_core::protocol::CursorShape>>>,
     /// The latest picture (for "Save screenshot").
     last_frame: Option<DecodedFrame>,
-    /// The remote screen is fitted to the picture area: the size last asked for, and a
-    /// new size waiting for the window to stop changing.
-    fit_sent: Option<(u32, u32)>,
-    fit_pending: Option<((u32, u32), Instant)>,
+    /// "Match resolution to window": the remote screen's resolution follows this window.
+    /// Off (the default) keeps the remote resolution and scales the picture.
+    match_resolution: bool,
+    /// The sizes asked of the host while matching.
+    fit: FitRequest,
+    /// Where this tab's per-computer choices are saved (`None`: not saved).
+    prefs_path: Option<std::path::PathBuf>,
     /// The toolbar's stats line, as of the last frame drawn.
     last_stats: String,
     /// "Restart remote computer" is waiting for confirmation.
@@ -1094,6 +1172,19 @@ impl ViewerApp {
                 self.save_screenshot();
                 ui.close();
             }
+            // Off (the default): the remote screen keeps its resolution and the picture is
+            // scaled to the window. Remembered for this computer.
+            let mut matching = self.match_resolution;
+            if ui
+                .checkbox(&mut matching, "⛶ Match resolution to window")
+                .on_hover_text(
+                    "Change the remote screen's resolution to fit this window; it goes back \
+                     when you turn this off or disconnect. Off: the picture is scaled.",
+                )
+                .changed()
+            {
+                self.set_match_resolution(matching);
+            }
             ui.separator();
             if ui.button("🔒 Lock remote computer").clicked() {
                 let _ = self.keyframe.send(Control::Action(rconn_core::protocol::HostAction::LockScreen));
@@ -1226,36 +1317,38 @@ impl ViewerApp {
         }
     }
 
-    /// Ask the host to fit its screen to `area` (in pixels), once the window has stopped
-    /// changing size for a moment: no black bars, and the host's pixels map 1:1 to ours.
+    /// With "Match resolution to window" on, ask the host to fit its screen to `area`
+    /// (in pixels) once the window has stopped changing size for a moment: no black bars,
+    /// and the host's pixels map 1:1 to ours.
     fn fit_remote_to(&mut self, area: Rect, ctx: &egui::Context) {
-        const SETTLE: Duration = Duration::from_millis(400);
-        if self.texture.is_none() {
-            return; // not connected yet
+        if self.texture.is_none() || !self.match_resolution {
+            return; // not connected yet, or scaling the picture instead
         }
         let ppp = ctx.pixels_per_point();
         let px = |v: f32| ((v * ppp).round() as u32 & !1).max(480);
         let want = (px(area.width()), px(area.height()));
-        if self.fit_sent == Some(want) {
-            self.fit_pending = None;
-            return;
-        }
-        match self.fit_pending {
-            Some((size, since)) if size == want => {
-                if since.elapsed() >= SETTLE {
-                    let _ = self.keyframe.send(Control::Resize {
-                        width: want.0,
-                        height: want.1,
-                    });
-                    self.fit_sent = Some(want);
-                    self.fit_pending = None;
-                } else {
-                    ctx.request_repaint_after(SETTLE - since.elapsed());
-                }
+        match self.fit.update(want, Instant::now()) {
+            FitStep::Send((width, height)) => {
+                let _ = self.keyframe.send(Control::Resize { width, height });
             }
-            _ => {
-                self.fit_pending = Some((want, Instant::now()));
-                ctx.request_repaint_after(SETTLE);
+            FitStep::Wait(d) => ctx.request_repaint_after(d),
+            FitStep::Idle => {}
+        }
+    }
+
+    /// The toolbar's "Match resolution" toggle: remembered for this computer; turning it
+    /// off gives the remote screen its own resolution back.
+    fn set_match_resolution(&mut self, on: bool) {
+        self.match_resolution = on;
+        if !on && self.fit.reset() {
+            let _ = self.keyframe.send(Control::RestoreResolution);
+        }
+        if let Some(path) = &self.prefs_path {
+            let prefs = crate::prefs::HostPrefs {
+                match_resolution: on,
+            };
+            if let Err(e) = crate::prefs::save(path, self.host, &prefs) {
+                tracing::warn!(error = %e, "could not save viewer preferences");
             }
         }
     }
@@ -1394,6 +1487,35 @@ mod tests {
             (picture.x / picture.y - remote.x / remote.y).abs() < 0.01,
             "same shape: no bars"
         );
+    }
+
+    #[test]
+    fn the_remote_screen_follows_the_window_only_once_it_settles() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut f = FitRequest::default();
+        // A drag: a new size every 16 ms for a second, nothing sent.
+        for i in 0..60u32 {
+            let step = f.update((1000 + i * 8, 700), at(u64::from(i) * 16));
+            assert!(matches!(step, FitStep::Wait(_)), "{step:?}");
+        }
+        let last = (1000 + 59 * 8, 700);
+        assert!(matches!(f.update(last, at(1200)), FitStep::Wait(_)));
+        assert_eq!(
+            f.update(last, at(1344)),
+            FitStep::Send(last),
+            "400 ms still"
+        );
+        assert_eq!(f.update(last, at(2000)), FitStep::Idle, "sent once");
+        // A few pixels (a scrollbar, rounding) are not worth a mode switch.
+        assert_eq!(f.update((last.0 + 6, 708), at(3000)), FitStep::Idle);
+        assert_eq!(f.update((last.0 + 6, 708), at(4000)), FitStep::Idle);
+        // A real change is, once it settles.
+        assert!(matches!(f.update((1280, 800), at(5000)), FitStep::Wait(_)));
+        assert_eq!(f.update((1280, 800), at(5400)), FitStep::Send((1280, 800)));
+        // Turning matching off: the host is told to restore, once.
+        assert!(f.reset());
+        assert!(!f.reset());
     }
 
     #[test]
@@ -1564,8 +1686,9 @@ mod render_tests {
             fit_window: false,
             cursor: Arc::default(),
             last_frame: None,
-            fit_sent: None,
-            fit_pending: None,
+            fit: FitRequest::default(),
+            match_resolution: false,
+            prefs_path: None,
             last_stats: String::new(),
             confirm_restart: false,
             toast: None,
@@ -1575,6 +1698,42 @@ mod render_tests {
             files_rect: None,
             _close: None,
         }
+    }
+
+    #[test]
+    fn scaling_is_the_default_and_no_resize_is_sent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut a = app(false, false);
+        a.keyframe = tx;
+        a.texture = Some(egui::Context::default().load_texture(
+            "t",
+            ColorImage::new([4, 4], vec![Color32::BLACK; 16]),
+            TextureOptions::LINEAR,
+        ));
+        let ctx = egui::Context::default();
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+        a.fit_remote_to(area, &ctx);
+        a.fit.pending = a.fit.pending.map(|(s, t)| (s, t - Duration::from_secs(1)));
+        a.fit_remote_to(area, &ctx);
+        assert!(
+            rx.try_recv().is_err(),
+            "off by default: the remote keeps its resolution"
+        );
+        // Matching on: the settled size goes out; off again: the host is told to restore.
+        a.set_match_resolution(true);
+        a.fit_remote_to(area, &ctx);
+        a.fit.pending = a.fit.pending.map(|(s, t)| (s, t - Duration::from_secs(1)));
+        a.fit_remote_to(area, &ctx);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(Control::Resize {
+                width: 1200,
+                height: 800
+            })
+        );
+        a.set_match_resolution(false);
+        assert_eq!(rx.try_recv().ok(), Some(Control::RestoreResolution));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

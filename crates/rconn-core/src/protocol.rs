@@ -450,6 +450,10 @@ pub enum Control {
         width: u32,
         height: u32,
     },
+    /// Viewer -> host: put the screen back to its own size (the viewer stopped matching
+    /// the resolution to its window). Appended: hosts that predate it reject it as an
+    /// unknown message, log it and carry on.
+    RestoreResolution,
 }
 
 /// Toolbar actions the host performs on request.
@@ -716,6 +720,24 @@ mod tests {
         assert_eq!(
             enc(GuestMessage::Refused(GuestRefusal::Declined)),
             [3, 3, 3]
+        );
+    }
+
+    /// Control messages keep their encoding; RestoreResolution was appended after Resize.
+    #[test]
+    fn control_messages_keep_their_encoding() {
+        let enc = |c: Control| DataMessage::Control(c).encode().unwrap();
+        let resize = enc(Control::Resize {
+            width: 1,
+            height: 2,
+        });
+        let restore = enc(Control::RestoreResolution);
+        assert_eq!(resize[1] + 1, restore[1], "next variant index after Resize");
+        assert_eq!(&resize[2..], [1, 2]);
+        assert_eq!(restore.len(), 2);
+        assert_eq!(
+            DataMessage::decode(&restore).unwrap(),
+            DataMessage::Control(Control::RestoreResolution)
         );
     }
 

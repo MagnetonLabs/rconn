@@ -21,6 +21,8 @@ pub struct Form {
     pub ask_with_password: bool,
     /// Viewers may browse and copy files (home folder; uploads to Downloads/Rconn).
     pub file_transfer: bool,
+    /// Viewers may change this screen's resolution to fit their window.
+    pub allow_resize: bool,
     /// A new password being typed (not saved; turned into a verifier by "Set").
     pub new_access_password: String,
 }
@@ -51,6 +53,7 @@ impl Form {
             access_password: s.access_password.clone(),
             ask_with_password: s.ask_with_password,
             file_transfer: s.file_transfer,
+            allow_resize: s.allow_resize,
             new_access_password: String::new(),
         }
     }
@@ -78,6 +81,7 @@ impl Form {
             ("access_password", self.access_password.clone()),
             ("ask_with_password", self.ask_with_password.to_string()),
             ("file_transfer", self.file_transfer.to_string()),
+            ("allow_resize", self.allow_resize.to_string()),
         ]
     }
 }

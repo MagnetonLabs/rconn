@@ -47,18 +47,60 @@ impl Fit {
         }
     }
 
-    /// Put the original display mode back (if this session changed it).
-    pub fn restore(&mut self) {
-        if std::mem::take(&mut self.changed) {
+    /// Put the original display mode back (if this session changed it). Whether it did.
+    pub fn restore(&mut self) -> bool {
+        let changed = std::mem::take(&mut self.changed);
+        if changed {
             imp::restore();
             tracing::info!("screen size restored");
         }
+        changed
     }
 }
 
 impl Drop for Fit {
     fn drop(&mut self) {
         self.restore();
+    }
+}
+
+/// What a viewer asked of this screen's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Want {
+    /// Fit the screen to the viewer's picture area (pixels).
+    Fit(u32, u32),
+    /// Back to the screen's own size.
+    Restore,
+}
+
+/// Requests closer together than this are one request (the last one).
+pub const RESIZE_QUIET: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Apply only the latest of `rx`'s requests, once none has come for `quiet`: a window
+/// being dragged sends many, and each display mode switch blanks the screen, restarts
+/// capture and costs a full-size keyframe. A request arriving while one is being applied
+/// waits for it, then the same rule. Ends when every sender is gone, applying nothing
+/// still pending (the session is over and its screen is being put back).
+pub async fn coalesce<F, Fut>(
+    mut rx: tokio::sync::watch::Receiver<Option<Want>>,
+    quiet: std::time::Duration,
+    mut apply: F,
+) where
+    F: FnMut(Want) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    while rx.changed().await.is_ok() {
+        loop {
+            match tokio::time::timeout(quiet, rx.changed()).await {
+                Ok(Ok(())) => {}      // a newer request: wait again
+                Ok(Err(_)) => return, // session over
+                Err(_) => break,      // quiet: apply the latest
+            }
+        }
+        let want = *rx.borrow_and_update();
+        if let Some(want) = want {
+            apply(want).await;
+        }
     }
 }
 
@@ -368,6 +410,85 @@ mod imp {
     }
 
     pub fn restore() {}
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::{Want, coalesce};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::watch;
+    use tokio::time::sleep;
+
+    /// What was applied, in order.
+    type Applied = Arc<Mutex<Vec<Want>>>;
+
+    /// Runs `coalesce` with a 300 ms quiet period; each apply takes `busy`.
+    fn start(
+        busy: Duration,
+    ) -> (
+        watch::Sender<Option<Want>>,
+        Applied,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = watch::channel(None);
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let log = applied.clone();
+        let task = tokio::spawn(coalesce(rx, Duration::from_millis(300), move |w| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(w);
+                sleep(busy).await;
+            }
+        }));
+        (tx, applied, task)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drag_resize_is_one_mode_switch_to_the_last_size() {
+        let (tx, applied, _task) = start(Duration::ZERO);
+        // A window dragged for a second: a new size every 50 ms.
+        for i in 0..20 {
+            tx.send_replace(Some(Want::Fit(1000 + i * 10, 700)));
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(applied.lock().unwrap().is_empty(), "nothing while dragging");
+        sleep(Duration::from_millis(400)).await;
+        assert_eq!(*applied.lock().unwrap(), [Want::Fit(1190, 700)]);
+        // Separate requests, far apart, are each applied.
+        tx.send_replace(Some(Want::Restore));
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            *applied.lock().unwrap(),
+            [Want::Fit(1190, 700), Want::Restore]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_during_a_slow_switch_collapse_into_the_latest() {
+        // Windows took 2.7 s for one mode switch in the field.
+        let (tx, applied, _task) = start(Duration::from_millis(2700));
+        tx.send_replace(Some(Want::Fit(1498, 940)));
+        sleep(Duration::from_millis(400)).await; // applying now
+        tx.send_replace(Some(Want::Fit(1280, 768)));
+        sleep(Duration::from_millis(500)).await;
+        tx.send_replace(Some(Want::Fit(1920, 984)));
+        sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            *applied.lock().unwrap(),
+            [Want::Fit(1498, 940), Want::Fit(1920, 984)],
+            "1280x768 was superseded before its turn"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_pending_is_applied_after_the_session_ends() {
+        let (tx, applied, task) = start(Duration::ZERO);
+        tx.send_replace(Some(Want::Fit(1280, 800)));
+        drop(tx);
+        task.await.unwrap();
+        assert!(applied.lock().unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]

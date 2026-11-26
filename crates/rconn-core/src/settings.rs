@@ -89,6 +89,9 @@ pub struct HostSettings {
     /// Let viewers browse this computer's files and copy them both ways (the signed-in
     /// user's home folder; uploads land in Downloads/Rconn). Fleet policy can lock it.
     pub file_transfer: bool,
+    /// Let viewers change this screen's resolution to fit their window (put back when
+    /// the session ends). Fleet policy can lock it.
+    pub allow_resize: bool,
 }
 
 impl Default for HostSettings {
@@ -103,6 +106,7 @@ impl Default for HostSettings {
             access_password: String::new(),
             ask_with_password: false,
             file_transfer: true,
+            allow_resize: true,
         }
     }
 }
@@ -415,6 +419,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "access_password",
     "ask_with_password",
     "file_transfer",
+    "allow_resize",
 ];
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -541,6 +546,34 @@ mod tests {
         assert_eq!(
             s.check_write("file_transfer", Writer::Admin, false),
             Err(WriteDenied::LockedByPolicy("file_transfer".into()))
+        );
+    }
+
+    /// Resizing the screen follows the same rules: on by default, the local user may turn
+    /// it off, fleet policy locks it.
+    #[test]
+    fn allow_resize_defaults_on_and_policy_locks_it() {
+        let s = LoadedSettings::load(SettingsLayers::default()).unwrap();
+        assert!(s.settings().allow_resize);
+        assert_eq!(s.check_write("allow_resize", Writer::User, false), Ok(()));
+        let dir = tempfile::tempdir().unwrap();
+        let user = write(&dir, "user.toml", "allow_resize = false\n");
+        let s = LoadedSettings::load(SettingsLayers {
+            user_file: Some(user.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!s.settings().allow_resize);
+        let s = LoadedSettings::load(SettingsLayers {
+            user_file: Some(user),
+            fleet_policy: Some(json!({ "allow_resize": true })),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(s.settings().allow_resize, "policy wins");
+        assert_eq!(
+            s.check_write("allow_resize", Writer::Admin, false),
+            Err(WriteDenied::LockedByPolicy("allow_resize".into()))
         );
     }
 

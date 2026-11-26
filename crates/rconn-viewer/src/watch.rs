@@ -9,7 +9,7 @@ use rconn_peer::rtc::{PeerEvent, PeerOptions};
 use rconn_peer::session::open_viewer_session;
 use rconn_peer::signaling::SignalingClient;
 use rconn_peer::trust::ServerTrust;
-use rconn_peer::video::VideoReceiver;
+use rconn_peer::video::{KeyframeNeed, VideoReceiver};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use webrtc::data_channel::DataChannelEvent;
@@ -173,17 +173,26 @@ pub async fn run(
     let mut first_frame = None;
     let mut total = 0u32;
 
+    let mut need = KeyframeNeed::default();
     while Instant::now() < deadline {
-        let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), track.poll()).await else {
+        let polled = tokio::time::timeout(Duration::from_millis(250), track.poll()).await;
+        if need.poll(Instant::now()) {
+            tracing::warn!("no picture from the video; requesting keyframe");
+            let _ = kf_tx.send(());
+        }
+        let Ok(Some(ev)) = polled else {
             continue;
         };
         let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
             continue;
         };
+        if !pkt.payload.is_empty() {
+            need.data(Instant::now());
+        }
         let aus = rx.push(pkt);
         if rx.take_loss() {
-            tracing::warn!("video packets lost; requesting keyframe");
-            let _ = kf_tx.send(());
+            tracing::warn!("video packets lost");
+            need.lost();
         }
         for au in aus {
             window.bytes += au.len();
@@ -193,6 +202,7 @@ pub async fn run(
                     window.decode += d0.elapsed();
                     window.frames += 1;
                     total += 1;
+                    need.picture();
                     if first_frame.is_none() {
                         first_frame = Some(t0.elapsed());
                         println!(
@@ -206,8 +216,8 @@ pub async fn run(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(error = %e, "decode error; requesting keyframe");
-                    let _ = kf_tx.send(());
+                    tracing::warn!(error = %e, "decode error");
+                    need.lost();
                 }
             }
         }

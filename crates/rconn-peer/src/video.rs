@@ -14,12 +14,14 @@ use rtc::peer_connection::configuration::media_engine::{
     MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine,
 };
 use rtc::rtp::codec::h264::H264Packet;
+use rtc::rtp::packetizer::Depacketizer;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
     RtpCodecKind,
 };
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use webrtc::media_stream::Track;
 use webrtc::media_stream::track_local::TrackLocal;
@@ -61,38 +63,112 @@ fn h264() -> RTCRtpCodec {
 
 /// Latest congestion-control estimate in bits/s, shared with the encoder loop.
 #[derive(Clone)]
-pub struct TargetBitrate(Arc<AtomicU64>);
+pub struct TargetBitrate {
+    value: Arc<AtomicU64>,
+    shield: Arc<Mutex<Option<Shield>>>,
+}
+
+/// Names one [`TargetBitrate::shield`] call.
+#[derive(Clone, Copy, Debug)]
+pub struct ShieldTicket {
+    fresh: bool,
+    until: Instant,
+}
+
+/// The estimate held up through a burst the host causes itself (see
+/// [`TargetBitrate::shield`]).
+#[derive(Clone, Copy, Debug)]
+struct Shield {
+    floor: f64,
+    until: Instant,
+}
 
 impl TargetBitrate {
+    fn new(bps: f64) -> Self {
+        Self {
+            value: Arc::new(AtomicU64::new(bps.to_bits())),
+            shield: Arc::default(),
+        }
+    }
+
     pub fn get(&self) -> f64 {
-        f64::from_bits(self.0.load(Ordering::Relaxed))
+        f64::from_bits(self.value.load(Ordering::Relaxed))
+    }
+
+    /// The host is about to cause a burst on purpose (the screen changes size: a new
+    /// encoder, a full-size keyframe). Its queueing reads to congestion control like a
+    /// congested link and collapsed the estimate after every resize (8.5 -> 1 -> 0.3
+    /// Mb/s). For `window` the estimate is kept at least at today's value, and if it
+    /// has fallen below that by the end, it starts again from it. Returns a ticket for
+    /// [`Self::cancel_shield`].
+    pub fn shield(&self, window: Duration) -> ShieldTicket {
+        let floor = self.get();
+        let mut s = self.shield.lock().expect("shield");
+        let until = Instant::now() + window;
+        // Only a shield this call started may be cancelled by it.
+        let fresh = s.is_none();
+        *s = Some(match *s {
+            // Back-to-back resizes keep the value from before the first.
+            Some(old) => Shield {
+                floor: old.floor.max(floor),
+                until: old.until.max(until),
+            },
+            None => Shield { floor, until },
+        });
+        ShieldTicket { fresh, until }
+    }
+
+    /// The burst did not happen after all (the screen already had that size): drop the
+    /// shield, unless a later one has replaced it.
+    pub fn cancel_shield(&self, ticket: ShieldTicket) {
+        let mut s = self.shield.lock().expect("shield");
+        if ticket.fresh && s.is_some_and(|n| n.until == ticket.until) {
+            *s = None;
+        }
     }
 }
 
-/// GCC wrapped so every estimate update is published to [`TargetBitrate`].
+/// GCC wrapped so every estimate update is published to [`TargetBitrate`], and held up
+/// through a deliberate burst ([`TargetBitrate::shield`]).
 struct Reporting<E: BandwidthEstimator> {
     inner: E,
-    target: Arc<AtomicU64>,
+    /// A fresh estimator starting at the given bits/s.
+    restart: fn(f64) -> E,
+    target: TargetBitrate,
 }
 
 impl<E: BandwidthEstimator> Reporting<E> {
-    fn publish(&self) {
+    fn publish(&mut self, now: Instant) {
+        let mut estimate = self.inner.target_bitrate();
+        let shield = *self.target.shield.lock().expect("shield");
+        if let Some(s) = shield {
+            if now < s.until {
+                estimate = estimate.max(s.floor);
+            } else {
+                if estimate < s.floor {
+                    self.inner = (self.restart)(s.floor);
+                    estimate = self.inner.target_bitrate();
+                }
+                *self.target.shield.lock().expect("shield") = None;
+            }
+        }
         self.target
-            .store(self.inner.target_bitrate().to_bits(), Ordering::Relaxed);
+            .value
+            .store(estimate.to_bits(), Ordering::Relaxed);
     }
 }
 
 impl<E: BandwidthEstimator> BandwidthEstimator for Reporting<E> {
     fn on_reports(&mut self, now: Instant, reports: &[PacketReport]) {
         self.inner.on_reports(now, reports);
-        self.publish();
+        self.publish(now);
     }
     fn target_bitrate(&self) -> f64 {
-        self.inner.target_bitrate()
+        self.target.get()
     }
     fn handle_timeout(&mut self, now: Instant) {
         self.inner.handle_timeout(now);
-        self.publish();
+        self.publish(now);
     }
     fn poll_timeout(&self) -> Option<Instant> {
         self.inner.poll_timeout()
@@ -120,15 +196,17 @@ pub fn media_stack() -> Result<(MediaEngine, Registry, TargetBitrate)> {
         RtpCodecKind::Audio,
     )?;
     let registry = register_default_interceptors(Registry::new(), &mut engine)?;
-    let gcc = Gcc::new(START_BITRATE_BPS, MIN_BITRATE_BPS, MAX_BITRATE_BPS);
-    let target = Arc::new(AtomicU64::new(gcc.target_bitrate().to_bits()));
+    let gcc = |start| Gcc::new(start, MIN_BITRATE_BPS, MAX_BITRATE_BPS);
+    let inner = gcc(START_BITRATE_BPS);
+    let target = TargetBitrate::new(inner.target_bitrate());
     let estimator = Reporting {
-        inner: gcc,
+        inner,
+        restart: gcc,
         target: target.clone(),
     };
     let registry =
         configure_congestion_control(registry, estimator, CongestionFeedback::Twcc, &mut engine)?;
-    Ok((engine, registry, TargetBitrate(target)))
+    Ok((engine, registry, target))
 }
 
 /// The host's outgoing H.264 track.
@@ -280,6 +358,13 @@ pub struct VideoReceiver {
     /// Packets were lost for good since the last `take_loss`: the picture that follows
     /// is missing data, so the viewer should ask for a keyframe.
     lost: bool,
+    /// The frame arriving now, while its packets come in order right after the previous
+    /// frame's last one (so none of it can be missing).
+    frame: Vec<rtc::rtp::Packet>,
+    /// Sequence number of the last packet that ended a frame.
+    frame_end: Option<u16>,
+    /// RTP timestamps of the frames handed out lately (each frame goes out once).
+    delivered: VecDeque<u32>,
 }
 
 impl Default for VideoReceiver {
@@ -295,21 +380,89 @@ impl Default for VideoReceiver {
             builder: SampleBuilder::new(4096, H264Packet::default(), 90_000)
                 .with_max_time_delay(LOSS_GIVE_UP),
             lost: false,
+            frame: Vec::new(),
+            frame_end: None,
+            delivered: VecDeque::new(),
         }
     }
 }
 
 impl VideoReceiver {
     /// Feed one RTP packet; returns any access units it completed (Annex-B).
+    ///
+    /// The sample builder hands a frame out only once a packet of the *next* frame
+    /// arrives. A still screen sends no next frame: the keyframe after a screen-size
+    /// change (or any last change) waited, unseen, until something else moved. So a
+    /// frame whose packets all came in order, from right after the previous frame's end
+    /// to its own end, goes out at once; the builder's later copy of it is dropped.
     pub fn push(&mut self, packet: rtc::rtp::Packet) -> Vec<Bytes> {
         let now = Instant::now();
+        let early = self.follow(&packet);
         self.builder.push(now, packet);
         let mut out = Vec::new();
         while let Some(sample) = self.builder.pop(now) {
             self.lost |= sample.prev_dropped_packets > 0;
-            out.push(sample.data);
+            if self.deliver(sample.packet_timestamp) {
+                out.push(sample.data);
+            }
+        }
+        if let Some((timestamp, data)) = early
+            && self.deliver(timestamp)
+        {
+            out.push(data);
         }
         out
+    }
+
+    /// Track the frame in progress; the whole frame if `p` completed it.
+    fn follow(&mut self, p: &rtc::rtp::Packet) -> Option<(u32, Bytes)> {
+        let (seq, ts) = (p.header.sequence_number, p.header.timestamp);
+        // Right after the previous frame's end, or the stream's first packet.
+        let follows_end = self.frame_end.is_none_or(|end| end == seq.wrapping_sub(1));
+        if p.payload.is_empty() {
+            // Padding: keeps the chain unbroken, belongs to no frame.
+            if follows_end {
+                self.frame_end = Some(seq);
+            }
+            self.frame.clear();
+            return None;
+        }
+        let continues = self.frame.last().is_some_and(|l| {
+            l.header.timestamp == ts && l.header.sequence_number.wrapping_add(1) == seq
+        });
+        if continues {
+            self.frame.push(p.clone());
+        } else if follows_end && H264Packet::default().is_partition_head(&p.payload) {
+            self.frame = vec![p.clone()];
+        } else {
+            self.frame.clear();
+        }
+        if !p.header.marker {
+            return None;
+        }
+        self.frame_end = Some(seq);
+        let frame = std::mem::take(&mut self.frame);
+        if frame.is_empty() {
+            return None;
+        }
+        let mut depacketizer = H264Packet::default();
+        let mut data = Vec::new();
+        for p in &frame {
+            data.extend_from_slice(&depacketizer.depacketize(&p.payload).ok()?);
+        }
+        (!data.is_empty()).then(|| (ts, Bytes::from(data)))
+    }
+
+    /// Hand out the frame at `timestamp` unless it already went out.
+    fn deliver(&mut self, timestamp: u32) -> bool {
+        if self.delivered.contains(&timestamp) {
+            return false;
+        }
+        if self.delivered.len() == 32 {
+            self.delivered.pop_front();
+        }
+        self.delivered.push_back(timestamp);
+        true
     }
 
     /// Were packets lost for good since the last call? (Then ask the host for a keyframe:
@@ -321,6 +474,209 @@ impl VideoReceiver {
 
 /// How long the viewer waits for a missing packet before giving up on its frame.
 pub const LOSS_GIVE_UP: Duration = Duration::from_millis(250);
+
+/// Video arriving without a picture for this long: ask for a keyframe.
+pub const STALL: Duration = Duration::from_secs(1);
+/// Requests after a picture came: at most this often (each costs a full-size encode).
+const RETRY_AFTER_PICTURE: Duration = Duration::from_millis(300);
+/// Unanswered requests back off from `STALL` up to this: a full-size keyframe can take
+/// seconds on a slow link, and asking again meanwhile only queues more of them.
+const RETRY_MAX: Duration = Duration::from_secs(4);
+
+/// When the viewer asks the host for a keyframe: after lost packets or a decode error,
+/// and whenever video keeps arriving with no picture coming out of it. Some decoders say
+/// nothing when a picture can't be made (VideoToolbox, given frames that build on a
+/// keyframe it never saw, returns no error and no picture), so a lost keyframe after the
+/// host changed screen size froze the picture for good: nothing ever asked for another.
+#[derive(Debug, Default)]
+pub struct KeyframeNeed {
+    /// Packets were lost or a frame failed to decode, not yet asked about.
+    owed: bool,
+    /// Video has arrived since the last picture, since then.
+    waiting_since: Option<Instant>,
+    last_request: Option<Instant>,
+    /// Requests since the last picture.
+    unanswered: u32,
+}
+
+impl KeyframeNeed {
+    /// Packets were lost for good, or a frame failed to decode.
+    pub fn lost(&mut self) {
+        self.owed = true;
+    }
+
+    /// Video data (an RTP packet with payload) arrived.
+    pub fn data(&mut self, now: Instant) {
+        self.waiting_since.get_or_insert(now);
+    }
+
+    /// A picture came out of the decoder.
+    pub fn picture(&mut self) {
+        self.waiting_since = None;
+        self.unanswered = 0;
+    }
+
+    /// Should the viewer ask for a keyframe now? Call after every packet and on a timer
+    /// (a lost keyframe on a still screen is followed by no packets at all).
+    pub fn poll(&mut self, now: Instant) -> bool {
+        let stalled = self
+            .waiting_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= STALL);
+        if !self.owed && !stalled {
+            return false;
+        }
+        let gap = match self.unanswered {
+            0 => RETRY_AFTER_PICTURE,
+            n => (STALL * 2u32.saturating_pow(n - 1)).min(RETRY_MAX),
+        };
+        if self
+            .last_request
+            .is_some_and(|t| now.saturating_duration_since(t) < gap)
+        {
+            return false; // still owed: asked again once the gap is over
+        }
+        self.owed = false;
+        self.last_request = Some(now);
+        self.unanswered = self.unanswered.saturating_add(1);
+        true
+    }
+}
+
+#[cfg(test)]
+mod keyframe_need_tests {
+    use super::*;
+
+    fn ms(t0: Instant, n: u64) -> Instant {
+        t0 + Duration::from_millis(n)
+    }
+
+    #[test]
+    fn video_without_a_picture_asks_for_a_keyframe_and_backs_off() {
+        let t0 = Instant::now();
+        let mut k = KeyframeNeed::default();
+        k.picture();
+        // P-frames of a stream whose keyframe was lost: data, no picture, no error.
+        let mut asked = Vec::new();
+        for t in (0..12_000).step_by(50) {
+            k.data(ms(t0, t));
+            if k.poll(ms(t0, t)) {
+                asked.push(t);
+            }
+        }
+        assert_eq!(
+            asked,
+            [1000, 2000, 4000, 8000],
+            "1 s, then backing off to 4 s"
+        );
+    }
+
+    #[test]
+    fn a_picture_ends_the_stall() {
+        let t0 = Instant::now();
+        let mut k = KeyframeNeed::default();
+        k.data(t0);
+        assert!(!k.poll(ms(t0, 900)));
+        k.picture();
+        assert!(!k.poll(ms(t0, 1500)), "pictures are coming: nothing to ask");
+        // An idle screen sends nothing: no data, no request, however long.
+        assert!(!k.poll(ms(t0, 60_000)));
+    }
+
+    #[test]
+    fn a_still_screen_after_a_lost_keyframe_is_noticed_without_more_packets() {
+        let t0 = Instant::now();
+        let mut k = KeyframeNeed::default();
+        k.data(t0); // part of a keyframe that never completes; nothing follows
+        assert!(!k.poll(ms(t0, 500)));
+        assert!(k.poll(ms(t0, 1000)), "the timer finds it");
+    }
+
+    #[test]
+    fn a_loss_inside_the_throttle_is_remembered_not_dropped() {
+        let t0 = Instant::now();
+        let mut k = KeyframeNeed::default();
+        k.lost();
+        assert!(k.poll(t0), "first loss: ask at once");
+        k.picture(); // the keyframe came
+        k.lost(); // and soon another loss
+        assert!(!k.poll(ms(t0, 100)), "throttled");
+        assert!(
+            k.poll(ms(t0, 300)),
+            "...but still asked once the gap is over"
+        );
+        assert!(!k.poll(ms(t0, 2000)), "and only once");
+    }
+
+    #[test]
+    fn decode_errors_back_off_while_no_picture_comes() {
+        let t0 = Instant::now();
+        let mut k = KeyframeNeed::default();
+        let mut asked = Vec::new();
+        // An error on every frame at 30 fps, no picture for 10 s (a slow link).
+        for t in (0..10_000).step_by(33) {
+            k.data(ms(t0, t));
+            k.lost();
+            if k.poll(ms(t0, t)) {
+                asked.push(t);
+            }
+        }
+        assert_eq!(asked, [0, 1023, 3036, 7062], "not every 300 ms");
+    }
+}
+
+#[cfg(test)]
+mod shield_tests {
+    use super::*;
+
+    /// An estimator that falls to 1 Mb/s at the first feedback.
+    struct Falls(f64);
+
+    impl BandwidthEstimator for Falls {
+        fn on_reports(&mut self, _now: Instant, _reports: &[PacketReport]) {
+            self.0 = 1_000_000.0;
+        }
+        fn target_bitrate(&self) -> f64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn a_shielded_burst_does_not_collapse_the_estimate() {
+        let target = TargetBitrate::new(8_000_000.0);
+        let mut r = Reporting {
+            inner: Falls(8_000_000.0),
+            restart: Falls,
+            target: target.clone(),
+        };
+        target.shield(Duration::from_millis(500));
+        let now = Instant::now();
+        r.on_reports(now, &[]);
+        assert_eq!(target.get(), 8_000_000.0, "held during the window");
+        assert_eq!(r.target_bitrate(), 8_000_000.0, "the pacer sees the same");
+        // The window ends with the estimate still down: it restarts from before.
+        r.handle_timeout(now + Duration::from_secs(1));
+        assert_eq!(target.get(), 8_000_000.0);
+        assert_eq!(
+            r.inner.0, 8_000_000.0,
+            "estimator restarted at the old value"
+        );
+        // Afterwards congestion control is in charge again.
+        r.on_reports(now + Duration::from_secs(2), &[]);
+        assert_eq!(target.get(), 1_000_000.0);
+    }
+
+    #[test]
+    fn without_a_shield_the_estimate_is_published_as_is() {
+        let target = TargetBitrate::new(8_000_000.0);
+        let mut r = Reporting {
+            inner: Falls(8_000_000.0),
+            restart: Falls,
+            target: target.clone(),
+        };
+        r.on_reports(Instant::now(), &[]);
+        assert_eq!(target.get(), 1_000_000.0);
+    }
+}
 
 #[cfg(test)]
 mod receiver_tests {
@@ -377,6 +733,34 @@ mod receiver_tests {
             "whole frame: {} bytes",
             first.len()
         );
+        assert!(!rx.take_loss());
+    }
+
+    /// The last frame of a burst (a still screen after a change) comes out on its own
+    /// last packet, not only when a next frame arrives; and only once.
+    #[test]
+    fn a_complete_frame_comes_out_without_waiting_for_the_next() {
+        let mut rx = VideoReceiver::default();
+        let mut seq = 40;
+        let mut key = vec![0, 0, 0, 1, 0x65];
+        key.extend((0..5_000u32).map(|i| (i % 251) as u8 | 1));
+        let mut out = Vec::new();
+        for p in packets(&[0, 0, 0, 1, 0x41, 5, 5, 5], 0, &mut seq) {
+            out.extend(rx.push(p));
+        }
+        for p in packets(&key, 3000, &mut seq) {
+            out.extend(rx.push(p));
+        }
+        assert!(
+            out.iter().any(|au| au.len() >= key.len() - 4),
+            "the keyframe is out with nothing after it: {} unit(s)",
+            out.len()
+        );
+        let before = out.len();
+        for p in packets(&[0, 0, 0, 1, 0x41, 7, 7, 7], 6000, &mut seq) {
+            out.extend(rx.push(p));
+        }
+        assert_eq!(out.len(), before + 1, "the next frame, no second copy");
         assert!(!rx.take_loss());
     }
 

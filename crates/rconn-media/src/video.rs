@@ -323,6 +323,23 @@ impl VideoEncoder {
             }
         };
         let _ = changed_rows; // only the NV12 path can use it
+        // A keyframe asked for (a viewer lost its picture) is owed until one comes out: the
+        // rate controller may skip the frame it was asked of, and a viewer without a
+        // picture has nothing to show until it gets one.
+        if force_key && !self.last_was_key {
+            self.force_key = true;
+            // Media Foundation's "force keyframe" is a request an encoder may ignore (the
+            // property is optional, and its result is not checked). A picture came out and
+            // it is not a keyframe: start a new encoder, whose first frame always is.
+            #[cfg(windows)]
+            if !out.is_empty() && matches!(self.encoder, Some(Engine::MediaFoundation(_))) {
+                tracing::warn!(
+                    engine = %self.engine_name,
+                    "encoder ignored a keyframe request; restarting it"
+                );
+                self.encoder = None;
+            }
+        }
         let out = with_headers(out, &mut self.headers);
         Ok(if out.is_empty() { None } else { Some(out) })
     }
@@ -370,6 +387,11 @@ pub(crate) fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
         .zip(ends)
         .filter(|(s, e)| e > s)
         .map(move |(s, e)| &data[s..e])
+}
+
+/// The sequence parameter set (SPS) in `annex_b`, if any (without its start code).
+fn sequence_header(annex_b: &[u8]) -> Option<&[u8]> {
+    nal_units(annex_b).find(|nal| nal[0] & 0x1f == 7)
 }
 
 /// The SPS and PPS of `annex_b` (with start codes), if it carries both.
@@ -423,9 +445,11 @@ pub struct DecodedFrame {
 /// openh264 otherwise. `RCONN_DECODER=openh264` forces software, for comparisons.
 pub struct VideoDecoder {
     engine: DecEngine,
-    /// For falling back to software if the hardware decoder refuses a stream.
-    #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
+    /// For a fresh software decoder per stream, or falling back to software if the
+    /// hardware decoder refuses a stream.
     openh264_path: std::path::PathBuf,
+    /// The sequence header (SPS) of the stream being decoded.
+    sps: Vec<u8>,
 }
 
 enum DecEngine {
@@ -450,6 +474,16 @@ impl VideoDecoder {
         Ok(Self {
             engine,
             openh264_path: openh264_path.to_owned(),
+            sps: Vec::new(),
+        })
+    }
+
+    /// Cisco's openh264 on every platform (comparisons, tests).
+    pub fn software(openh264_path: &std::path::Path) -> Result<Self, CodecError> {
+        Ok(Self {
+            engine: Self::openh264(openh264_path)?,
+            openh264_path: openh264_path.to_owned(),
+            sps: Vec::new(),
         })
     }
 
@@ -469,7 +503,21 @@ impl VideoDecoder {
     }
 
     /// Decode one Annex-B access unit. `None` until the decoder has a full picture.
+    ///
+    /// A new sequence header (the host restarted its encoder: a new screen size, a new
+    /// capture after a desktop switch) gets a fresh software decoder, so nothing of the
+    /// old stream (its size, its reference pictures, a header replaced half-way) can keep
+    /// the new one from showing. VideoToolbox opens a new session for it ([`crate::vt`]).
     pub fn decode(&mut self, annex_b: &[u8]) -> Result<Option<DecodedFrame>, CodecError> {
+        if let Some(sps) = sequence_header(annex_b)
+            && sps != self.sps.as_slice()
+        {
+            let restart = !self.sps.is_empty();
+            self.sps = sps.to_vec();
+            if restart && matches!(self.engine, DecEngine::OpenH264(_)) {
+                self.engine = Self::openh264(&self.openh264_path)?;
+            }
+        }
         match &mut self.engine {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             DecEngine::VideoToolbox(vt) => {
@@ -723,10 +771,7 @@ mod hardware_decode {
         let aus = stream(&lib, 40);
         let mut hw = VideoDecoder::new(&lib).unwrap();
         assert_eq!(hw.engine_name(), "VideoToolbox (hardware)");
-        let mut sw = VideoDecoder {
-            engine: VideoDecoder::openh264(&lib).unwrap(),
-            openh264_path: lib.clone(),
-        };
+        let mut sw = VideoDecoder::software(&lib).unwrap();
         let (a, hw_ms) = decode_all(&mut hw, &aus);
         let (b, sw_ms) = decode_all(&mut sw, &aus);
         assert_eq!(hw.engine_name(), "VideoToolbox (hardware)", "no fallback");

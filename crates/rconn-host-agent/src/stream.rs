@@ -54,6 +54,8 @@ const MOTION_CHANGE: f32 = 0.25;
 const MOTION_FRAMES: u32 = 4;
 /// ...which ends after this long without such a frame.
 const MOTION_SETTLE: Duration = Duration::from_millis(700);
+/// A new capture's first keyframe is sent again after this long if nothing followed it.
+const STILL_REPEAT: Duration = Duration::from_secs(1);
 /// Only screens this large (in pixels) are halved during motion.
 const MOTION_MIN_PIXELS: usize = 2_500_000;
 
@@ -220,6 +222,10 @@ fn run_generation(
     // idle screen sends nothing else: repeat the current picture as a keyframe shortly
     // after, so a picture always arrives within about a second.
     let mut resends: Vec<Instant> = Vec::new();
+    // This capture's first frame has gone out; a repeat of it is due if the screen stays
+    // still (see below).
+    let mut sent_any = false;
+    let mut repeat_if_still = false;
     let mut stats = Stats::default();
 
     while !ctx.stop.load(Ordering::Relaxed) {
@@ -368,7 +374,19 @@ fn run_generation(
                     engine = enc.engine_name(),
                     "first frame encoded, sending"
                 );
+            } else if !sent_any {
+                // A new capture (the screen changed size, a desktop switch): its first
+                // frame is a keyframe at a new size. Lost on a still screen, nothing would
+                // follow it for the viewer to notice the gap by: send it once more unless
+                // other frames go out meanwhile.
+                resends = vec![Instant::now() + STILL_REPEAT];
+                repeat_if_still = true;
+            } else if repeat_if_still && !force {
+                // Later frames went out: a loss shows as a gap, and the viewer asks.
+                resends.clear();
+                repeat_if_still = false;
             }
+            sent_any = true;
             stats.bytes += au.len();
             stats.frames += 1;
             if let Some(p) = &p {

@@ -65,6 +65,7 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
         "access_password",
         "ask_with_password",
         "file_transfer",
+        "allow_resize",
     ]
     .iter()
     .map(|k| m.lock_reason(k))
@@ -138,6 +139,16 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
                     "Let the viewer copy files both ways",
                 )
                 .on_hover_text("Your home folder is shared; received files go to Downloads/Rconn.")
+            });
+            row(ui, "Screen resolution", locks[10], |ui| {
+                ui.checkbox(
+                    &mut form.allow_resize,
+                    "Let viewers change this screen's resolution",
+                )
+                .on_hover_text(
+                    "Only when the viewer turns on \"Match resolution\"; the original \
+                     resolution comes back when the session ends.",
+                )
             });
             row(ui, "Max video bitrate", locks[5], |ui| {
                 ui.add(

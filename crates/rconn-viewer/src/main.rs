@@ -7,6 +7,7 @@ mod gui;
 mod keymap;
 mod oidc_login;
 mod playback;
+mod prefs;
 mod watch;
 
 use anyhow::{Result, bail};

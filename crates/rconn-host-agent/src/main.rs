@@ -297,6 +297,11 @@ impl Drop for SessionMarker {
     }
 }
 
+/// How long after a screen-size change congestion control's estimate is held up: the
+/// mode switch, capture restart and first full-size keyframe fit in it (the slowest seen,
+/// on Windows: 2.7 s for the switch, then 0.3 s to the first frame).
+const RESIZE_SHIELD: Duration = Duration::from_secs(4);
+
 async fn serve_session(
     mut session: HostSession,
     cli: &Cli,
@@ -339,9 +344,42 @@ async fn serve_session(
     let binding = session.binding.clone();
     let session_id = session.session_id;
     let channel_gate = gate.clone();
-    // The screen fitted to the viewer's window; the original size returns at the end.
+    // The screen fitted to the viewer's window (only when the viewer asks, and the setting
+    // allows it); the original size returns at the end. Requests are coalesced: a window
+    // being dragged gives one mode switch, to its final size.
     let fit = Arc::new(std::sync::Mutex::new(display::Fit::default()));
-    let channel_fit = fit.clone();
+    let allow_resize = settings.settings().allow_resize;
+    let (resize_tx, resize_rx) = tokio::sync::watch::channel(None::<display::Want>);
+    let resize_tx = Arc::new(resize_tx);
+    let fitter = {
+        let fit = fit.clone();
+        let target = session.target_bitrate.clone();
+        tokio::spawn(display::coalesce(
+            resize_rx,
+            display::RESIZE_QUIET,
+            move |want| {
+                let (fit, target) = (fit.clone(), target.clone());
+                async move {
+                    // A mode switch restarts capture and the encoder: a burst of our own
+                    // making that congestion control must not take for a slow link.
+                    let ticket = target.shield(RESIZE_SHIELD);
+                    let changed = tokio::task::spawn_blocking(move || {
+                        let mut fit = fit.lock().expect("fit");
+                        match want {
+                            display::Want::Fit(w, h) => fit.apply(w, h).is_some(),
+                            display::Want::Restore => fit.restore(),
+                        }
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if !changed {
+                        target.cancel_shield(ticket);
+                    }
+                }
+            },
+        ))
+    };
+    let channel_resize = resize_tx.clone();
     let mut channels = std::mem::replace(
         &mut session.channels,
         tokio::sync::mpsc::unbounded_channel().1,
@@ -356,7 +394,7 @@ async fn serve_session(
                 policy: policy.clone(),
                 binding: binding.clone(),
             };
-            let (kf, fit) = (kf.clone(), channel_fit.clone());
+            let (kf, resize) = (kf.clone(), channel_resize.clone());
             tokio::spawn(async move {
                 if dc
                     .protocol()
@@ -366,7 +404,7 @@ async fn serve_session(
                     files::serve_channel(dc, session_id, file_setting, file_policy, guest.gate)
                         .await
                 } else {
-                    serve_channel(dc, kf, clipboard, fit, guest).await
+                    serve_channel(dc, kf, clipboard, resize, allow_resize, guest).await
                 }
             });
         }
@@ -442,6 +480,10 @@ async fn serve_session(
         stop,
     )
     .await;
+    // However the session ended (the viewer closed, the connection dropped): no more
+    // fitting, and the screen's own size back.
+    fitter.abort();
+    drop(resize_tx);
     let _ = tokio::task::spawn_blocking(move || fit.lock().expect("fit").restore()).await;
     result
 }
@@ -460,7 +502,8 @@ async fn serve_channel(
     dc: Arc<dyn DataChannel>,
     keyframes: KeyframeRequests,
     clipboard: bool,
-    fit: Arc<std::sync::Mutex<display::Fit>>,
+    resize: Arc<tokio::sync::watch::Sender<Option<display::Want>>>,
+    allow_resize: bool,
     guest: Guest,
 ) {
     match dc.protocol().await {
@@ -545,10 +588,14 @@ async fn serve_channel(
                     Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
                     Ok(DataMessage::Control(Control::Action(action))) => host_action(action),
                     Ok(DataMessage::Control(Control::Resize { width, height })) => {
-                        let fit = fit.clone();
-                        tokio::task::spawn_blocking(move || {
-                            fit.lock().expect("fit").apply(width, height)
-                        });
+                        if allow_resize {
+                            resize.send_replace(Some(display::Want::Fit(width, height)));
+                        } else {
+                            tracing::debug!(width, height, "resolution changes are off in settings; ignoring");
+                        }
+                    }
+                    Ok(DataMessage::Control(Control::RestoreResolution)) => {
+                        resize.send_replace(Some(display::Want::Restore));
                     }
                     Ok(DataMessage::Input(ev)) => {
                         stream::note_input(); // someone is interacting: full frame rate
