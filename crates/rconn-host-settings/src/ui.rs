@@ -63,6 +63,7 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
         "max_bitrate_kbps",
         "log_level",
         "access_password",
+        "ask_with_password",
     ]
     .iter()
     .map(|k| m.lock_reason(k))
@@ -156,7 +157,7 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
             row(ui, "Access password", locks[7], |ui| {
                 ui.vertical(|ui| {
                     ui.label(if form.access_password.is_empty() {
-                        "Off: only signed-in accounts can connect."
+                        "None: whoever connects with the ID must be accepted at this computer."
                     } else {
                         "On: anyone with this computer's ID and the password can connect."
                     });
@@ -175,12 +176,22 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
                                 Err(e) => access_msg = Some((e, true)),
                             }
                         }
-                        if !form.access_password.is_empty() && ui.button("Turn off").clicked() {
+                        if !form.access_password.is_empty() && ui.button("Remove").clicked() {
                             form.access_password.clear();
                         }
                     });
                 })
                 .response
+            });
+            row(ui, "Without the password", locks[8], |ui| {
+                ui.checkbox(
+                    &mut form.ask_with_password,
+                    "Also let people ask: someone here accepts or declines",
+                )
+                .on_hover_text(
+                    "Off: with a password set, it is the only way in. Without a password, \
+                     connections always need someone here to accept.",
+                )
             });
             row(ui, "Log level", locks[6], |ui| {
                 egui::ComboBox::from_id_salt("log_level")

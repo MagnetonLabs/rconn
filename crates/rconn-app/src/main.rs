@@ -1,4 +1,5 @@
-//! `rconn`: the desktop app. `rconn --tray` runs only the tray icon.
+//! `rconn`: the desktop app. `rconn --tray` runs only the tray icon; `rconn --ask <json>`
+//! shows the host agent's "allow this connection?" question (see `rconn_app::ask`).
 #![cfg_attr(windows, windows_subsystem = "windows")] // no console window behind the GUI
 
 use rconn_app::home::{self, Home};
@@ -47,6 +48,10 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The host agent asking the person here about a connection (own window, own process).
+    if args.first().map(String::as_str) == Some("--ask") {
+        return rconn_app::ask::run(args.get(1).map_or("", String::as_str));
+    }
     if args.iter().any(|a| a == "--tray") {
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         return rconn_app::tray::run(rconn_app::worker::Paths::installed().status_file);
