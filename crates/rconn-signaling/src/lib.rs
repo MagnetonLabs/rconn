@@ -106,7 +106,7 @@ impl AppState {
     }
 
     /// Let signed-in operators of `org` turn their own computers into hosts
-    /// ("Allow connections to this computer" in the app).
+    /// (the app does this when signed in; computers without an account use the public CA).
     pub fn allow_enrollment(&self, org: rconn_core::ids::OrgId, ca: rconn_core::fleet::FleetCa) {
         let _ = self.inner.enroller.set((org, ca));
     }

@@ -97,6 +97,10 @@ pub fn spawn(shared: Shared, ctx: egui::Context, paths: Paths) -> mpsc::Unbounde
         .spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async move {
+                {
+                    let w = w.clone();
+                    tokio::spawn(async move { w.first_launch().await });
+                }
                 let mut tick = tokio::time::interval(Duration::from_secs(5));
                 let mut n: u64 = 0;
                 loop {
@@ -141,7 +145,7 @@ impl Worker {
         self.home(|h| {
             let fp = h.profile.fingerprint().map(str::to_owned);
             (
-                h.profile.server.clone(),
+                h.profile.server_url().to_owned(),
                 ServerTrust::from_fingerprint(fp.as_deref()),
                 fp,
             )
@@ -149,8 +153,20 @@ impl Worker {
     }
 
     fn token(&self) -> Option<String> {
-        let server = self.home(|h| h.profile.server.clone());
+        let server = self.home(|h| h.profile.server_url().to_owned());
         profile::token_for(&self.paths.config, &server, profile::now_unix())
+    }
+
+    /// First launch, like AnyDesk: give this computer an ID right away (no account, no
+    /// "allow" step), unless incoming connections were turned off here before.
+    async fn first_launch(&self) {
+        let decided = self.home(|h| h.profile.incoming);
+        if cfg!(unix)
+            && decided != Some(false)
+            && !rconn_peer::identity::has_identity(&self.paths.host_data)
+        {
+            self.enable_host().await;
+        }
     }
 
     /// Re-read this computer's status (and, every few ticks, its settings).
@@ -291,7 +307,13 @@ impl Worker {
                 }
             }
             Request::Connect(id, label) => self.connect(id, label).await,
-            Request::ConnectGuest { id, password } => self.connect_guest(id, password.0).await,
+            Request::ConnectGuest { id, password } => {
+                self.home(|h| {
+                    h.profile.remember_code(&id);
+                    let _ = h.profile.save(&self.paths.config);
+                });
+                self.connect_guest(id, password.0).await
+            }
             Request::SetAccessPassword(p) => self.set_access_password(Some(p.0)).await,
             Request::ClearAccessPassword => self.set_access_password(None).await,
             Request::SaveServer {
@@ -306,14 +328,7 @@ impl Worker {
                 });
                 let signed_in = self.token().is_some();
                 self.home(|h| h.signed_in = signed_in);
-                self.notice(
-                    if signed_in {
-                        "Server saved"
-                    } else {
-                        "Server saved. Now sign in below."
-                    },
-                    false,
-                );
+                self.notice("Server saved", false);
             }
             Request::OpenHostSettings => {
                 if let Err(e) =
@@ -329,8 +344,10 @@ impl Worker {
                 self.home(|h| {
                     h.this = None;
                     h.host_settings = None;
+                    h.profile.incoming = Some(false);
+                    let _ = h.profile.save(&self.paths.config);
                 });
-                self.notice("Connections to this computer are off", false);
+                self.notice("Incoming connections to this computer are off", false);
             }
             Request::OpenPermission(name) => {
                 #[cfg(target_os = "macos")]
@@ -347,8 +364,17 @@ impl Worker {
         }
     }
 
-    /// macOS and Linux: get an id from the server for this computer (reusing a saved one),
-    /// then start the host agent at login.
+    /// Why turning on incoming connections failed: shown in "This computer".
+    fn host_failed(&self, text: String) {
+        self.home(|h| {
+            h.host_setup = None;
+            h.host_error = Some(text);
+        });
+    }
+
+    /// macOS and Linux: get an ID from the server for this computer (reusing a saved one),
+    /// then start the host agent at login. No account needed: the computer belongs to
+    /// nobody and takes the access password. Signed in to a fleet, it joins the fleet.
     async fn enable_host(&self) {
         #[cfg(not(unix))]
         self.notice("Use the Rconn host installer on this OS", true);
@@ -359,48 +385,64 @@ impl Worker {
             } else {
                 "this computer"
             };
-            let Some(token) = self.token() else {
-                return self.notice("Sign in first (⚙ Settings)", true);
-            };
-            self.home(|h| h.busy = Some(format!("Setting up connections to {this}…")));
+            self.home(|h| {
+                h.host_error = None;
+                h.host_setup = Some(format!("Getting an ID for {this}…"));
+            });
             let (server, trust, fp) = self.server();
             let dir = self.paths.host_data.clone();
-            if !crate::userhost::has_identity(&dir) {
-                let key = match rconn_core::fleet::HostKey::generate() {
-                    Ok(k) => k,
-                    Err(e) => return self.notice(format!("Couldn't create a key: {e}"), true),
-                };
-                match SignalingClient::enroll_host(&server, &trust, &token, &key).await {
-                    Ok((id, cert)) => {
-                        if let Err(e) = crate::userhost::save_identity(
-                            &dir,
-                            &id.to_string(),
-                            &cert,
-                            &key.to_pem(),
-                        ) {
-                            return self
-                                .notice(format!("Couldn't save {this}'s identity: {e}"), true);
-                        }
+            if !rconn_peer::identity::has_identity(&dir) {
+                let enrolled = match self.token() {
+                    Some(token) => {
+                        let key = match rconn_core::fleet::HostKey::generate() {
+                            Ok(k) => k,
+                            Err(e) => {
+                                return self.host_failed(format!("Couldn't create a key: {e}"));
+                            }
+                        };
+                        SignalingClient::enroll_host(&server, &trust, &token, &key)
+                            .await
+                            .and_then(|(id, cert)| {
+                                rconn_peer::identity::save_identity(&dir, id, &cert, &key, None)
+                            })
                     }
-                    Err(e) => return self.notice(format!("The server refused: {e:#}"), true),
+                    None => rconn_peer::identity::enroll_anonymous_into(&dir, &server, &trust)
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(e) = enrolled {
+                    return self.host_failed(format!("Couldn't get an ID from {server}: {e:#}"));
                 }
             }
+            self.home(|h| h.host_setup = Some(format!("Starting the host on {this}…")));
             let agent = std::env::current_exe()
                 .unwrap_or_default()
                 .with_file_name("rconn-host-agent");
             match crate::userhost::install(&agent, &dir, &server, fp.as_deref()) {
                 Ok(()) => {
+                    self.home(|h| {
+                        h.profile.incoming = Some(true);
+                        let _ = h.profile.save(&self.paths.config);
+                    });
+                    // The ID shows once the agent publishes its status (a few seconds).
+                    for _ in 0..20 {
+                        if HostStatus::read(&self.paths.status_file).is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    self.home(|h| h.host_setup = None);
+                    self.refresh_local(true);
                     self.notice(
                         if cfg!(target_os = "macos") {
-                            "This Mac now accepts connections. Allow the macOS permissions when asked."
+                            "This Mac has an ID. Allow the macOS permissions when asked, then set an access password."
                         } else {
-                            "This computer now accepts connections."
+                            "This computer has an ID. Set an access password so others can connect."
                         },
                         false,
                     );
-                    self.refresh_local(true);
                 }
-                Err(e) => self.notice(format!("Couldn't start the host: {e}"), true),
+                Err(e) => self.host_failed(format!("Couldn't start the host: {e}")),
             }
         }
     }

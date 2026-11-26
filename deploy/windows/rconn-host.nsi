@@ -1,9 +1,13 @@
 ; rconn host installer (NSIS). Built by scripts/package.sh:
 ;   makensis -DARCH=x64|arm64 -DVERSION=0.1.0 -DSRC=<staging dir> -DOUT=<setup.exe> rconn-host.nsi
 ;
-; Interactive: asks for the server URL, the server pin and the host identity folder.
-; Silent (fleet rollout):
+; Default: the public Rconn server, no account. The computer gets its ID from the server at
+; the service's first start; connecting to it then needs its access password.
+; Interactive: the server URL, pin and identity folder can be changed (self-hosted fleets).
+; Silent:
+;   rconn-host-setup.exe /S                                   (public server, no account)
 ;   rconn-host-setup.exe /S /SERVER=wss://rconn.example.com:443/v1/ws /PIN=sha256:... /IDENTITY=C:\path\host1
+; Upgrading without /SERVER keeps the server already configured.
 
 Unicode true
 !include "MUI2.nsh"
@@ -12,6 +16,8 @@ Unicode true
 !include "FileFunc.nsh"
 !include "x64.nsh"
 !include "getarg.nsh"
+
+!define DEFAULT_SERVER "wss://connect.rconn.app/v1/ws"
 
 Name "Rconn host ${VERSION} (${ARCH})"
 OutFile "${OUT}"
@@ -49,19 +55,24 @@ Function .onInit
   !insertmacro GetArg $0 "/SERVER=" $Server
   !insertmacro GetArg $0 "/PIN=" $Pin
   !insertmacro GetArg $0 "/IDENTITY=" $Identity
+  ; New install: the public server. Upgrade: an empty field keeps the current one.
+  ${If} $Server == ""
+  ${AndIfNot} ${FileExists} "$COMMONPROGRAMDATA\rconn\host.toml"
+    StrCpy $Server "${DEFAULT_SERVER}"
+  ${EndIf}
 FunctionEnd
 
 Function ServerPage
-  !insertmacro MUI_HEADER_TEXT "Connect to your Rconn server" "Values printed by the server installer and by enroll-host."
+  !insertmacro MUI_HEADER_TEXT "Rconn server" "Keep the defaults to use the public Rconn server without an account."
   nsDialogs::Create 1018
   Pop $0
-  ${NSD_CreateLabel} 0 0 100% 12u "Server URL (e.g. wss://rconn.example.com:443/v1/ws):"
+  ${NSD_CreateLabel} 0 0 100% 12u "Server URL (empty: keep the current one):"
   ${NSD_CreateText} 0 13u 100% 12u "$Server"
   Pop $ServerField
   ${NSD_CreateLabel} 0 32u 100% 12u "Server pin (sha256:..., leave empty for a public certificate):"
   ${NSD_CreateText} 0 45u 100% 12u "$Pin"
   Pop $PinField
-  ${NSD_CreateLabel} 0 64u 100% 12u "Host identity folder (from enroll-host; contains host.id):"
+  ${NSD_CreateLabel} 0 64u 100% 12u "Self-hosted fleets only: host identity folder from enroll-host (else leave empty):"
   ${NSD_CreateDirRequest} 0 77u 80% 12u "$Identity"
   Pop $IdentityField
   ${NSD_CreateBrowseButton} 82% 77u 18% 12u "Browse..."
@@ -82,22 +93,18 @@ Function ServerPageLeave
   ${NSD_GetText} $ServerField $Server
   ${NSD_GetText} $PinField $Pin
   ${NSD_GetText} $IdentityField $Identity
-  ${If} $Server == ""
-  ${OrIf} $Identity == ""
-    MessageBox MB_ICONEXCLAMATION "Server URL and identity folder are required."
-    Abort
-  ${EndIf}
-  ${IfNot} ${FileExists} "$Identity\host.id"
-    MessageBox MB_ICONEXCLAMATION "No host.id in $Identity. Choose the folder made by enroll-host."
+  ${If} $Identity != ""
+  ${AndIfNot} ${FileExists} "$Identity\host.id"
+    MessageBox MB_ICONEXCLAMATION "No host.id in $Identity. Choose the folder made by enroll-host, or leave it empty."
     Abort
   ${EndIf}
 FunctionEnd
 
 Section "Rconn host" SecHost
   SetRegView 64
-  ${If} $Server == ""
-  ${OrIf} $Identity == ""
-    DetailPrint "Missing /SERVER= or /IDENTITY= (silent install)."
+  ${If} $Identity != ""
+  ${AndIf} $Server == ""
+    DetailPrint "/IDENTITY= needs /SERVER= (the server that enrolled it)."
     SetErrorLevel 2
     Abort
   ${EndIf}
@@ -119,11 +126,19 @@ Section "Rconn host" SecHost
   File "${SRC}\host\rconn-settings.exe"
   File "rconn.ico"
 
-  ${If} $Pin == ""
-    nsExec::ExecToLog '"$INSTDIR\rconn-host-service.exe" configure --server "$Server" --identity-from "$Identity"'
+  ; Empty server on an upgrade: keep host.toml, only re-apply the folder's permissions.
+  ${If} $Server == ""
+    StrCpy $1 '"$INSTDIR\rconn-host-service.exe" configure --keep-server'
   ${Else}
-    nsExec::ExecToLog '"$INSTDIR\rconn-host-service.exe" configure --server "$Server" --fingerprint "$Pin" --identity-from "$Identity"'
+    StrCpy $1 '"$INSTDIR\rconn-host-service.exe" configure --server "$Server"'
+    ${If} $Pin != ""
+      StrCpy $1 '$1 --fingerprint "$Pin"'
+    ${EndIf}
   ${EndIf}
+  ${If} $Identity != ""
+    StrCpy $1 '$1 --identity-from "$Identity"'
+  ${EndIf}
+  nsExec::ExecToLog $1
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Configuring the host failed (code $0). See the details above." /SD IDOK

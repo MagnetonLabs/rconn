@@ -23,7 +23,8 @@ use webrtc::data_channel::DataChannelEvent;
 #[derive(Parser)]
 #[command(version, about = "rconn viewer")]
 struct Cli {
-    #[arg(long, env = "RCONN_SERVER")]
+    /// Signaling server. Default: the public Rconn server.
+    #[arg(long, env = "RCONN_SERVER", default_value = rconn_core::DEFAULT_SERVER)]
     server: String,
     /// Operator token. Defaults to the one saved by `login` for this server.
     #[arg(long, env = "RCONN_TOKEN", hide_env_values = true)]

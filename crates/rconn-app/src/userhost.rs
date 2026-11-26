@@ -50,27 +50,6 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-/// Is a host identity already saved here? (Re-enabling reuses it.)
-pub fn has_identity(dir: &Path) -> bool {
-    dir.join("host.id").exists()
-        && dir.join("host.key.pem").exists()
-        && dir.join("host.cert.pem").exists()
-}
-
-pub fn save_identity(
-    dir: &Path,
-    host_id: &str,
-    cert_pem: &str,
-    key_pem: &str,
-) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    write_private(&dir.join("host.id"), host_id)?;
-    write_private(&dir.join("host.cert.pem"), cert_pem)?;
-    write_private(&dir.join("host.key.pem"), key_pem)
-}
-
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

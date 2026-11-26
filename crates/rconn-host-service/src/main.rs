@@ -29,16 +29,22 @@ enum Cmd {
     /// connect without an account. Read from the first line of stdin, never the command
     /// line; an empty line turns access by password off.
     SetAccessPassword,
-    /// (Windows, admin) write host.toml + identity into ProgramData\rconn and lock it down.
+    /// (Windows, admin) write host.toml (+ identity) into ProgramData\rconn and lock it
+    /// down. Without --identity-from the agent gets an ID from the server at first start
+    /// (no account; every session then needs the access password).
     Configure {
-        /// Signaling server URL (also the identity bound into host proofs).
+        /// Signaling server URL (also the identity bound into host proofs). Default: the
+        /// public server.
+        #[arg(long, conflicts_with = "keep_server")]
+        server: Option<String>,
+        /// Upgrade: keep host.toml as it is; only lock the folders down again.
         #[arg(long)]
-        server: String,
+        keep_server: bool,
         #[arg(long)]
         fingerprint: Option<String>,
-        /// Directory from `rconn-signaling enroll-host`.
+        /// Directory from `rconn-signaling enroll-host` (self-hosted fleets).
         #[arg(long)]
-        identity_from: std::path::PathBuf,
+        identity_from: Option<std::path::PathBuf>,
     },
     /// (Windows, admin) register and start the `rconn-host` service.
     Install,
@@ -147,11 +153,18 @@ fn main() -> Result<()> {
         }
         Cmd::Configure {
             server,
+            keep_server,
             fingerprint,
             identity_from,
         } => windows_only(|| {
+            let server = (!keep_server)
+                .then(|| server.unwrap_or_else(|| rconn_core::DEFAULT_SERVER.to_owned()));
             #[cfg(windows)]
-            service::configure(&server, fingerprint.as_deref(), &identity_from)?;
+            service::configure(
+                server.as_deref(),
+                fingerprint.as_deref(),
+                identity_from.as_deref(),
+            )?;
             #[cfg(not(windows))]
             let _ = (&server, &fingerprint, &identity_from);
             Ok(())

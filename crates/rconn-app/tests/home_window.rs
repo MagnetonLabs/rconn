@@ -108,7 +108,7 @@ fn render(name: &str, mut h: Home) -> Vec<Request> {
         .build_ui(|ui| {
             requests.extend(home::draw(ui, &mut h));
         });
-    harness.run();
+    harness.run_steps(4); // not `run`: a spinner never settles
     let image = harness.render().expect("offscreen render");
     let dir = std::env::var_os("RCONN_APP_PNG_DIR").map(std::path::PathBuf::from);
     if let Some(dir) = dir {
@@ -132,6 +132,115 @@ fn renders_each_tab() {
     let mut no_host = Home::new(Profile::default());
     no_host.tab = Tab::Settings;
     render("home-not-a-host", no_host);
+    render("home-first-run", first_run());
+    render("home-no-account", no_account(false));
+    render("home-no-account-password-set", no_account(true));
+}
+
+/// First launch: no server configured, no account, the ID being fetched.
+fn first_run() -> Home {
+    let mut h = Home::new(Profile::default());
+    h.host_setup = Some("Getting an ID for this Mac…".into());
+    h
+}
+
+/// No account anywhere: an ID from the public server, a recent computer reached by ID.
+fn no_account(password_set: bool) -> Home {
+    let mut p = Profile::default();
+    p.remember_code("987654321");
+    let mut h = Home::new(p);
+    let me = id("1e5ede94-60e3-408a-9cc4-b1c92e0ca86b");
+    h.now = 1_000;
+    h.this = Some(HostStatus {
+        host_id: me.to_string(),
+        short_code: me.short_code(),
+        label: "Matts-MacBook".into(),
+        server: rconn_core::DEFAULT_SERVER.into(),
+        online: true,
+        access_password: password_set,
+        updated: 990,
+        ..Default::default()
+    });
+    h
+}
+
+#[test]
+fn no_server_means_the_public_one_and_guests_are_remembered_by_id() {
+    let mut p = Profile::default();
+    assert_eq!(p.server_url(), rconn_core::DEFAULT_SERVER);
+    assert!(p.on_public_server());
+    assert_eq!(
+        p.incoming, None,
+        "first launch turns incoming connections on"
+    );
+    p.remember_code("123-456789");
+    p.remember_code("555 666 777");
+    p.remember_code("123456789");
+    let codes: Vec<_> = p.recent.iter().map(|r| r.code()).collect();
+    assert_eq!(codes, vec!["123 456 789", "555 666 777"]);
+    assert_eq!(rconn_app::profile::tidy_code(" abc "), "abc");
+    // Older app.json files (host_id only) still load.
+    let old: Profile = serde_json::from_str(
+        r#"{"server":"","fingerprint":"","username":"","recent":[{"host_id":"1e5ede94-60e3-408a-9cc4-b1c92e0ca86b","label":"X"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        old.recent[0].code(),
+        id("1e5ede94-60e3-408a-9cc4-b1c92e0ca86b").short_code()
+    );
+}
+
+/// Drive the window like a person would: clicks in, requests out.
+fn harness(h: Home) -> Harness<'static, (Home, Vec<Request>)> {
+    Harness::builder()
+        .with_size(egui::vec2(980.0, 640.0))
+        .build_ui_state(
+            |ui, (h, out): &mut (Home, Vec<Request>)| out.extend(home::draw(ui, h)),
+            (h, Vec::new()),
+        )
+}
+
+#[test]
+fn without_an_account_the_window_asks_for_the_password_and_connects_by_id() {
+    use egui_kittest::kittest::Queryable;
+    let mut hs = harness(no_account(false));
+    hs.run();
+    // No sign-in anywhere on the way: the access password is the prompt.
+    assert!(hs.query_by_label("Set an access password").is_some());
+    assert!(hs.query_by_label("Sign in").is_none());
+    // A recent computer: clicking it fills in its ID and waits for the password.
+    hs.get_by_label("Connect").click();
+    hs.run();
+    assert_eq!(hs.state().0.connect_to, "987 654 321");
+    hs.state_mut().0.access_password = "correct horse".into();
+    hs.run();
+    hs.get_all_by_label("  Connect  ").next().unwrap().click();
+    hs.run();
+    assert_eq!(
+        hs.state().1,
+        vec![Request::ConnectGuest {
+            id: "987 654 321".into(),
+            password: home::Secret("correct horse".into()),
+        }]
+    );
+}
+
+#[test]
+fn incoming_connections_can_be_turned_off_and_on_without_an_account() {
+    use egui_kittest::kittest::Queryable;
+    let mut hs = harness(no_account(true));
+    hs.run();
+    assert!(hs.query_by_label("Access password set").is_some());
+    hs.get_by_label("Turn off incoming connections").click();
+    hs.run();
+    assert_eq!(hs.state().1, vec![Request::DisableHost]);
+    let mut off = Home::new(Profile::default());
+    off.can_host_here = true;
+    let mut hs = harness(off);
+    hs.run();
+    hs.get_by_label("Turn on incoming connections").click();
+    hs.run();
+    assert_eq!(hs.state().1, vec![Request::EnableHost]);
 }
 
 /// The session window's toolbar labels (rconn-viewer) render with the bundled fonts.
