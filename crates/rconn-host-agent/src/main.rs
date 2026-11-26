@@ -487,6 +487,7 @@ async fn serve_session(
         max_bitrate_bps: cli.max_kbps.saturating_mul(1000),
         max_size: (mw.parse()?, mh.parse()?),
         motion_half_res: cli.motion_half_res,
+        software: false,
     };
     // Host sound runs alongside the picture; losing it never ends the session.
     if let (Some(audio_track), false) = (session.audio.take(), cli.no_audio) {
@@ -627,6 +628,9 @@ async fn serve_channel(
                         } else {
                             tracing::debug!(width, height, "resolution changes are off in settings; ignoring");
                         }
+                    }
+                    Ok(DataMessage::Control(Control::ViewSize { width, height })) => {
+                        keyframes.set_view_size(width, height)
                     }
                     Ok(DataMessage::Control(Control::RestoreResolution)) => {
                         resize.send_replace(Some(display::Want::Restore));

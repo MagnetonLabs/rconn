@@ -385,6 +385,172 @@ impl I420 {
     }
 }
 
+/// Source samples and weights (summing to [`ONE`]) that make one output sample.
+type Taps = Vec<(usize, Vec<u16>)>;
+
+/// Fixed-point 1.0 for scaler weights.
+const ONE: u32 = 256;
+
+/// Area-average taps for scaling `src` samples down to `dst` (each output sample is the
+/// mean of the source span it covers, edges weighted by their overlap): text stays
+/// legible, without the aliasing of nearest or bilinear sampling.
+fn area_taps(src: usize, dst: usize) -> Taps {
+    let f = src as f64 / dst as f64;
+    (0..dst)
+        .map(|i| {
+            let (a, b) = (i as f64 * f, ((i + 1) as f64 * f).min(src as f64));
+            let first = a.floor() as usize;
+            let last = (b.ceil() as usize).clamp(first + 1, src);
+            let mut w: Vec<u16> = (first..last)
+                .map(|s| {
+                    let overlap = (b.min(s as f64 + 1.0) - a.max(s as f64)).max(0.0);
+                    (overlap / (b - a) * f64::from(ONE)).round() as u16
+                })
+                .collect();
+            // Rounding may leave the sum a little off: the largest weight takes it.
+            let sum: i32 = w.iter().map(|&v| i32::from(v)).sum();
+            let k = (0..w.len()).max_by_key(|&k| w[k]).unwrap_or(0);
+            w[k] = (i32::from(w[k]) + ONE as i32 - sum).max(0) as u16;
+            (first, w)
+        })
+        .collect()
+}
+
+/// One plane's taps, both ways.
+struct PlaneTaps {
+    x: Taps,
+    y: Taps,
+}
+
+impl PlaneTaps {
+    fn new((sw, sh): (usize, usize), (dw, dh): (usize, usize)) -> Self {
+        Self {
+            x: area_taps(sw, dw),
+            y: area_taps(sh, dh),
+        }
+    }
+
+    /// Output rows whose source spans touch source rows `r0..r1`.
+    fn rows_from(&self, (r0, r1): (usize, usize)) -> (usize, usize) {
+        let touches = |(first, w): &(usize, Vec<u16>)| *first < r1 && first + w.len() > r0;
+        let o0 = self.y.iter().position(touches);
+        let o1 = self.y.iter().rposition(touches);
+        match (o0, o1) {
+            (Some(a), Some(b)) => (a, b + 1),
+            _ => (0, 0),
+        }
+    }
+
+    /// Output rows `rows` of `dst` (`dw` per row) from `src` (`sw` per row).
+    fn run(&self, src: &[u8], sw: usize, dst: &mut [u8], dw: usize, (o0, o1): (usize, usize)) {
+        if o1 <= o0 {
+            return;
+        }
+        let out = &mut dst[o0 * dw..o1 * dw];
+        let rows = o1 - o0;
+        let bands = threads().min(rows / MIN_BAND_ROWS).max(1);
+        let band_rows = rows.div_ceil(bands).max(1);
+        std::thread::scope(|s| {
+            for (i, band) in out.chunks_mut(band_rows * dw).enumerate() {
+                let mut job = move || {
+                    let mut acc = vec![0u16; sw];
+                    for (r, line) in band.chunks_exact_mut(dw).enumerate() {
+                        let (first, wy) = &self.y[o0 + i * band_rows + r];
+                        // Vertical: weighted sum of the source rows (vectorizes).
+                        acc.fill(0);
+                        for (k, &w) in wy.iter().enumerate() {
+                            let row = &src[(first + k) * sw..(first + k + 1) * sw];
+                            for (a, &p) in acc.iter_mut().zip(row) {
+                                *a += u16::from(p) * w;
+                            }
+                        }
+                        // Horizontal.
+                        for (px, (fx, wx)) in line.iter_mut().zip(&self.x) {
+                            let sum: u32 = wx
+                                .iter()
+                                .zip(&acc[*fx..])
+                                .map(|(&w, &a)| u32::from(w) * u32::from(a))
+                                .sum();
+                            *px = ((sum + ONE * ONE / 2) / (ONE * ONE)) as u8;
+                        }
+                    }
+                };
+                if bands == 1 {
+                    job();
+                } else {
+                    s.spawn(job);
+                }
+            }
+        });
+    }
+}
+
+/// Scales I420 pictures of one size down to another (area average), redoing only the
+/// output rows a change touches. Built once per pair of sizes.
+pub struct Scaler {
+    from: (usize, usize),
+    to: (usize, usize),
+    luma: PlaneTaps,
+    chroma: PlaneTaps,
+}
+
+impl Scaler {
+    /// `to` must be even and no larger than `from` either way.
+    pub fn new(from: (usize, usize), to: (usize, usize)) -> Self {
+        assert!(
+            to.0 <= from.0 && to.1 <= from.1 && to.0 >= 2 && to.1 >= 2,
+            "the scaler only shrinks"
+        );
+        Self {
+            from,
+            to,
+            luma: PlaneTaps::new(from, to),
+            chroma: PlaneTaps::new((from.0 / 2, from.1 / 2), (to.0 / 2, to.1 / 2)),
+        }
+    }
+
+    pub fn sizes(&self) -> ((usize, usize), (usize, usize)) {
+        (self.from, self.to)
+    }
+
+    /// Update `out` (allocated at the output size if it isn't) from `src`, of which only
+    /// rows `changed` (an even range; `None`: any) differ from the picture given last
+    /// time. Returns the even range of output rows rewritten.
+    pub fn scale(
+        &self,
+        src: &I420,
+        out: &mut Option<I420>,
+        changed: Option<(usize, usize)>,
+    ) -> (usize, usize) {
+        assert_eq!(src.dimensions(), self.from, "picture of another size");
+        let fresh = !matches!(out, Some(o) if o.dimensions() == self.to);
+        let dst = match out {
+            Some(o) if !fresh => o,
+            _ => out.insert(I420::new(self.to.0, self.to.1)),
+        };
+        let (dw, dh) = self.to;
+        let rows = match changed {
+            Some((r0, r1)) if !fresh => {
+                let (a, b) = self.luma.rows_from((r0, r1));
+                let (c, d) = self.chroma.rows_from((r0 / 2, r1.div_ceil(2)));
+                let (a, b) = (a.min(2 * c), b.max(2 * d));
+                if b <= a {
+                    return (0, 0);
+                }
+                (a & !1, b.next_multiple_of(2).min(dh))
+            }
+            _ => (0, dh),
+        };
+        let (sw, _) = self.from;
+        let (y, u, v) = dst.planes_mut();
+        self.luma.run(src.y(), sw, y, dw, rows);
+        let crows = (rows.0 / 2, rows.1 / 2);
+        self.chroma.run(src.u(), sw / 2, u, dw / 2, crows);
+        self.chroma.run(src.v(), sw / 2, v, dw / 2, crows);
+        rows
+    }
+}
+
 /// One BT.601 limited-range pixel, as openh264's own conversion.
 #[inline]
 fn yuv_to_rgba(y: u8, u: u8, v: u8) -> [u8; 4] {
@@ -677,6 +843,87 @@ mod tests {
             .unwrap();
         assert!(worst <= 3, "colours differ by up to {worst}");
         println!("I420->RGBA {w}x{h}: openh264 {theirs_ms:.2} ms, ours {ours_ms:.2} ms");
+    }
+
+    #[test]
+    fn scaler_halving_matches_the_box_average_and_keeps_flat_colours() {
+        let (w, h) = (640, 360);
+        let mut full = I420::new(w, h);
+        full.fill_from_bgra(&sample(w, h), w);
+        let mut half = None;
+        full.half_into(&mut half);
+        let mut scaled = None;
+        Scaler::new((w, h), (w / 2, h / 2)).scale(&full, &mut scaled, None);
+        let (half, scaled) = (half.unwrap(), scaled.unwrap());
+        for (a, b) in [
+            (half.y(), scaled.y()),
+            (half.u(), scaled.u()),
+            (half.v(), scaled.v()),
+        ] {
+            let worst = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+            assert!(worst <= 1, "differs from 2x2 averages by {worst}");
+        }
+        // Any ratio: a flat picture stays exactly flat.
+        let flat: Vec<u8> = [90u8, 160, 200, 255].repeat(1920 * 1080);
+        let mut src = I420::new(1920, 1080);
+        src.fill_from_bgra(&flat, 1920);
+        let mut out = None;
+        Scaler::new((1920, 1080), (1280, 720)).scale(&src, &mut out, None);
+        let out = out.unwrap();
+        assert!(out.y().iter().all(|&v| v == src.y()[0]));
+        assert!(out.u().iter().all(|&v| v == src.u()[0]));
+        assert!(out.v().iter().all(|&v| v == src.v()[0]));
+    }
+
+    #[test]
+    fn scaler_redoes_only_changed_rows_and_gets_the_same_picture() {
+        let (w, h) = (1920, 1080);
+        let mut src = I420::new(w, h);
+        src.fill_from_bgra(&sample(w, h), w);
+        for to in [(1280, 720), (1366, 768), (962, 540)] {
+            let s = Scaler::new((w, h), to);
+            let mut inc = None;
+            s.scale(&src, &mut inc, None);
+            // A change in rows 301..333 (odd edges on purpose).
+            let mut changed = I420::new(w, h);
+            let mut bgra = sample(w, h);
+            for b in &mut bgra[301 * w * 4..333 * w * 4] {
+                *b = b.wrapping_add(77);
+            }
+            changed.fill_from_bgra(&bgra, w);
+            let rows = s.scale(&changed, &mut inc, Some((300, 334)));
+            assert!(
+                rows.0 > 0 && rows.1 < to.1,
+                "{to:?}: {rows:?} is not a part"
+            );
+            let mut whole = None;
+            s.scale(&changed, &mut whole, None);
+            assert!(inc.unwrap().data == whole.unwrap().data, "{to:?}");
+        }
+    }
+
+    /// `cargo test --release -p rconn-media yuv::tests::scaler_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn scaler_speed() {
+        let (w, h) = (1920, 1080);
+        let mut src = I420::new(w, h);
+        src.fill_from_bgra(&sample(w, h), w);
+        for to in [(1280, 720), (960, 540)] {
+            let s = Scaler::new((w, h), to);
+            let mut out = None;
+            let t = std::time::Instant::now();
+            for _ in 0..50 {
+                s.scale(&src, &mut out, None);
+            }
+            let whole = t.elapsed().as_secs_f64() * 1e3 / 50.0;
+            let t = std::time::Instant::now();
+            for _ in 0..50 {
+                s.scale(&src, &mut out, Some((360, 378)));
+            }
+            let line = t.elapsed().as_secs_f64() * 1e3 / 50.0;
+            println!("scale {w}x{h} -> {to:?}: whole {whole:.2} ms, one text line {line:.3} ms");
+        }
     }
 
     /// `cargo test --release -p rconn-media yuv::tests::speed -- --ignored --nocapture`

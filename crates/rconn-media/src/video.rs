@@ -173,7 +173,6 @@ pub struct VideoEncoder {
     /// openh264 rather than VideoToolbox / Media Foundation, as asked for
     /// (`RCONN_ENCODER=openh264`, [`VideoEncoder::software`]) or because VideoToolbox
     /// failed.
-    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     software_only: bool,
     /// VideoToolbox failures in a row.
     #[cfg(target_os = "macos")]
@@ -406,6 +405,22 @@ impl VideoEncoder {
     /// Which encoder is in use ("Media Foundation (...)" or "openh264").
     pub fn engine_name(&self) -> &str {
         &self.engine_name
+    }
+
+    /// Does the CPU do the encoding (openh264, Microsoft's software encoder, VideoToolbox
+    /// without hardware)? Before the first frame: the engine the first frame will get.
+    pub fn is_software(&self) -> bool {
+        match &self.encoder {
+            Some(Engine::OpenH264(_)) => true,
+            #[cfg(windows)]
+            Some(Engine::MediaFoundation(mf)) => !mf.is_hardware(),
+            #[cfg(target_os = "macos")]
+            Some(Engine::VideoToolbox(vt)) => !vt.is_hardware(),
+            #[cfg(windows)]
+            None => self.software_only || !crate::mf::MfH264Encoder::hardware_available(),
+            #[cfg(not(windows))]
+            None => self.software_only || !cfg!(target_os = "macos"),
+        }
     }
 
     /// openh264 engines built from now on use long-term references (camera mode), so

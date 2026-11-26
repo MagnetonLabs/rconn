@@ -12,7 +12,7 @@ use anyhow::Result;
 use rconn_media::capture::{Captured, Capturer, Surface};
 use rconn_media::copyrect::{Composer, Move};
 use rconn_media::video::{EncoderSettings, VideoEncoder, should_retarget, should_retarget_costly};
-use rconn_media::yuv::I420;
+use rconn_media::yuv::{I420, Scaler};
 use rconn_peer::frames::{self, Feedback, FrameTag};
 use rconn_peer::video::{TargetBitrate, VideoSender};
 use std::path::PathBuf;
@@ -30,6 +30,8 @@ pub struct StreamConfig {
     /// Send large screens at half size while a big area keeps changing (scrolling, video):
     /// a quarter of the encoding work; a sharp full-size picture follows when it settles.
     pub motion_half_res: bool,
+    /// openh264 even where a hardware encoder exists (tests; `RCONN_ENCODER=openh264`).
+    pub software: bool,
 }
 
 /// The viewer's requests to the encoder: an IDR frame (viewer joined, decoder lost
@@ -40,9 +42,18 @@ pub struct KeyframeRequests {
     notify: Arc<Notify>,
     feedback: Arc<Mutex<Vec<Feedback>>>,
     copy_rects: Arc<AtomicBool>,
+    view: Arc<AtomicU64>,
 }
 
 impl KeyframeRequests {
+    /// `Control::ViewSize`: the viewer shows the picture this many pixels large.
+    pub fn set_view_size(&self, width: u32, height: u32) {
+        let packed = u64::from(width) << 32 | u64::from(height);
+        if self.view.swap(packed, Ordering::Relaxed) != packed {
+            tracing::debug!(width, height, "viewer shows the picture at this size");
+        }
+    }
+
     pub fn request(&self) {
         self.notify.notify_one();
     }
@@ -120,6 +131,7 @@ pub async fn run(
     let frame_budget = Duration::from_secs(1) / cfg.max_fps.max(1);
     let want_key = Arc::new(AtomicBool::new(false));
     let copy_rects = keyframes.copy_rects.clone();
+    let view = keyframes.view.clone();
     let forward = {
         let want_key = want_key.clone();
         let keyframe = keyframes.notify.clone();
@@ -143,6 +155,7 @@ pub async fn run(
         next_id: AtomicU32::new(0),
         sending: sending.clone(),
         copy_rects,
+        view,
     };
     let worker = tokio::task::spawn_blocking(move || supervise(make_capturer, &ctx, &tx));
     while let Some((au, encoded_at)) = rx.recv().await {
@@ -176,6 +189,65 @@ struct Ctx {
     /// Id of the next frame of the stream (ids run on across capture generations).
     next_id: AtomicU32,
     sending: Arc<SendClock>,
+    /// The viewer's picture size ([`KeyframeRequests::set_view_size`]); 0 = not told.
+    view: Arc<AtomicU64>,
+}
+
+impl Ctx {
+    fn view_size(&self) -> Option<(usize, usize)> {
+        let v = self.view.load(Ordering::Relaxed);
+        let (w, h) = ((v >> 32) as usize, (v & 0xffff_ffff) as usize);
+        (w > 0 && h > 0).then_some((w, h))
+    }
+}
+
+/// `RCONN_VIEW_SCALE`: a CPU encoder sends the picture at the viewer's size ("on", the
+/// default), and also one full-size picture once the screen has been still for
+/// [`REFINE_AFTER`] ("refine"), or always the full screen ("0" / "off").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewScale {
+    Off,
+    On,
+    Refine,
+}
+
+impl ViewScale {
+    fn from_env() -> Self {
+        match std::env::var("RCONN_VIEW_SCALE").as_deref() {
+            Ok("0" | "off") => Self::Off,
+            Ok("refine") => Self::Refine,
+            _ => Self::On,
+        }
+    }
+}
+
+/// With [`ViewScale::Refine`], a still screen gets one full-size picture after this long.
+const REFINE_AFTER: Duration = Duration::from_secs(2);
+/// Scaling to less than this share of the screen's width is worth a size switch (each
+/// costs a keyframe); closer to full size, the full picture is sent.
+const VIEW_SCALE_BELOW: f32 = 0.9;
+/// Encoding taking this share of the frame interval (averaged) counts as CPU-bound: even
+/// a hardware encoder then gets pictures at the viewer's size.
+const CPU_BOUND: f64 = 0.7;
+
+/// The size to encode a `w` x `h` screen at for a viewer showing it `view` large, or
+/// `None` for the full size. Same shape as the screen; width a multiple of 16 (a size
+/// that changes by a few pixels would cost a keyframe for nothing), height even; at most
+/// a quarter of the screen's width.
+fn view_target((w, h): (usize, usize), view: Option<(usize, usize)>) -> Option<(usize, usize)> {
+    let (vw, vh) = view?;
+    if w < 64 || h < 64 {
+        return None;
+    }
+    let s = (vw as f32 / w as f32).min(vh as f32 / h as f32);
+    if s >= VIEW_SCALE_BELOW {
+        return None;
+    }
+    let tw = ((w as f32 * s.max(0.25)).round() as usize)
+        .next_multiple_of(16)
+        .min(w & !1);
+    let th = ((tw * h + w / 2) / w) & !1;
+    (th >= 16).then_some((tw, th))
 }
 
 /// Time encoded frames spend waiting for the session task, and being packetized and
@@ -275,15 +347,17 @@ fn run_generation(
     let cfg = &ctx.cfg;
     let budget = Duration::from_secs(1) / cfg.max_fps.max(1);
     let mut cap = make()?;
-    let mut enc = VideoEncoder::new(
-        &cfg.openh264,
-        EncoderSettings {
-            bitrate_bps: (ctx.target.get() as u32).min(cfg.max_bitrate_bps),
-            max_fps: cfg.max_fps as f32,
-            threads: 0,
-            slice_bytes: None,
-        },
-    )?;
+    let settings = EncoderSettings {
+        bitrate_bps: (ctx.target.get() as u32).min(cfg.max_bitrate_bps),
+        max_fps: cfg.max_fps as f32,
+        threads: 0,
+        slice_bytes: None,
+    };
+    let mut enc = if cfg.software {
+        VideoEncoder::software(&cfg.openh264, settings)?
+    } else {
+        VideoEncoder::new(&cfg.openh264, settings)?
+    };
     // Frame ids run on from the previous capture; the viewer acknowledges by id.
     let first_id = ctx.next_id.load(Ordering::Relaxed);
     enc.start_frame_ids_at(first_id);
@@ -295,6 +369,17 @@ fn run_generation(
     let mut surface: Option<Surface> = None;
     let mut picture: Option<I420> = None;
     let mut small: Option<I420> = None;
+    // At the viewer's size: a CPU encoder's work shrinks with the pixels it gets.
+    let view_scale = ViewScale::from_env();
+    let mut scaler: Option<Scaler> = None;
+    let mut scaled: Option<I420> = None;
+    // `scaled` missed changes (the full picture went out meanwhile): redo it whole.
+    let mut scaled_stale = true;
+    // The last picture out was scaled; the full-size one after it (`Refine`) is sent.
+    let mut sent_scaled = false;
+    let mut refined = false;
+    // Encoder time per picture (ms, moving average).
+    let mut encode_avg_ms = 0.0f64;
     // Copy instructions (scrolls and moves as copies), once the viewer asks for them.
     // Pictures only: GPU surfaces go to the encoder untouched.
     let mut composer: Option<Composer> = None;
@@ -373,6 +458,7 @@ fn run_generation(
                 produced = true;
                 warned = false;
                 last_change = Instant::now();
+                refined = false;
                 pending = Some(Pending::merge(pending.take(), c));
             }
             Ok(None) => {
@@ -434,10 +520,34 @@ fn run_generation(
                 c.request_full();
             }
         }
+        // A CPU encoder (or one that can't keep up) gets the picture at the size the
+        // viewer shows it; GPU surfaces go to a hardware encoder as they are.
+        let cpu_bound = encode_avg_ms > budget.as_secs_f64() * 1e3 * CPU_BOUND;
+        let mut target =
+            (!surfaces && view_scale != ViewScale::Off && (enc.is_software() || cpu_bound))
+                .then(|| view_target((w, h), ctx.view_size()))
+                .flatten();
+        // `Refine`: a still screen gets one sharp full-size picture, then stays so
+        // until it changes.
+        let refine = view_scale == ViewScale::Refine
+            && target.is_some()
+            && sent_scaled
+            && !refined
+            && pending.is_none()
+            && last_change.elapsed() >= REFINE_AFTER;
+        if refine {
+            refined = true;
+        }
+        if refined {
+            target = None;
+        }
         // Not with copy instructions: they keep scrolls cheap at full size, and a size
-        // switch costs a keyframe.
-        let may_halve =
-            !surfaces && composer.is_none() && cfg.motion_half_res && w * h >= MOTION_MIN_PIXELS;
+        // switch costs a keyframe. Not at the viewer's size either (smaller already).
+        let may_halve = !surfaces
+            && composer.is_none()
+            && target.is_none()
+            && cfg.motion_half_res
+            && w * h >= MOTION_MIN_PIXELS;
         // Motion over: one sharp full-size picture.
         let sharpen = motion && last_big.elapsed() >= MOTION_SETTLE;
         if sharpen {
@@ -456,8 +566,11 @@ fn run_generation(
         } else {
             BACKGROUND_INTERVAL.max(budget)
         };
-        let encode_now =
-            force || repair || sharpen || (pending.is_some() && now >= last_encode + interval);
+        let encode_now = force
+            || repair
+            || sharpen
+            || refine
+            || (pending.is_some() && now >= last_encode + interval);
         if !encode_now {
             continue;
         }
@@ -506,37 +619,61 @@ fn run_generation(
                 stats.half += 1;
                 enc.encode_yuv(small.as_ref().expect("allocated by half_into"), None)?
             }
-            (None, Some(pic)) => match composer.as_mut() {
-                Some(c) => {
-                    let (canvas, found) = c.prepare(pic, &std::mem::take(&mut hints));
-                    match enc.encode_yuv(canvas, found.rows)? {
-                        Some(au) => {
-                            stats.moved += f64::from(c.last().moved);
-                            Some(c.sent(pic, au))
+            (None, Some(full)) => {
+                // The picture to send: the screen, or scaled down to the viewer's size.
+                let (pic, rows) = match target {
+                    Some(to) => {
+                        if scaler.as_ref().is_none_or(|s| s.sizes() != ((w, h), to)) {
+                            scaler = Some(Scaler::new((w, h), to));
+                            scaled_stale = true;
                         }
-                        None => {
-                            // openh264's rate control drops frames for good; another
-                            // encoder may hand the picture out later.
-                            let was = c.is_passthrough();
-                            c.no_output(enc.engine_name().starts_with("openh264"));
-                            if !was && c.is_passthrough() {
-                                tracing::info!(
-                                    engine = %enc.engine_name(),
-                                    "encoder gave no picture; copy instructions off for this capture"
-                                );
+                        let s = scaler.as_ref().expect("built above");
+                        let changed = (!std::mem::take(&mut scaled_stale)).then_some(rows);
+                        let rows = s.scale(full, &mut scaled, changed);
+                        hints.clear(); // in screen coordinates
+                        stats.scaled += 1;
+                        (scaled.as_ref().expect("allocated by scale"), rows)
+                    }
+                    None => {
+                        scaled_stale = true;
+                        (full, rows)
+                    }
+                };
+                sent_scaled = target.is_some();
+                match composer.as_mut() {
+                    Some(c) => {
+                        let (canvas, found) = c.prepare(pic, &std::mem::take(&mut hints));
+                        match enc.encode_yuv(canvas, found.rows)? {
+                            Some(au) => {
+                                stats.moved += f64::from(c.last().moved);
+                                Some(c.sent(pic, au))
                             }
-                            None
+                            None => {
+                                // openh264's rate control drops frames for good; another
+                                // encoder may hand the picture out later.
+                                let was = c.is_passthrough();
+                                c.no_output(enc.engine_name().starts_with("openh264"));
+                                if !was && c.is_passthrough() {
+                                    tracing::info!(
+                                        engine = %enc.engine_name(),
+                                        "encoder gave no picture; copy instructions off for this capture"
+                                    );
+                                }
+                                None
+                            }
                         }
                     }
+                    None => {
+                        hints.clear();
+                        enc.encode_yuv(pic, Some(rows))?
+                    }
                 }
-                None => {
-                    hints.clear();
-                    enc.encode_yuv(pic, Some(rows))?
-                }
-            },
+            }
             (None, None) => unreachable!("checked above"),
         };
-        stats.encode += t0.elapsed();
+        let took = t0.elapsed();
+        stats.encode += took;
+        encode_avg_ms = encode_avg_ms * 0.9 + took.as_secs_f64() * 1e3 * 0.1;
         last_encode = Instant::now();
         if urgent {
             stats.urgent += 1;
@@ -654,6 +791,8 @@ struct Stats {
     urgent: u32,
     /// Frames sent at half size (motion).
     half: u32,
+    /// Frames sent at the viewer's (smaller) size.
+    scaled: u32,
     captures: u32,
     /// Keyframes, loss repairs from long-term references, losses the viewer reported,
     /// live bitrate changes.
@@ -693,6 +832,7 @@ impl Stats {
             fps = format!("{:.1}", f64::from(self.frames) / secs),
             urgent_fps = format!("{:.1}", f64::from(self.urgent) / secs),
             half_size_fps = format!("{:.1}", f64::from(self.half) / secs),
+            view_size_fps = format!("{:.1}", f64::from(self.scaled) / secs),
             moved_pct = format!("{:.1}", self.moved * 100.0 / n),
             kbps = format!("{:.0}", self.bytes as f64 * 8.0 / secs / 1000.0),
             changed_pct = format!("{:.1}", self.changed * 100.0 / n),
@@ -716,5 +856,88 @@ impl Stats {
             "stream"
         );
         *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rconn_media::capture::TestPattern;
+    use rconn_media::video::VideoDecoder;
+
+    /// A software host streaming a 1920x1080 screen to a viewer showing it 1280x720
+    /// sends 1280x720 pictures; once the viewer shows it full size, full-size ones.
+    #[test]
+    fn a_software_encoder_sends_the_viewer_size() {
+        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let keyframes = KeyframeRequests::default();
+        keyframes.set_view_size(1280, 720);
+        let ctx = Ctx {
+            cfg: StreamConfig {
+                openh264: lib.clone(),
+                max_fps: 30,
+                max_bitrate_bps: 8_000_000,
+                max_size: (3840, 2400),
+                motion_half_res: false,
+                software: true,
+            },
+            target: TargetBitrate::fixed(8_000_000.0),
+            want_key: Arc::default(),
+            feedback: keyframes.feedback.clone(),
+            stop: Arc::default(),
+            first_sent: AtomicBool::new(false),
+            next_id: AtomicU32::new(0),
+            sending: Arc::default(),
+            copy_rects: Arc::default(),
+            view: keyframes.view.clone(),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let make =
+            || -> Result<Box<dyn Capturer>> { Ok(Box::new(TestPattern::new(1920, 1080, 30))) };
+        let mut decoder = VideoDecoder::software(&lib).unwrap();
+        let mut sizes = Vec::new();
+        std::thread::scope(|s| {
+            let worker = s.spawn(|| {
+                let tx = tx; // closes the channel when the generation ends
+                run_generation(&make, &ctx, &tx)
+            });
+            while let Some((au, _)) = rx.blocking_recv() {
+                if let Some(f) = decoder.decode(&au).unwrap() {
+                    sizes.push((f.width, f.height));
+                }
+                if sizes.len() == 10 {
+                    keyframes.set_view_size(2560, 1440); // HiDPI, full screen
+                }
+                if sizes.len() == 20 {
+                    ctx.stop.store(true, Ordering::Relaxed);
+                }
+            }
+            drop(rx);
+            worker.join().unwrap().unwrap();
+        });
+        assert!(sizes[..10].iter().all(|&s| s == (1280, 720)), "{sizes:?}");
+        // The switch back takes effect with the next picture encoded.
+        assert!(sizes[11..].iter().all(|&s| s == (1920, 1080)), "{sizes:?}");
+    }
+
+    #[test]
+    fn view_target_keeps_the_shape_and_skips_small_savings() {
+        let screen = (1920, 1080);
+        assert_eq!(view_target(screen, None), None);
+        // Bigger than the screen, or within 10 % of it: the full picture.
+        assert_eq!(view_target(screen, Some((2560, 1440))), None);
+        assert_eq!(view_target(screen, Some((1800, 1100))), None);
+        assert_eq!(view_target(screen, Some((1280, 720))), Some((1280, 720)));
+        // A tall window: the width decides, the shape stays the screen's.
+        assert_eq!(view_target(screen, Some((1000, 900))), Some((1008, 566)));
+        // Never below a quarter.
+        assert_eq!(view_target(screen, Some((100, 60))), Some((480, 270 & !1)));
+        // A few pixels either way: the same size (no keyframe for nothing).
+        assert_eq!(
+            view_target(screen, Some((1275, 717))),
+            view_target(screen, Some((1272, 716)))
+        );
     }
 }

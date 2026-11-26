@@ -109,6 +109,12 @@ impl TargetBitrate {
         }
     }
 
+    /// A target derived from a fixed `estimate` (bits/s), for streams without a peer
+    /// connection (tests, benchmarks).
+    pub fn fixed(estimate: f64) -> Self {
+        Self::new(estimate)
+    }
+
     /// What the encoder should aim at, bits/s.
     pub fn get(&self) -> f64 {
         f64::from_bits(self.value.load(Ordering::Relaxed))

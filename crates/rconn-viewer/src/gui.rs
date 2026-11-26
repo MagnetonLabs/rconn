@@ -290,6 +290,7 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
         cursor: shared_cursor,
         last_frame: None,
         fit: FitRequest::default(),
+        view_report: FitRequest::default(),
         match_resolution,
         prefs_path,
         last_stats: String::new(),
@@ -981,6 +982,8 @@ struct ViewerApp {
     match_resolution: bool,
     /// The sizes asked of the host while matching.
     fit: FitRequest,
+    /// The picture sizes reported to the host (`Control::ViewSize`).
+    view_report: FitRequest,
     /// Where this tab's per-computer choices are saved (`None`: not saved).
     prefs_path: Option<std::path::PathBuf>,
     /// The toolbar's stats line, as of the last frame drawn.
@@ -1511,6 +1514,24 @@ impl ViewerApp {
         }
     }
 
+    /// Tell the host how large its picture is shown (`image`, in physical pixels) once
+    /// that has settled: a host encoding on the CPU then sends it at that size rather
+    /// than the full screen. The remote resolution stays as it is.
+    fn report_view_size(&mut self, image: Rect, ctx: &egui::Context) {
+        let ppp = ctx.pixels_per_point();
+        let px = |v: f32| ((v * ppp).round() as u32).max(2);
+        match self
+            .view_report
+            .update((px(image.width()), px(image.height())), Instant::now())
+        {
+            FitStep::Send((width, height)) => {
+                let _ = self.keyframe.send(Control::ViewSize { width, height });
+            }
+            FitStep::Wait(d) => ctx.request_repaint_after(d),
+            FitStep::Idle => {}
+        }
+    }
+
     /// The toolbar's "Match resolution" toggle: remembered for this computer; turning it
     /// off gives the remote screen its own resolution back.
     fn set_match_resolution(&mut self, on: bool) {
@@ -1597,6 +1618,7 @@ impl ViewerApp {
                 self.floating_bar(ui, area, &stats);
             }
             if let Some(image) = image {
+                self.report_view_size(image, ui.ctx());
                 self.forward_input(ui, image);
                 let over_picture = ui.ctx().pointer_hover_pos().is_some_and(|p| {
                     image.contains(p)
@@ -1851,6 +1873,7 @@ mod render_tests {
             cursor: Arc::default(),
             last_frame: None,
             fit: FitRequest::default(),
+            view_report: FitRequest::default(),
             match_resolution: false,
             prefs_path: None,
             last_stats: String::new(),
@@ -1862,6 +1885,33 @@ mod render_tests {
             files_rect: None,
             _close: None,
         }
+    }
+
+    #[test]
+    fn the_shown_size_is_reported_once_settled() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut a = app(false, false);
+        a.keyframe = tx;
+        let ctx = egui::Context::default();
+        let image = Rect::from_min_size(Pos2::new(0.0, 30.0), Vec2::new(1280.0, 720.0));
+        a.report_view_size(image, &ctx);
+        assert!(rx.try_recv().is_err(), "not before it has settled");
+        a.view_report.pending = a
+            .view_report
+            .pending
+            .map(|(s, t)| (s, t - Duration::from_secs(1)));
+        a.report_view_size(image, &ctx);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(Control::ViewSize {
+                width: 1280,
+                height: 720
+            })
+        );
+        // A few pixels off: nothing new to say.
+        let nudged = Rect::from_min_size(Pos2::new(0.0, 30.0), Vec2::new(1284.0, 722.0));
+        a.report_view_size(nudged, &ctx);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

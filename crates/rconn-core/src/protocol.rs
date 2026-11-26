@@ -470,6 +470,15 @@ pub enum Control {
         decoded: u32,
         lost: bool,
     },
+    /// Viewer -> host: the remote picture is shown `width` x `height` pixels large (its
+    /// physical pixels, whatever the window's shape). A host that encodes on the CPU may
+    /// send a picture scaled down to it instead of the full screen; the screen's own
+    /// resolution stays as it is (unlike `Resize`), and input coordinates are normalized
+    /// anyway. Appended: older hosts reject it as an unknown message, log it and carry on.
+    ViewSize {
+        width: u32,
+        height: u32,
+    },
 }
 
 /// Toolbar actions the host performs on request.
@@ -768,6 +777,19 @@ mod tests {
         });
         assert_eq!(copy[1] + 1, ack[1], "FrameAck appended after CopyRects");
         assert_eq!(&ack[2..], [0xac, 0x02, 1], "varint id, then the flag");
+        let view = enc(Control::ViewSize {
+            width: 1280,
+            height: 720,
+        });
+        assert_eq!(ack[1] + 1, view[1], "ViewSize appended after FrameAck");
+        assert_eq!(&view[2..], [0x80, 0x0a, 0xd0, 0x05]);
+        assert_eq!(
+            DataMessage::decode(&view).unwrap(),
+            DataMessage::Control(Control::ViewSize {
+                width: 1280,
+                height: 720
+            })
+        );
     }
 
     #[test]
