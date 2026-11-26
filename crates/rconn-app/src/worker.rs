@@ -365,6 +365,7 @@ impl Worker {
     }
 
     /// Why turning on incoming connections failed: shown in "This computer".
+    #[cfg(unix)]
     fn host_failed(&self, text: String) {
         self.home(|h| {
             h.host_setup = None;
