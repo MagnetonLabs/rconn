@@ -1150,12 +1150,13 @@ mod tests {
             drop(rx);
             worker.join().unwrap().unwrap();
         });
-        // 5 pictures for the changes, then the top-offs (repeats of the first keyframe at
-        // 300 ms and 1 s may stand in for one; openh264 may skip one after a keyframe),
-        // then nothing until the next repeat at 2.5 s.
+        // 5 pictures for the changes, then the top-offs, then nothing until the next
+        // repeat at 2.5 s. The first keyframe's repeats at 300 ms and 1 s may stand in for
+        // top-offs or, on a busy machine, come on top of them; openh264 may skip one after
+        // a keyframe.
         let after = tags.len().saturating_sub(5);
         assert!(
-            (3..=TOPOFF_FRAMES as usize).contains(&after),
+            (3..=TOPOFF_FRAMES as usize + 2).contains(&after),
             "{after} pictures after the changes: {tags:?}"
         );
     }

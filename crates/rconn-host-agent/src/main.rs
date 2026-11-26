@@ -168,6 +168,13 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // A fresh process's view of the permissions (see `restart_when_permissions_change`).
+    if std::env::args().nth(1).as_deref() == Some(PERMISSIONS_FLAG) {
+        for p in missing_permissions() {
+            println!("{p}");
+        }
+        return Ok(());
+    }
     let cli = Cli::parse();
     if cli.selftest_input {
         println!("{}", input::selftest()?);
@@ -246,6 +253,7 @@ async fn main() -> Result<()> {
             .join("portal-restore-token"),
     );
     request_permissions();
+    restart_when_permissions_change();
     raise_priority();
     let status = StatusPublisher::new(
         cli.status_file.clone(),
@@ -858,6 +866,74 @@ fn missing_permissions() -> Vec<String> {
     }
     #[cfg(not(target_os = "macos"))]
     Vec::new()
+}
+
+/// Prints the permissions still missing, one per line, and exits (internal).
+const PERMISSIONS_FLAG: &str = "--print-missing-permissions";
+
+/// macOS answers a process's permission questions once: a permission granted while the
+/// host runs only counts after a restart. So while some are missing, a fresh process of
+/// this program (macOS counts it as the host) asks every 2 s; once more are granted, the
+/// host exits and launchd starts it again, with nobody pressing "Restart host".
+fn restart_when_permissions_change() {
+    #[cfg(target_os = "macos")]
+    {
+        let missing = missing_permissions();
+        if missing.is_empty() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("permissions".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let Ok(out) = std::process::Command::new(&exe)
+                        .arg(PERMISSIONS_FLAG)
+                        .stdin(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .output()
+                    else {
+                        continue;
+                    };
+                    if !out.status.success() {
+                        continue;
+                    }
+                    let now = String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .count();
+                    if now < missing.len() {
+                        // Never a restart loop: if the last one didn't bring the permission
+                        // (macOS told the fresh process something else), "Restart host" is
+                        // left to the person.
+                        let marker = std::env::temp_dir().join("rconn-permission-restart");
+                        let recent = std::fs::metadata(&marker)
+                            .and_then(|m| m.modified())
+                            .is_ok_and(|t| t.elapsed().is_ok_and(|e| e < Duration::from_secs(120)));
+                        if recent {
+                            tracing::warn!(
+                                "permission granted but a restart just now didn't apply it"
+                            );
+                            return;
+                        }
+                        let _ = std::fs::write(&marker, b"");
+                        // A new process, not `exec` in place: macOS may know a process by
+                        // its id. launchd (KeepAlive) starts the host again within ~10 s.
+                        tracing::info!(
+                            before = ?missing,
+                            "a macOS permission was granted; restarting the host to apply it"
+                        );
+                        std::process::exit(0);
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "can't watch for macOS permissions");
+        }
+    }
 }
 
 /// macOS: ask once for the permissions a host needs (shows the system prompts).

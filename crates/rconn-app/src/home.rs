@@ -317,11 +317,15 @@ fn this_computer(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             }
         }
         ui.label(
-            RichText::new("Then restart the host so macOS applies it:")
+            RichText::new("The host restarts by itself once you allow it.")
                 .small()
                 .color(Color32::GRAY),
         );
-        if ui.button("🔄 Restart host").clicked() {
+        if ui
+            .small_button("🔄 Restart host")
+            .on_hover_text("Only if it hasn't picked up the permission after a few seconds")
+            .clicked()
+        {
             out.push(Request::RestartHostAgent);
         }
     }
