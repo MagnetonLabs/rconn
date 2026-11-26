@@ -382,3 +382,122 @@ fn session_toolbar_glyphs_render() {
     harness.run();
     harness.render().expect("render");
 }
+
+/// Five recent computers: online, offline and not yet known, long and missing names.
+fn many_recent() -> Home {
+    let mut h = no_account(true);
+    for (code, label) in [
+        ("555 666 777", None),
+        (
+            "444 333 222",
+            Some("Accounting workstation, second floor east"),
+        ),
+        ("123 456 789", Some("Grandma's laptop")),
+        ("111 222 333", Some("BUILD-BOX")),
+    ] {
+        h.profile.remember_code(code);
+        h.profile.recent[0].label = label.map(str::to_owned);
+    }
+    for (code, on) in [
+        ("111222333", true),
+        ("123456789", false),
+        ("444333222", true),
+    ] {
+        h.presence.insert(code.into(), on);
+    }
+    h
+}
+
+/// Signed in to a fleet: its computers, one of them this one.
+fn signed_in_fleet() -> Home {
+    let mut h = sample();
+    h.tab = Tab::Computers;
+    let list = h.computers.as_mut().unwrap();
+    for (n, label) in [
+        (0xa1, Some("Reception PC")),
+        (0xa2, Some("Warehouse scanner station (north dock)")),
+        (0xa3, Some("CFO-LAPTOP")),
+    ] {
+        list.push(HostInfo {
+            host_id: HostId(uuid::Uuid::from_u128(0x5d6f_0a1b_2c3d_0000 + n)),
+            label: label.map(str::to_owned),
+        });
+    }
+    h
+}
+
+/// Settings with the host's own settings readable (an admin on a self-hosted fleet).
+fn settings_with_host(dir: &std::path::Path) -> Home {
+    std::fs::write(
+        dir.join("host.toml"),
+        "[server]\nurl = \"wss://192.0.2.10:8443/v1/ws\"\n",
+    )
+    .unwrap();
+    let mut h = no_account(true);
+    h.tab = Tab::Settings;
+    h.host_settings = Some(rconn_host_settings::model::Model::load(dir));
+    h
+}
+
+/// A window this big inside (the harness puts an 8 px margin around the app).
+fn sized(h: Home, size: egui::Vec2) -> Harness<'static, (Home, Vec<Request>)> {
+    let size = size + egui::vec2(16.0, 16.0);
+    Harness::builder().with_size(size).build_ui_state(
+        |ui, (h, out): &mut (Home, Vec<Request>)| out.extend(home::draw(ui, h)),
+        (h, Vec::new()),
+    )
+}
+
+/// Cards fill the row: 2 in the smallest window, 3 by default, 4 in a wide one
+/// (window minus the 270 px left panel and 2 × 16 px margins).
+#[test]
+fn cards_fill_the_row() {
+    for (window, per_row) in [(760.0, 2), (980.0, 3), (1280.0, 4)] {
+        let available: f32 = window - 270.0 - 32.0;
+        let (n, w) = home::card_columns(available);
+        assert_eq!(n, per_row, "{window}");
+        let used = w * n as f32 + 12.0 * (n - 1) as f32;
+        assert!(
+            used <= available && available - used < n as f32,
+            "{window}: {used}"
+        );
+    }
+}
+
+/// The layouts people see most, against stored images (`UPDATE_SNAPSHOTS=1` rewrites them):
+/// recent cards at the default, smallest and a wide window, renaming one, a fleet, Settings.
+#[test]
+fn layouts_look_as_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let default = egui::vec2(980.0, 640.0);
+    let mut renaming = many_recent();
+    renaming.renaming = Some(("444 333 222".into(), "Accounting".into()));
+    let mut self_hosted = sample(); // signed in to its own server: the server fields open
+    self_hosted.tab = Tab::Settings;
+    let cases = [
+        ("recent-cards", many_recent(), default),
+        ("recent-cards-min", many_recent(), egui::vec2(760.0, 520.0)),
+        (
+            "recent-cards-wide",
+            many_recent(),
+            egui::vec2(1280.0, 800.0),
+        ),
+        ("recent-renaming", renaming, default),
+        ("computers-signed-in", signed_in_fleet(), default),
+        ("settings-self-hosted", self_hosted, default),
+        (
+            "settings",
+            settings_with_host(dir.path()),
+            egui::vec2(980.0, 1080.0),
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (name, h, size) in cases {
+        let mut hs = sized(h, size);
+        hs.run_steps(4);
+        if let Err(e) = hs.try_snapshot(name) {
+            failed.push(format!("{name}: {e}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}

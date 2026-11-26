@@ -168,23 +168,24 @@ pub fn resolve<'a>(typed: &str, computers: &'a [HostInfo]) -> Option<&'a HostInf
 
 pub fn draw(ui: &mut egui::Ui, h: &mut Home) -> Vec<Request> {
     let mut out = Vec::new();
+    // The ID line (30 pt digits + copy button, 236 px) is the widest thing on the left.
     egui::Panel::left("this_computer")
-        .exact_size(290.0)
+        .exact_size(270.0)
         .resizable(false)
         .frame(
             egui::Frame::new()
                 .fill(ui.visuals().faint_bg_color)
-                .inner_margin(20.0),
+                .inner_margin(MARGIN),
         )
         .show(ui, |ui| this_computer(ui, h, &mut out));
     egui::Panel::bottom("status")
         .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 8)))
         .show(ui, |ui| status_bar(ui, h));
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().inner_margin(20.0))
+        .frame(egui::Frame::new().inner_margin(MARGIN))
         .show(ui, |ui| {
             connect_card(ui, h, &mut out);
-            ui.add_space(14.0);
+            ui.add_space(GAP);
             tabs(ui, h, &mut out);
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| match h.tab {
@@ -326,71 +327,98 @@ fn this_computer(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
 fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     egui::Frame::group(ui.style())
         .corner_radius(10.0)
-        .inner_margin(18.0)
+        .inner_margin(MARGIN)
         .show(ui, |ui| {
-            ui.set_max_width(560.0);
+            ui.set_width(ui.available_width());
             ui.label(
                 RichText::new("Connect to a computer")
-                    .font(FontId::proportional(22.0))
+                    .font(FontId::proportional(20.0))
                     .strong(),
             );
             ui.add_space(8.0);
-            let edit = ui.add(
-                egui::TextEdit::singleline(&mut h.connect_to)
-                    .hint_text("Computer ID (123 456 789)")
-                    .font(FontId::proportional(22.0))
-                    .desired_width(f32::INFINITY),
-            );
-            let mut enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.add_space(6.0);
-            let pw = ui.add(
-                egui::TextEdit::singleline(&mut h.access_password)
-                    .password(true)
-                    .hint_text("Its access password (none: ask the person there)")
-                    .font(FontId::proportional(18.0))
-                    .desired_width(f32::INFINITY),
-            );
-            if std::mem::take(&mut h.focus_password) {
-                pw.request_focus();
-            }
-            enter |= pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            // Wide enough: ID, password and Connect on one line; otherwise the ID above.
+            let wide = ui.available_width() >= 520.0;
+            let mut enter = false;
+            let mut height = 0.0;
             ui.horizontal(|ui| {
-                // Signed in, a bare ID is looked up in the fleet; otherwise it connects as a
-                // guest: with the password, or by asking the person at the computer.
-                let guest = !h.access_password.is_empty() || !h.signed_in;
-                let ready = !h.connect_to.trim().is_empty() && h.busy.is_none();
-                let button = egui::Button::new(
-                    RichText::new("  Connect  ")
-                        .size(18.0)
-                        .color(Color32::WHITE),
-                )
-                .fill(ACCENT);
-                if (ui.add_enabled(ready, button).clicked() || (enter && ready))
-                    && !h.connect_to.trim().is_empty()
-                {
-                    let id = h.connect_to.trim().to_owned();
-                    out.push(if guest {
-                        Request::ConnectGuest {
-                            id,
-                            password: Secret(std::mem::take(&mut h.access_password)),
-                        }
-                    } else {
-                        Request::ConnectTyped(id)
-                    });
-                }
-                if !h.signed_in {
-                    ui.label(
-                        RichText::new(if h.access_password.is_empty() {
-                            "No account needed. Without a password, the person there accepts."
-                        } else {
-                            "No account needed: the ID and its access password."
-                        })
-                        .color(Color32::GRAY),
-                    );
+                let width = if wide {
+                    (ui.available_width() - CONNECT_W - 16.0) * 0.42
+                } else {
+                    f32::INFINITY
+                };
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut h.connect_to)
+                        .hint_text("Computer ID (123 456 789)")
+                        .font(FontId::proportional(18.0))
+                        .desired_width(width),
+                );
+                enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                height = edit.rect.height();
+                if wide {
+                    password_and_connect(ui, h, out, enter, height);
                 }
             });
+            if !wide {
+                ui.horizontal(|ui| password_and_connect(ui, h, out, enter, height));
+            }
+            if !h.signed_in {
+                ui.label(
+                    RichText::new(if h.access_password.is_empty() {
+                        "No account needed. Without a password, the person there accepts."
+                    } else {
+                        "No account needed: the ID and its access password."
+                    })
+                    .color(Color32::GRAY),
+                );
+            }
         });
+}
+
+/// The password field (the rest of the line) and the Connect button, `height` tall like the
+/// ID field. `enter`: Enter was pressed in the ID field.
+fn password_and_connect(
+    ui: &mut egui::Ui,
+    h: &mut Home,
+    out: &mut Vec<Request>,
+    mut enter: bool,
+    height: f32,
+) {
+    let pw = ui.add(
+        egui::TextEdit::singleline(&mut h.access_password)
+            .password(true)
+            .hint_text("Its access password (if it has one)")
+            .font(FontId::proportional(18.0))
+            .desired_width(ui.available_width() - CONNECT_W - ui.spacing().item_spacing.x),
+    );
+    if std::mem::take(&mut h.focus_password) {
+        pw.request_focus();
+    }
+    enter |= pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    // Signed in, a bare ID is looked up in the fleet; otherwise it connects as a
+    // guest: with the password, or by asking the person at the computer.
+    let guest = !h.access_password.is_empty() || !h.signed_in;
+    let ready = !h.connect_to.trim().is_empty() && h.busy.is_none();
+    let button = egui::Button::new(
+        RichText::new("  Connect  ")
+            .size(18.0)
+            .color(Color32::WHITE),
+    )
+    .fill(ACCENT)
+    .min_size(egui::vec2(CONNECT_W, height));
+    if (ui.add_enabled(ready, button).clicked() || (enter && ready))
+        && !h.connect_to.trim().is_empty()
+    {
+        let id = h.connect_to.trim().to_owned();
+        out.push(if guest {
+            Request::ConnectGuest {
+                id,
+                password: Secret(std::mem::take(&mut h.access_password)),
+            }
+        } else {
+            Request::ConnectTyped(id)
+        });
+    }
 }
 
 fn tabs(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
@@ -441,8 +469,13 @@ enum CardClick {
     CancelName,
 }
 
+/// One computer, `width` wide in all: its name (one line, the full one on hover), its ID
+/// and online state, then Connect on the left and Rename / Remove on the right. Every card
+/// has the same height, so the rows line up.
+#[allow(clippy::too_many_arguments)]
 fn computer_card(
     ui: &mut egui::Ui,
+    width: f32,
     code: &str,
     label: Option<&str>,
     online: Option<bool>,
@@ -452,54 +485,71 @@ fn computer_card(
 ) -> Option<CardClick> {
     let is_renaming = renaming.is_some();
     let mut clicked = None;
-    egui::Frame::group(ui.style())
+    let frame = egui::Frame::group(ui.style())
         .corner_radius(10.0)
-        .inner_margin(12.0)
-        .show(ui, |ui| {
-            ui.set_width(CARD_W);
+        .inner_margin(12.0);
+    let inner = width - frame.total_margin().sum().x;
+    frame.show(ui, |ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+        ui.vertical(|ui| {
+            ui.set_width(inner);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("🖥").size(28.0));
+                ui.label(RichText::new("🖥").size(26.0));
                 ui.vertical(|ui| {
-                    match renaming {
-                        Some(text) => {
-                            let r = ui.add(
-                                egui::TextEdit::singleline(text)
-                                    .hint_text("Name")
-                                    .char_limit(rconn_core::protocol::MAX_HOST_NAME_CHARS)
-                                    .desired_width(CARD_W - 60.0),
-                            );
-                            if !r.has_focus() && !r.lost_focus() {
-                                r.request_focus();
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    // A text field is a little taller than a label: keep the height either way.
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(NAME_ROW_H);
+                        match renaming {
+                            Some(text) => {
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(text)
+                                        .hint_text("Name")
+                                        .char_limit(rconn_core::protocol::MAX_HOST_NAME_CHARS)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if !r.has_focus() && !r.lost_focus() {
+                                    r.request_focus();
+                                }
+                                if r.lost_focus() {
+                                    clicked =
+                                        Some(if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                            CardClick::CancelName
+                                        } else {
+                                            CardClick::SaveName
+                                        });
+                                }
                             }
-                            if r.lost_focus() {
-                                clicked = Some(if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                    CardClick::CancelName
-                                } else {
-                                    CardClick::SaveName
-                                });
+                            None => {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(label.unwrap_or("Unnamed computer"))
+                                            .size(15.0)
+                                            .strong(),
+                                    )
+                                    .truncate(),
+                                );
                             }
                         }
-                        None => {
-                            ui.label(RichText::new(label.unwrap_or("Unnamed computer")).strong());
-                        }
-                    }
-                    ui.label(RichText::new(code).monospace().color(Color32::GRAY));
-                    if let Some(online) = online {
-                        let (c, t) = if online {
-                            (GOOD, "online")
-                        } else {
-                            (Color32::GRAY, "offline")
-                        };
-                        ui.horizontal(|ui| {
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(code).monospace().color(Color32::GRAY));
+                        if let Some(online) = online {
+                            let (c, t) = if online {
+                                (GOOD, "online")
+                            } else {
+                                (Color32::GRAY, "offline")
+                            };
+                            ui.add_space(4.0);
                             status_dot(ui, c);
-                            ui.label(RichText::new(t).color(c).small());
-                        });
-                    }
+                            ui.label(RichText::new(t).color(c).size(12.0));
+                        }
+                    });
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             let link = |ui: &mut egui::Ui, text: &str, hover: &str| {
-                ui.add(egui::Button::new(RichText::new(text).small()).frame(false))
+                ui.add(egui::Button::new(RichText::new(text).size(13.0)).frame(false))
                     .on_hover_text(hover)
                     .clicked()
             };
@@ -520,20 +570,23 @@ fn computer_card(
                     clicked = Some(CardClick::Connect);
                 }
                 if editable {
-                    if link(ui, "Rename", "Give it a name on this computer") {
-                        clicked = Some(CardClick::Rename);
-                    }
-                    if link(ui, "Remove", "Take it off this list") {
-                        clicked = Some(CardClick::Remove);
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if link(ui, "Remove", "Take it off this list") {
+                            clicked = Some(CardClick::Remove);
+                        }
+                        if link(ui, "Rename", "Give it a name on this computer") {
+                            clicked = Some(CardClick::Rename);
+                        }
+                    });
                 }
             });
         });
+    });
     clicked
 }
 
 fn empty(ui: &mut egui::Ui, icon: &str, text: &str) {
-    ui.add_space(40.0);
+    ui.add_space(24.0);
     ui.vertical_centered(|ui| {
         ui.label(RichText::new(icon).size(44.0).color(Color32::GRAY));
         ui.add_space(6.0);
@@ -636,53 +689,42 @@ fn recent(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(12.0);
+    ui.add_space(MARGIN);
     ui.label(RichText::new(title).size(18.0).strong());
     ui.add_space(4.0);
 }
 
 fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     section(ui, "🌐  Server");
-    ui.label(
-        RichText::new(format!(
-            "Empty: the public Rconn server ({}). Self-hosted: your server's URL and pin.",
-            rconn_core::DEFAULT_SERVER
-        ))
-        .small()
-        .color(Color32::GRAY),
-    );
-    egui::Grid::new("server")
-        .num_columns(2)
-        .spacing([12.0, 6.0])
+    let own = rconn_host_settings::ui::self_hosted(&h.profile.server, &h.profile.fingerprint);
+    ui.label(if own {
+        format!("Your own server: {}", h.profile.server)
+    } else {
+        format!("The public Rconn server ({}).", rconn_core::DEFAULT_SERVER)
+    });
+    egui::CollapsingHeader::new("Advanced: self-hosted server")
+        .id_salt("self_hosted_server")
+        .default_open(own)
         .show(ui, |ui| {
-            let label = ui.label("Server URL").id;
-            ui.add(
-                egui::TextEdit::singleline(&mut h.server_edit)
-                    .hint_text(rconn_core::DEFAULT_SERVER)
-                    .desired_width(360.0),
-            )
-            .labelled_by(label);
-            ui.end_row();
-            let label = ui.label("Server pin").id;
-            ui.add(
-                egui::TextEdit::singleline(&mut h.fingerprint_edit)
-                    .hint_text("sha256:… (empty for a public certificate)")
-                    .desired_width(360.0),
-            )
-            .labelled_by(label);
-            ui.end_row();
+            rconn_host_settings::ui::server_fields(
+                ui,
+                "server",
+                &mut h.server_edit,
+                &mut h.fingerprint_edit,
+                [None, None],
+            );
+            let changed = h.server_edit.trim() != h.profile.server
+                || h.fingerprint_edit.trim() != h.profile.fingerprint;
+            if ui
+                .add_enabled(changed, egui::Button::new("Save server"))
+                .clicked()
+            {
+                out.push(Request::SaveServer {
+                    server: h.server_edit.trim().to_owned(),
+                    fingerprint: h.fingerprint_edit.trim().to_owned(),
+                });
+            }
         });
-    let changed = h.server_edit.trim() != h.profile.server
-        || h.fingerprint_edit.trim() != h.profile.fingerprint;
-    if ui
-        .add_enabled(changed, egui::Button::new("Save server"))
-        .clicked()
-    {
-        out.push(Request::SaveServer {
-            server: h.server_edit.trim().to_owned(),
-            fingerprint: h.fingerprint_edit.trim().to_owned(),
-        });
-    }
 
     section(ui, "👤  Account (optional)");
     ui.label(
@@ -939,7 +981,22 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
     ui.painter().circle_filled(rect.center(), 4.5, color);
 }
 
-const CARD_W: f32 = 210.0;
+/// Panel margins; the space between cards, and between the connect card and the tabs.
+const MARGIN: f32 = 16.0;
+const GAP: f32 = 12.0;
+/// The Connect button next to the ID and password fields.
+const CONNECT_W: f32 = 112.0;
+/// The narrowest a computer card gets (name, ID + online, Connect / Rename / Remove).
+const CARD_MIN_W: f32 = 210.0;
+/// A card's name line: a text field's height, so renaming doesn't make the card taller.
+const NAME_ROW_H: f32 = 22.0;
+
+/// How many cards fit on a row `available` wide, and how wide each is so they fill it.
+pub fn card_columns(available: f32) -> (usize, f32) {
+    let per_row = ((available + GAP) / (CARD_MIN_W + GAP)).floor().max(1.0) as usize;
+    let width = (available - GAP * (per_row - 1) as f32) / per_row as f32;
+    (per_row, width.floor())
+}
 
 /// Cards (ID, name, online?) in even rows; returns the index of the one clicked and how.
 fn card_grid(
@@ -949,27 +1006,31 @@ fn card_grid(
     editable: bool,
     mut renaming: Option<&mut (String, String)>,
 ) -> Option<(usize, CardClick)> {
-    let per_row = ((ui.available_width() + 12.0) / (CARD_W + 12.0 + 26.0))
-        .floor()
-        .max(1.0) as usize;
+    let (per_row, width) = card_columns(ui.available_width());
     let mut clicked = None;
-    ui.add_space(8.0);
+    ui.add_space(GAP - ui.spacing().item_spacing.y);
+    ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
     for (r, row) in cards.chunks(per_row).enumerate() {
         ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
             for (i, (code, label, online)) in row.iter().enumerate() {
                 let edit = match renaming.as_deref_mut() {
                     Some((c, text)) if c == code => Some(text),
                     _ => None,
                 };
-                if let Some(c) =
-                    computer_card(ui, code, label.as_deref(), *online, enabled, editable, edit)
-                {
+                if let Some(c) = computer_card(
+                    ui,
+                    width,
+                    code,
+                    label.as_deref(),
+                    *online,
+                    enabled,
+                    editable,
+                    edit,
+                ) {
                     clicked = Some((r * per_row + i, c));
                 }
             }
         });
-        ui.add_space(12.0);
     }
     clicked
 }
