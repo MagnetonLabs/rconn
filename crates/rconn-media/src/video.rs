@@ -368,6 +368,8 @@ impl VideoEncoder {
             return;
         }
         self.settings.bitrate_bps = bps;
+        // Watch the next picture: a keyframe nobody asked for came from this change.
+        self.probe_retarget = self.encoder.is_some();
         self.apply_bitrate();
     }
 
@@ -375,7 +377,6 @@ impl VideoEncoder {
     /// spare encoder, which may have an older one).
     fn apply_bitrate(&mut self) {
         let bps = self.settings.bitrate_bps;
-        self.probe_retarget = self.encoder.is_some();
         match &mut self.encoder {
             Some(Engine::OpenH264(o)) if o.started && o.bps != bps => {
                 if !crate::oh264::set_bitrate(&mut o.encoder, o.bps, bps) {
@@ -705,6 +706,8 @@ impl VideoEncoder {
             self.spare = previous.map(|(e, d)| (d, e, old_headers));
             self.encoder = Some(engine);
             self.dims = Some((w, h));
+            // A new or switched-to encoder's first picture is a keyframe of its own.
+            self.probe_retarget = false;
             self.nv12.clear(); // forces a full NV12 rewrite
             // References never cross encoders.
             self.ledger.new_instance();
@@ -1219,10 +1222,12 @@ mod ltr_tests {
                 rates.iter().zip(bytes).collect::<Vec<_>>(),
                 e.bitrate_change_costs_keyframe()
             );
-            // Microsoft's software Media Foundation encoder puts out keyframes on changes:
-            // it must be known for it, so the host changes its bitrate rarely.
-            if !e.bitrate_change_costs_keyframe() {
+            // Microsoft's software Media Foundation encoder puts out keyframes on changes
+            // (known by name, so the host changes its bitrate rarely). Every other engine:
+            // one keyframe, and not taken for one that pays for changes.
+            if !e.engine_name().contains("H264 Encoder MFT") {
                 assert_eq!(keys, 1, "only the first frame");
+                assert!(!e.bitrate_change_costs_keyframe(), "free changes taken for costly");
             }
         }
     }
