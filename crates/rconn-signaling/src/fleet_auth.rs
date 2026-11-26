@@ -52,6 +52,7 @@ impl FleetAuthenticator {
                 guest: false,
                 show_indicator: false,
                 clipboard: true,
+                file_transfer: true,
             },
         }
     }
@@ -120,6 +121,13 @@ impl FleetAuthenticator {
     /// Mint TURN credentials into every `Welcome`.
     pub fn with_turn(mut self, minter: TurnMinter) -> Self {
         self.turn = Some(minter);
+        self
+    }
+
+    /// The policy sent to hosts with every session (the default allows clipboard and
+    /// file transfer, no indicator).
+    pub fn with_session_policy(mut self, policy: SessionPolicy) -> Self {
+        self.policy = policy;
         self
     }
 

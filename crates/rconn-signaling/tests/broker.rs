@@ -66,6 +66,7 @@ impl Authenticator for TestAuth {
             guest: false,
             show_indicator: false,
             clipboard: true,
+            file_transfer: true,
         }
     }
 }

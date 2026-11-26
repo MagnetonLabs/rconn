@@ -277,6 +277,14 @@ pub struct SessionPolicy {
     /// anything or taking input.
     #[serde(default)]
     pub guest: bool,
+    /// Allow file transfer (the `rconn-files/1` data channel). Servers from before it
+    /// existed don't send it: on, like the host setting's default.
+    #[serde(default = "yes")]
+    pub file_transfer: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -659,6 +667,21 @@ mod tests {
     fn unknown_server_message_decodes_as_unknown() {
         let msg = ServerMessage::from_json(r#"{"type":"some_future_thing","x":1}"#).unwrap();
         assert_eq!(msg, ServerMessage::Unknown);
+    }
+
+    #[test]
+    fn session_policy_from_an_older_server_allows_file_transfer() {
+        let old: SessionPolicy =
+            serde_json::from_str(r#"{"show_indicator":false,"clipboard":true}"#).unwrap();
+        assert!(old.file_transfer);
+        assert!(!old.guest);
+        let off = SessionPolicy {
+            file_transfer: false,
+            ..old
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(json.contains(r#""file_transfer":false"#), "{json}");
+        assert_eq!(serde_json::from_str::<SessionPolicy>(&json).unwrap(), off);
     }
 
     #[test]

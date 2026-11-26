@@ -64,6 +64,7 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
         "log_level",
         "access_password",
         "ask_with_password",
+        "file_transfer",
     ]
     .iter()
     .map(|k| m.lock_reason(k))
@@ -130,6 +131,12 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
             });
             row(ui, "Clipboard sync", locks[4], |ui| {
                 ui.checkbox(&mut form.clipboard, "Share clipboard text with the viewer")
+            });
+            row(ui, "File transfer", locks[9], |ui| {
+                ui.checkbox(
+                    &mut form.file_transfer,
+                    "Viewers may copy files to and from this computer (your home folder; received files go to Downloads/Rconn)",
+                )
             });
             row(ui, "Max video bitrate", locks[5], |ui| {
                 ui.add(

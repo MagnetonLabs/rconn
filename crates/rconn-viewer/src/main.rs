@@ -2,6 +2,7 @@
 //! session to a host and measures data-channel round trips.
 
 mod access;
+mod files;
 mod gui;
 mod keymap;
 mod oidc_login;

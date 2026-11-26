@@ -198,14 +198,18 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
     }));
     let (input_tx, input_rx) = mpsc::unbounded_channel::<InputEvent>();
     let (kf_ui, kf_from_ui) = mpsc::unbounded_channel::<Control>();
+    let (files_tx, files_rx) = mpsc::unbounded_channel::<crate::files::Cmd>();
+    let files_state = crate::files::Shared::default();
+    let files_for_session = files_state.clone();
     // Dropping the tab drops `close`, which ends the session and its runtime.
     let (close, mut closed) = tokio::sync::watch::channel(());
     let (sh, ctx2) = (shared.clone(), ctx_slot);
     let spawned = std::thread::Builder::new().name("rconn-session".into()).spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let result = rt.block_on(async {
+            let from_ui = FromUi { input: input_rx, control: kf_from_ui, files: files_rx };
             tokio::select! {
-                r = session(args, muted_audio, cursor_for_session, sh.clone(), input_rx, kf_from_ui, ctx2.clone()) => Some(r),
+                r = session(args, muted_audio, cursor_for_session, sh.clone(), from_ui, files_for_session, ctx2.clone()) => Some(r),
                 _ = closed.changed() => None, // tab closed
             }
         });
@@ -244,6 +248,8 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
         toast: None,
         closing: false,
         host,
+        files: crate::files::Panel::new(files_tx, files_state),
+        files_rect: None,
         _close: Some(close),
     }
 }
@@ -289,6 +295,7 @@ pub fn run(args: ConnectArgs) -> Result<()> {
             } else {
                 v
             }
+            .with_drag_and_drop(true) // files dropped on the window go to the remote computer
         },
         // Show each picture as soon as it is drawn: waiting for the display's refresh
         // (the default) adds up to two frames (16-33 ms at 60 Hz) of delay.
@@ -468,15 +475,28 @@ impl eframe::App for Window {
     }
 }
 
+/// What the tab's UI sends the session.
+struct FromUi {
+    input: mpsc::UnboundedReceiver<InputEvent>,
+    /// Control messages (keyframe requests, toolbar actions).
+    control: mpsc::UnboundedReceiver<Control>,
+    files: mpsc::UnboundedReceiver<crate::files::Cmd>,
+}
+
 async fn session(
     args: ConnectArgs,
     muted: Arc<std::sync::atomic::AtomicBool>,
     shared_cursor: Arc<Mutex<Option<rconn_core::protocol::CursorShape>>>,
     shared: Arc<Mutex<Shared>>,
-    mut input: mpsc::UnboundedReceiver<InputEvent>,
-    mut kf_from_ui: mpsc::UnboundedReceiver<Control>,
+    from_ui: FromUi,
+    files_state: crate::files::Shared,
     ctx: Arc<Mutex<Option<egui::Context>>>,
 ) -> Result<()> {
+    let FromUi {
+        mut input,
+        control: mut kf_from_ui,
+        files: files_cmds,
+    } = from_ui;
     let repaint = || {
         if let Some(c) = ctx.lock().expect("ctx").as_ref() {
             c.request_repaint();
@@ -523,6 +543,24 @@ async fn session(
         }
     };
     let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
+    // File transfer: its own channel, opened on first use once the session is let in.
+    let (allowed_tx, allowed_rx) = tokio::sync::watch::channel(false);
+    let files_repaint = {
+        let ctx = ctx.clone();
+        move || {
+            if let Some(c) = ctx.lock().expect("ctx").as_ref() {
+                c.request_repaint();
+            }
+        }
+    };
+    let files_task = tokio::spawn(crate::files::run(
+        session.peer.pc.clone(),
+        files_cmds,
+        files_state,
+        allowed_rx,
+        files_repaint,
+    ));
+    let guest = args.guest.is_some();
     let dc_task = tokio::spawn(async move {
         let send = |dc: Arc<dyn webrtc::data_channel::DataChannel>, m: DataMessage| async move {
             if let Ok(b) = m.encode() {
@@ -539,6 +577,9 @@ async fn session(
                 ev = dc.poll() => match ev {
                     Some(DataChannelEvent::OnOpen) => {
                         open = true;
+                        if !guest {
+                            let _ = allowed_tx.send(true);
+                        }
                         send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
                     }
                     Some(DataChannelEvent::OnMessage(msg)) => match DataMessage::decode(&msg.data) {
@@ -567,6 +608,7 @@ async fn session(
                                         }
                                     }
                                     rconn_peer::guest::Step::Accepted => {
+                                        let _ = allowed_tx.send(true);
                                         status_shared.lock().expect("ui state").status =
                                             "accepted, waiting for the picture…".into();
                                         if let Some(c) = status_ctx.lock().expect("ctx").as_ref() {
@@ -645,6 +687,7 @@ async fn session(
         Ok(why) = &mut refused_rx => {
             dc_task.abort();
             router.abort();
+            files_task.abort();
             session.close().await;
             anyhow::bail!("{why}");
         }
@@ -704,6 +747,7 @@ async fn session(
     }
     dc_task.abort();
     router.abort();
+    files_task.abort();
     session.close().await;
     Ok(())
 }
@@ -745,6 +789,10 @@ struct ViewerApp {
     closing: bool,
     /// The computer this tab shows.
     host: HostId,
+    /// The Files panel (and its transfers).
+    files: crate::files::Panel,
+    /// Where the Files panel is on screen; pointer input there stays local.
+    files_rect: Option<Rect>,
     /// Dropped with the tab, which ends the session.
     _close: Option<tokio::sync::watch::Sender<()>>,
 }
@@ -778,8 +826,9 @@ impl ViewerApp {
     /// Translate this frame's egui input into remote input, relative to `image` on screen.
     fn forward_input(&mut self, ui: &egui::Ui, image: Rect) {
         let events = ui.ctx().input(|i| i.events.clone());
-        let chrome = self.chrome;
-        let on_chrome = |p: Pos2| chrome.is_some_and(|r| r.contains(p));
+        let (chrome, panel) = (self.chrome, self.files_rect);
+        let on_chrome =
+            |p: Pos2| chrome.is_some_and(|r| r.contains(p)) || panel.is_some_and(|r| r.contains(p));
         let hover_on_chrome = ui.ctx().pointer_hover_pos().is_some_and(on_chrome);
         for ev in events {
             match ev {
@@ -1063,6 +1112,21 @@ impl ViewerApp {
         {
             let _ = self.keyframe.send(Control::RequestKeyframe);
         }
+        let active = self.files.active();
+        let label = if active > 0 {
+            format!("📁 Files ({active})")
+        } else {
+            "📁 Files".to_owned()
+        };
+        if ui
+            .selectable_label(self.files.open, label)
+            .on_hover_text(
+                "Copy files to and from the remote computer (or drop files on the window)",
+            )
+            .clicked()
+        {
+            self.files.open = !self.files.open;
+        }
         let muted = self.muted.load(std::sync::atomic::Ordering::Relaxed);
         if ui
             .button(if muted {
@@ -1235,6 +1299,23 @@ impl ViewerApp {
         self.last_stats.clone_from(&stats);
         let ctx = ui.ctx().clone();
         self.restart_dialog(&ctx);
+        // Files dropped on the window go to the remote computer.
+        let (dropped, hovering) = ctx.input(|i| {
+            (
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .map(|f| f.path().to_path_buf())
+                    .collect::<Vec<_>>(),
+                !i.raw.hovered_files.is_empty(),
+            )
+        });
+        let n = self.files.upload(dropped);
+        if n > 0 {
+            self.notify(format!("Sending {n} file(s) to {}", self.name));
+        }
+        let name = self.name.clone();
+        self.files_rect = self.files.show(&ctx, &name);
         if !fullscreen {
             // In a window the toolbar shares the tab strip's row (see `Window::tab_strip`).
             self.chrome = None;
@@ -1261,12 +1342,25 @@ impl ViewerApp {
             if let Some(image) = image {
                 self.forward_input(ui, image);
                 let over_picture = ui.ctx().pointer_hover_pos().is_some_and(|p| {
-                    image.contains(p) && !self.chrome.is_some_and(|r| r.contains(p))
+                    image.contains(p)
+                        && !self.chrome.is_some_and(|r| r.contains(p))
+                        && !self.files_rect.is_some_and(|r| r.contains(p))
                 });
                 let shape = *self.cursor.lock().expect("cursor");
                 if over_picture && let Some(shape) = shape {
                     ui.ctx().set_cursor_icon(cursor_icon(shape));
                 }
+            }
+            if hovering {
+                ui.painter()
+                    .rect_filled(area.shrink(12.0), 12.0, Color32::from_black_alpha(160));
+                ui.painter().text(
+                    area.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("Drop to send to {} (Downloads/Rconn)", self.name),
+                    egui::FontId::proportional(22.0),
+                    Color32::WHITE,
+                );
             }
             if !status.is_empty() {
                 ui.painter().text(
@@ -1477,8 +1571,51 @@ mod render_tests {
             toast: None,
             closing: false,
             host: HostId(uuid::Uuid::nil()),
+            files: crate::files::Panel::new(mpsc::unbounded_channel().0, Default::default()),
+            files_rect: None,
             _close: None,
         }
+    }
+
+    #[test]
+    fn the_files_panel_shows_both_computers_and_transfer_progress() {
+        use rconn_core::files::FileEntry;
+        let mut a = app(false, false);
+        {
+            let mut s = a.files.state.lock().unwrap();
+            s.entries = Some(vec![
+                FileEntry {
+                    name: "Documents".into(),
+                    is_dir: true,
+                    size: 0,
+                    modified: None,
+                },
+                FileEntry {
+                    name: "report.pdf".into(),
+                    is_dir: false,
+                    size: 2_400_000,
+                    modified: None,
+                },
+            ]);
+            let p = rconn_peer::files::Progress::new();
+            s.transfers.push(crate::files::Transfer {
+                upload: true,
+                name: "movie.mp4".into(),
+                progress: p,
+                outcome: None,
+            });
+            s.transfers.push(crate::files::Transfer {
+                upload: false,
+                name: "report.pdf".into(),
+                progress: rconn_peer::files::Progress::new(),
+                outcome: Some(Err("checksum mismatch".into())),
+            });
+        }
+        a.files.open = true;
+        let a = render("viewer-files", a);
+        let rect = a.files_rect.expect("panel shown");
+        assert!(rect.width() > 400.0, "{rect:?}");
+        assert_eq!(a.files.active(), 1);
     }
 
     fn render(name: &str, app: ViewerApp) -> ViewerApp {

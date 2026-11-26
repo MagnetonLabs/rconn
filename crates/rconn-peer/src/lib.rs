@@ -2,6 +2,7 @@
 //! a signaling client ([`signaling`]) and a WebRTC peer wrapper ([`rtc`]).
 
 pub mod clipboard;
+pub mod files;
 pub mod guest;
 pub mod identity;
 pub mod rtc;

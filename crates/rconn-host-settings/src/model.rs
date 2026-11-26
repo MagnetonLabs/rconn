@@ -19,6 +19,8 @@ pub struct Form {
     pub access_password: String,
     /// With a password set, also let people without it ask the person at the computer.
     pub ask_with_password: bool,
+    /// Viewers may browse and copy files (home folder; uploads to Downloads/Rconn).
+    pub file_transfer: bool,
     /// A new password being typed (not saved; turned into a verifier by "Set").
     pub new_access_password: String,
 }
@@ -48,6 +50,7 @@ impl Form {
             log_level: s.log_level.clone(),
             access_password: s.access_password.clone(),
             ask_with_password: s.ask_with_password,
+            file_transfer: s.file_transfer,
             new_access_password: String::new(),
         }
     }
@@ -74,6 +77,7 @@ impl Form {
             ("log_level", self.log_level.clone()),
             ("access_password", self.access_password.clone()),
             ("ask_with_password", self.ask_with_password.to_string()),
+            ("file_transfer", self.file_transfer.to_string()),
         ]
     }
 }
