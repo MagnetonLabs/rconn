@@ -1,14 +1,17 @@
-//! Frame identity for loss repair and timing: the host puts a small tag in every H.264
-//! access unit (an SEI "user data unregistered" message, which decoders ignore), the
-//! viewer reads it, follows whether its picture is intact, and answers with
-//! [`Feedback`] (sent as `Control::FrameAck`).
+//! Frame identity for loss repair and timing: the host puts a small tag in every access
+//! unit (user data that decoders ignore: an SEI "user data unregistered" message in H.264
+//! and H.265, a private metadata OBU in AV1; see [`rconn_core::codec`]), the viewer
+//! reads it, follows whether its picture is intact, and answers with [`Feedback`] (sent
+//! as `Control::FrameAck`).
 //!
 //! With ids the viewer knows exactly which frames it missed (a gap) and which repair
 //! frame makes its picture whole again, so the host can repair a loss from a long-term
 //! reference instead of a keyframe; the tag also carries the host's capture-to-encoded
 //! time for the stats line. Hosts that predate it send no tag; viewers that predate it
-//! ignore it.
+//! ignore it. H.264 tags are byte for byte what 0.1.6 hosts sent.
 
+use rconn_core::codec::{self, VideoCodec};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -30,50 +33,8 @@ pub struct FrameTag {
     pub host_us: u32,
 }
 
-/// Escape `00 00 0x` (x <= 3) as H.264 requires inside a NAL unit.
-fn escape(payload: &[u8], out: &mut Vec<u8>) {
-    let mut zeros = 0;
-    for &b in payload {
-        if zeros >= 2 && b <= 3 {
-            out.push(3);
-            zeros = 0;
-        }
-        out.push(b);
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-    }
-}
-
-fn unescape(nal: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nal.len());
-    let mut zeros = 0;
-    for &b in nal {
-        if zeros >= 2 && b == 3 {
-            zeros = 0;
-            continue;
-        }
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        out.push(b);
-    }
-    out
-}
-
-/// Start offsets of the NAL units in an Annex-B unit (just after each start code).
-fn nal_starts(data: &[u8]) -> Vec<usize> {
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            starts.push(i + 3);
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    starts
-}
-
-/// Put `tag` into `au`, just before its first slice.
-pub fn tag(au: Vec<u8>, tag: &FrameTag) -> Vec<u8> {
+/// Put `tag` into `au` (of `codec`), just before its first picture unit.
+pub fn tag(codec: VideoCodec, au: Vec<u8>, tag: &FrameTag) -> Vec<u8> {
     let mut payload = Vec::with_capacity(PAYLOAD_LEN);
     payload.extend_from_slice(&UUID);
     payload.push(VERSION);
@@ -81,61 +42,43 @@ pub fn tag(au: Vec<u8>, tag: &FrameTag) -> Vec<u8> {
     payload.push(u8::from(tag.key) | (u8::from(tag.recovers_from.is_some()) << 1));
     payload.extend_from_slice(&tag.recovers_from.unwrap_or(0).to_be_bytes());
     payload.extend_from_slice(&tag.host_us.to_be_bytes());
-    let mut sei = vec![0, 0, 0, 1];
-    let mut body = vec![5, PAYLOAD_LEN as u8]; // user_data_unregistered, size
-    body.extend_from_slice(&payload);
-    body.push(0x80); // rbsp trailing bits
-    sei.push(0x06);
-    escape(&body, &mut sei);
-    // Before the first slice (type 1 or 5), after any parameter sets.
-    let at = nal_starts(&au)
-        .into_iter()
-        .find(|&s| matches!(au.get(s).map(|b| b & 0x1f), Some(1 | 5)))
-        .map(|s| {
-            // Back over the start code, and a fourth zero byte if there is one.
-            let mut i = s - 3;
-            if i > 0 && au[i - 1] == 0 {
-                i -= 1;
-            }
-            i
-        })
-        .unwrap_or(0);
-    let mut out = Vec::with_capacity(au.len() + sei.len());
-    out.extend_from_slice(&au[..at]);
-    out.extend_from_slice(&sei);
-    out.extend_from_slice(&au[at..]);
-    out
+    let unit = codec::user_data_unit(codec, &payload);
+    codec::insert_before_picture(codec, au, &unit)
+}
+
+fn parse(p: &[u8]) -> Option<FrameTag> {
+    if p.len() < PAYLOAD_LEN || p[16] != VERSION {
+        return None;
+    }
+    let p = &p[17..];
+    let u32_at = |i: usize| u32::from_be_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+    let flags = p[4];
+    Some(FrameTag {
+        id: u32_at(0),
+        key: flags & 1 != 0,
+        recovers_from: (flags & 2 != 0).then(|| u32_at(5)),
+        host_us: u32_at(9),
+    })
 }
 
 /// The tag in `au`, if the host put one there.
-pub fn read(au: &[u8]) -> Option<FrameTag> {
-    for s in nal_starts(au) {
-        match au.get(s).map(|b| b & 0x1f) {
-            Some(6) => {}
-            Some(1 | 5) => return None, // slices: no tag before them
-            _ => continue,
-        }
-        let end = (s + 3 + 2 * PAYLOAD_LEN).min(au.len());
-        let body = unescape(&au[s + 1..end]);
-        if body.len() < 2 + PAYLOAD_LEN
-            || body[0] != 5
-            || usize::from(body[1]) != PAYLOAD_LEN
-            || body[2..18] != UUID
-            || body[18] != VERSION
-        {
-            continue;
-        }
-        let p = &body[19..];
-        let u32_at = |i: usize| u32::from_be_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
-        let flags = p[4];
-        return Some(FrameTag {
-            id: u32_at(0),
-            key: flags & 1 != 0,
-            recovers_from: (flags & 2 != 0).then(|| u32_at(5)),
-            host_us: u32_at(9),
-        });
+pub fn read(codec: VideoCodec, au: &[u8]) -> Option<FrameTag> {
+    let (_, p) = codec::find_user_data(codec, au, &UUID)?;
+    parse(&p)
+}
+
+/// The tag in `au`, and `au` without it (what a decoder gets: AV1 decoders are not all
+/// sure to skip private metadata). H.264 units are left as they are.
+pub fn take(codec: VideoCodec, au: &[u8]) -> (Cow<'_, [u8]>, Option<FrameTag>) {
+    let Some((unit, p)) = codec::find_user_data(codec, au, &UUID) else {
+        return (Cow::Borrowed(au), None);
+    };
+    if codec == VideoCodec::H264 {
+        return (Cow::Borrowed(au), parse(&p));
     }
-    None
+    let mut rest = au[..unit.start].to_vec();
+    rest.extend_from_slice(&au[unit.end..]);
+    (Cow::Owned(rest), parse(&p))
 }
 
 /// What the viewer tells the host.
@@ -393,15 +336,44 @@ mod tests {
             recovers_from: Some(3),
             host_us: 4500,
         };
-        let tagged = tag(au.clone(), &t);
-        assert_eq!(read(&tagged), Some(t));
-        let types: Vec<u8> = nal_starts(&tagged)
+        let h264 = VideoCodec::H264;
+        let tagged = tag(h264, au.clone(), &t);
+        assert_eq!(read(h264, &tagged), Some(t));
+        let types: Vec<u8> = codec::units(h264, &tagged)
             .iter()
-            .map(|&s| tagged[s] & 0x1f)
+            .map(|u| tagged[u.header] & 0x1f)
             .collect();
         assert_eq!(types, [7, 8, 6, 5], "SPS, PPS, tag, slice");
-        assert_eq!(read(&au), None, "untagged");
+        assert_eq!(read(h264, &au), None, "untagged");
         assert!(tagged.ends_with(&[0, 0, 1, 0x65, 9, 9]));
+        // The bytes 0.1.6 hosts sent (and 0.1.6 viewers read).
+        let sei = &tagged[12..tagged.len() - 6];
+        assert_eq!(&sei[..7], &[0, 0, 0, 1, 6, 5, PAYLOAD_LEN as u8]);
+        assert_eq!(&sei[7..23], &UUID);
+        assert_eq!(take(h264, &tagged).0.as_ref(), tagged.as_slice());
+    }
+
+    #[test]
+    fn tags_ride_in_hevc_and_av1_and_come_out_before_decoding() {
+        let t = FrameTag {
+            id: 7,
+            key: false,
+            recovers_from: Some(5),
+            host_us: 1,
+        };
+        for (codec, au) in [
+            (
+                VideoCodec::H265,
+                vec![0, 0, 0, 1, 0x40, 1, 0, 0, 0, 1, 0x02, 1, 0xd0, 4],
+            ),
+            (VideoCodec::Av1, vec![0x0a, 1, 0, 0x32, 2, 7, 7]),
+        ] {
+            let tagged = tag(codec, au.clone(), &t);
+            assert_eq!(read(codec, &tagged), Some(t), "{codec:?}");
+            assert_eq!(read(VideoCodec::H264, &au), None);
+            let (bits, back) = take(codec, &tagged);
+            assert_eq!((bits.as_ref(), back), (au.as_slice(), Some(t)), "{codec:?}");
+        }
     }
 
     fn t(id: u32) -> FrameTag {

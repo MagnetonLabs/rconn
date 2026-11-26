@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+rconn-core.workspace = true
 # Types only. Loading Cisco's downloaded binary (libloading) is added per target below:
 # not on iOS, where the App Store forbids downloaded code and VideoToolbox decodes.
 openh264 = { version = "0.9", default-features = false }

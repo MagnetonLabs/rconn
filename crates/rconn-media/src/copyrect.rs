@@ -15,6 +15,8 @@
 //!   ([`FrameOps`]): moves first, then the regions of this decoded picture to show.
 //!   In-band, the instructions can never arrive without their picture or out of order
 //!   with it; losing one is losing the picture, which the viewer already notices.
+//!   HEVC carries the same SEI message, AV1 a private metadata OBU
+//!   ([`rconn_core::codec`]): the scheme does not depend on the codec.
 //! * The viewer keeps its own picture ([`Compositor`]): it applies the moves to it, then
 //!   copies the listed regions of the decoded canvas in. A gap in the sequence numbers
 //!   (or a picture without instructions) means it missed something: it freezes and asks
@@ -26,6 +28,7 @@
 use crate::video::{DecodedFrame, PixelLayout};
 use crate::yuv::{I420, Rect};
 use openh264::formats::YUVSource;
+use rconn_core::codec::{self, UnitKind, VideoCodec};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -272,122 +275,53 @@ impl FrameOps {
 
     /// These instructions as an SEI NAL unit, start code included.
     pub fn to_sei(&self) -> Vec<u8> {
-        let payload = self.payload();
-        let mut rbsp = vec![5u8]; // payload type: user_data_unregistered
-        let mut n = payload.len();
-        while n >= 255 {
-            rbsp.push(255);
-            n -= 255;
-        }
-        rbsp.push(n as u8);
-        rbsp.extend_from_slice(&payload);
-        rbsp.push(0x80); // rbsp_trailing_bits
-        let mut nal = vec![0, 0, 0, 1, 0x06];
-        let mut zeros = 0;
-        for b in rbsp {
-            // Emulation prevention: no start code may appear inside a NAL unit.
-            if zeros >= 2 && b <= 3 {
-                nal.push(3);
-                zeros = 0;
-            }
-            nal.push(b);
-            zeros = if b == 0 { zeros + 1 } else { 0 };
-        }
-        nal
+        self.to_unit(VideoCodec::H264)
     }
 
-    /// The instructions in an SEI NAL unit (without start code), if it is ours.
-    fn from_sei(nal: &[u8]) -> Option<FrameOps> {
-        if nal.first()? & 0x1f != 6 {
-            return None;
-        }
-        let mut rbsp = Vec::with_capacity(nal.len());
-        let mut zeros = 0;
-        for &b in &nal[1..] {
-            if zeros >= 2 && b == 3 {
-                zeros = 0;
-                continue;
-            }
-            rbsp.push(b);
-            zeros = if b == 0 { zeros + 1 } else { 0 };
-        }
-        let mut bytes = rbsp.iter().copied();
-        let mut ff = || {
-            let mut v = 0usize;
-            loop {
-                let b = bytes.next()?;
-                v += usize::from(b);
-                if b != 255 {
-                    return Some(v);
-                }
-            }
-        };
-        let (kind, size) = (ff()?, ff()?);
-        let at = rbsp.len() - bytes.len();
-        if kind != 5 {
-            return None;
-        }
-        Self::from_payload(rbsp.get(at..at + size)?)
+    /// These instructions as a user data unit of `codec` (see [`rconn_core::codec`]).
+    pub fn to_unit(&self, codec: VideoCodec) -> Vec<u8> {
+        codec::user_data_unit(codec, &self.payload())
     }
 }
 
-/// (start code offset, NAL unit offset, end) of each NAL unit of an Annex-B stream.
-fn nal_spans(au: &[u8]) -> Vec<(usize, usize, usize)> {
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= au.len() {
-        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
-            let code = if i > 0 && au[i - 1] == 0 { i - 1 } else { i };
-            starts.push((code, i + 3));
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    let ends = starts.iter().skip(1).map(|s| s.0).chain([au.len()]);
-    starts
-        .iter()
-        .zip(ends)
-        .map(|(&(code, nal), end)| (code, nal, end))
-        .collect()
-}
-
-/// Is this NAL unit a picture slice (non-IDR or IDR)?
-fn is_slice(nal: &[u8]) -> bool {
-    matches!(nal.first().map(|b| b & 0x1f), Some(1 | 5))
-}
-
-/// How many pictures an access unit holds (slices that start a picture:
-/// `first_mb_in_slice` is 0, whose Exp-Golomb code is a single 1 bit).
+/// How many pictures an H.264 access unit holds (see [`pictures_in`]).
 pub fn pictures(au: &[u8]) -> usize {
-    nal_spans(au)
-        .into_iter()
-        .map(|(_, s, e)| &au[s..e])
-        .filter(|nal| is_slice(nal) && nal.get(1).is_some_and(|b| b & 0x80 != 0))
+    pictures_in(VideoCodec::H264, au)
+}
+
+/// How many pictures an access unit holds (units that start a picture: in H.264 a slice
+/// with `first_mb_in_slice` 0, in HEVC `first_slice_segment_in_pic_flag`, in AV1 a
+/// frame or frame header).
+pub fn pictures_in(codec: VideoCodec, au: &[u8]) -> usize {
+    codec::units(codec, au)
+        .iter()
+        .filter(|u| codec::kind(codec, au, u) == UnitKind::Picture { first: true })
         .count()
 }
 
-/// `au` with `ops` in front of its first picture slice.
-pub fn attach(mut au: Vec<u8>, ops: &FrameOps) -> Vec<u8> {
-    let at = nal_spans(&au)
-        .into_iter()
-        .find(|&(_, s, e)| is_slice(&au[s..e]))
-        .map_or(au.len(), |(code, _, _)| code);
-    au.splice(at..at, ops.to_sei());
-    au
+/// An H.264 `au` with `ops` in front of its first picture slice.
+pub fn attach(au: Vec<u8>, ops: &FrameOps) -> Vec<u8> {
+    attach_in(VideoCodec::H264, au, ops)
+}
+
+/// `au` with `ops` in front of its first picture unit.
+pub fn attach_in(codec: VideoCodec, au: Vec<u8>, ops: &FrameOps) -> Vec<u8> {
+    codec::insert_before_picture(codec, au, &ops.to_unit(codec))
+}
+
+/// Take our instructions out of an H.264 access unit (see [`split_in`]).
+pub fn split(au: &[u8]) -> (Cow<'_, [u8]>, Option<FrameOps>) {
+    split_in(VideoCodec::H264, au)
 }
 
 /// Take our instructions out of an access unit: (what the decoder gets, instructions).
-pub fn split(au: &[u8]) -> (Cow<'_, [u8]>, Option<FrameOps>) {
-    for (code, s, e) in nal_spans(au) {
-        if is_slice(&au[s..e]) {
-            break; // SEI comes before the picture's slices
-        }
-        if let Some(ops) = FrameOps::from_sei(&au[s..e]) {
-            let mut rest = au[..code].to_vec();
-            rest.extend_from_slice(&au[e..]);
-            return (Cow::Owned(rest), Some(ops));
-        }
+pub fn split_in(codec: VideoCodec, au: &[u8]) -> (Cow<'_, [u8]>, Option<FrameOps>) {
+    if let Some((u, p)) = codec::find_user_data(codec, au, &UUID)
+        && let Some(ops) = FrameOps::from_payload(&p)
+    {
+        let mut rest = au[..u.start].to_vec();
+        rest.extend_from_slice(&au[u.end..]);
+        return (Cow::Owned(rest), Some(ops));
     }
     (Cow::Borrowed(au), None)
 }
@@ -415,6 +349,8 @@ pub struct Composer {
     /// Send the next picture without instructions (the viewer then asks for a keyframe).
     withhold_next: bool,
     last: PrepareStats,
+    /// The codec of the access units given to [`Composer::sent`].
+    codec: VideoCodec,
 }
 
 /// What the last [`Composer::prepare`] found.
@@ -431,8 +367,17 @@ pub struct PrepareStats {
 }
 
 impl Composer {
+    /// For an H.264 stream.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// For a stream in `codec`.
+    pub fn for_codec(codec: VideoCodec) -> Self {
+        Self {
+            codec,
+            ..Self::default()
+        }
     }
 
     /// The next picture is sent whole (a keyframe was asked for).
@@ -539,7 +484,7 @@ impl Composer {
         let Some((mut ops, band)) = self.prepared.take() else {
             return au;
         };
-        if pictures(&au) != 1 || std::mem::take(&mut self.withhold_next) {
+        if pictures_in(self.codec, &au) != 1 || std::mem::take(&mut self.withhold_next) {
             // Not exactly this picture (an encoder that delays or merges them): without
             // instructions, the viewer knows it lost track and asks for a keyframe.
             self.want_full = true;
@@ -554,7 +499,7 @@ impl Composer {
             // `shown` now matches `picture` everywhere (the moved areas were checked).
             copy_rows(picture, shown, band);
         }
-        attach(au, &ops)
+        attach_in(self.codec, au, &ops)
     }
 
     /// The encoder gave nothing for the prepared picture. `skipped` says it dropped it
@@ -1216,6 +1161,54 @@ mod tests {
     }
 
     const FAKE_AU: [u8; 7] = [0, 0, 0, 1, 0x65, 0x88, 0x84];
+
+    /// The same instructions ride in HEVC (SEI) and AV1 (metadata OBU) streams.
+    #[test]
+    fn instructions_ride_in_hevc_and_av1() {
+        let ops = FrameOps {
+            seq: 3,
+            size: (64, 32),
+            moves: vec![Move {
+                from_x: 0,
+                from_y: 16,
+                to: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 64,
+                    h: 16,
+                },
+            }],
+            regions: vec![Rect {
+                x: 0,
+                y: 16,
+                w: 64,
+                h: 16,
+            }],
+            ..Default::default()
+        };
+        for (codec, au) in [
+            (
+                VideoCodec::H265,
+                vec![0, 0, 0, 1, 0x40, 1, 0, 0, 0, 1, 0x02, 1, 0xd0, 4],
+            ),
+            (VideoCodec::Av1, vec![0x0a, 1, 0, 0x32, 2, 7, 7]),
+        ] {
+            assert_eq!(pictures_in(codec, &au), 1);
+            let with = attach_in(codec, au.clone(), &ops);
+            assert_eq!(pictures_in(codec, &with), 1, "{codec:?}");
+            let (rest, back) = split_in(codec, &with);
+            assert_eq!(rest.as_ref(), au.as_slice(), "{codec:?}");
+            assert_eq!(back.as_ref(), Some(&ops), "{codec:?}");
+            let mut composer = Composer::for_codec(codec);
+            let pic = I420::new(64, 32);
+            composer.prepare(&pic, &[]);
+            let sent = composer.sent(&pic, au.clone());
+            assert!(
+                split_in(codec, &sent).1.is_some_and(|o| o.full),
+                "{codec:?}"
+            );
+        }
+    }
 
     /// Host and viewer with a lossless "codec" (the canvas is decoded exactly): the
     /// instructions sent and the viewer's picture.

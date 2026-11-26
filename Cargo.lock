@@ -5870,6 +5870,7 @@ dependencies = [
  "opus",
  "opusic-sys",
  "pipewire",
+ "rconn-core",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

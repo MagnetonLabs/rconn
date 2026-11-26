@@ -36,6 +36,8 @@ pub struct StreamConfig {
     pub motion_half_res: bool,
     /// openh264 even where a hardware encoder exists (tests; `RCONN_ENCODER=openh264`).
     pub software: bool,
+    /// The codec negotiated with the viewer ([`VideoSender::codec`]).
+    pub codec: rconn_media::caps::VideoCodec,
 }
 
 /// The viewer's requests to the encoder: an IDR frame (viewer joined, decoder lost
@@ -458,6 +460,9 @@ fn run_generation(
     } else {
         VideoEncoder::new(&cfg.openh264, settings)?
     };
+    // The negotiated codec: H.264, or HEVC/AV1 on a hardware encoder (losses there are
+    // repaired with keyframes where the encoder has no long-term references).
+    enc.set_codec(cfg.codec);
     // Frame ids run on from the previous capture; the viewer acknowledges by id.
     let first_id = ctx.next_id.load(Ordering::Relaxed);
     enc.start_frame_ids_at(first_id);
@@ -625,7 +630,7 @@ fn run_generation(
             force = true;
         }
         if composer.is_none() && !surfaces && ctx.copy_rects.load(Ordering::Relaxed) {
-            composer = Some(Composer::new()); // its first picture is whole
+            composer = Some(Composer::for_codec(cfg.codec)); // its first picture is whole
         }
         if force {
             enc.request_keyframe();
@@ -878,6 +883,7 @@ fn run_generation(
                 .as_micros()
                 .min(u128::from(u32::MAX)) as u32;
             let au = frames::tag(
+                cfg.codec,
                 au,
                 &FrameTag {
                     id: info.id,
@@ -1075,6 +1081,7 @@ mod tests {
                 max_size: (3840, 2400),
                 motion_half_res: false,
                 software: true,
+                codec: rconn_media::caps::VideoCodec::H264,
             },
             target: TargetBitrate::fixed(8_000_000.0),
             want_key: Arc::default(),
@@ -1134,7 +1141,7 @@ mod tests {
             let mut first = None;
             while let Some((au, _)) = rx.blocking_recv() {
                 let first = *first.get_or_insert_with(Instant::now);
-                tags.push(frames::read(&au).expect("tagged"));
+                tags.push(frames::read(rconn_media::caps::VideoCodec::H264, &au).expect("tagged"));
                 // Before the third repeat of the first keyframe (2.5 s).
                 if first.elapsed() > Duration::from_millis(2300) {
                     ctx.stop.store(true, Ordering::Relaxed);

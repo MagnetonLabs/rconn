@@ -19,6 +19,7 @@
 #![allow(unsafe_code)]
 
 use crate::codec::CodecError;
+use rconn_core::codec::VideoCodec;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
@@ -26,22 +27,25 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_DECODER_PROFILE_H264_VLD_NOFGT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0, D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
+    D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
     ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D, ID3D11VideoDevice,
 };
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264DecoderMFT, CODECAPI_AVDecVideoAcceleration_H264, CODECAPI_AVLowLatencyMode,
-    ICodecAPI, IMF2DBuffer, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType,
-    IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    ICodecAPI, IMF2DBuffer, IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer,
+    IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE,
-    MF_SA_D3D11_AWARE, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFStartup,
+    MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC, MF_VERSION, MFCreateDXGIDeviceManager,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
+    MFStartup, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFVideoArea, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoArea,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -53,6 +57,60 @@ fn err(what: &str, e: windows::core::Error) -> CodecError {
     CodecError::OpenH264(format!("Media Foundation decoder: {what}: {e}"))
 }
 
+/// The registered `codec` -> NV12 decoders, best first. HEVC and AV1 decoders come with
+/// Store extensions ("HEVC Video Extensions", "AV1 Video Extension"), so they may be
+/// missing on any machine.
+fn decoders(codec: VideoCodec) -> Vec<IMFActivate> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if MFStartup(MF_VERSION, MFSTARTUP_FULL).is_err() {
+            return Vec::new();
+        }
+        let input = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: crate::mf::subtype(codec),
+        };
+        let output = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_NV12,
+        };
+        let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        let flags = MFT_ENUM_FLAG_SYNCMFT
+            | MFT_ENUM_FLAG_ASYNCMFT
+            | MFT_ENUM_FLAG_HARDWARE
+            | MFT_ENUM_FLAG_LOCALMFT
+            | MFT_ENUM_FLAG_SORTANDFILTER;
+        if MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            flags,
+            Some(&input),
+            Some(&output),
+            &mut list,
+            &mut count,
+        )
+        .is_err()
+        {
+            return Vec::new();
+        }
+        // Each entry is owned (released when dropped), then the array is freed.
+        let owned = (0..count as usize)
+            .filter_map(|i| std::ptr::read(list.add(i)))
+            .collect();
+        windows::Win32::System::Com::CoTaskMemFree(Some(list.cast()));
+        owned
+    }
+}
+
+/// Is a `codec` decoder installed that [`MfH264Decoder::new_codec`] can use (a
+/// synchronous MFT)? H.264's is part of Windows.
+pub fn decoder_exists(codec: VideoCodec) -> bool {
+    codec == VideoCodec::H264
+        || decoders(codec)
+            .iter()
+            .any(|a| unsafe { a.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) == 0)
+}
+
 /// The Direct3D 11 device the decoder works on, and a staging texture to read from.
 struct Gpu {
     device: ID3D11Device,
@@ -62,7 +120,7 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new() -> Result<Self, CodecError> {
+    fn new(kind: VideoCodec) -> Result<Self, CodecError> {
         unsafe {
             let levels: [D3D_FEATURE_LEVEL; 4] = [
                 D3D_FEATURE_LEVEL_11_1,
@@ -89,13 +147,19 @@ impl Gpu {
             // Virtual and basic display adapters have no video engine: say so up front.
             let video: ID3D11VideoDevice =
                 device.cast().map_err(|e| err("no D3D11 video device", e))?;
-            let h264 = (0..video.GetVideoDecoderProfileCount())
+            let want = match kind {
+                VideoCodec::H264 => D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
+                VideoCodec::H265 => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
+                VideoCodec::Av1 => D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0,
+            };
+            let has = (0..video.GetVideoDecoderProfileCount())
                 .filter_map(|i| video.GetVideoDecoderProfile(i).ok())
-                .any(|g| g == D3D11_DECODER_PROFILE_H264_VLD_NOFGT);
-            if !h264 {
-                return Err(CodecError::OpenH264(
-                    "the GPU has no H.264 decoder (DXVA profile)".into(),
-                ));
+                .any(|g| g == want);
+            if !has {
+                return Err(CodecError::OpenH264(format!(
+                    "the GPU has no {} decoder (DXVA profile)",
+                    kind.name()
+                )));
             }
             // The decoder uses the device from its own threads too.
             if let Ok(mt) = device.cast::<ID3D11Multithread>() {
@@ -211,6 +275,10 @@ pub struct MfH264Decoder {
     time: i64,
     /// Whether the last picture came out of GPU memory.
     on_gpu: bool,
+    /// What it decodes.
+    kind: VideoCodec,
+    /// The activation an enumerated (HEVC, AV1) decoder came from: shut down on drop.
+    activate: Option<IMFActivate>,
 }
 
 // SAFETY: created in (and the process stays in) the multithreaded apartment; the decoder
@@ -221,21 +289,43 @@ unsafe impl Send for MfH264Decoder {}
 impl MfH264Decoder {
     /// Microsoft's H.264 decoder, on the GPU (`hardware`) or the CPU.
     pub fn new(hardware: bool) -> Result<Self, CodecError> {
+        Self::new_codec(VideoCodec::H264, hardware)
+    }
+
+    /// A `kind` decoder: Microsoft's for H.264 (part of Windows); for HEVC and AV1 the
+    /// first synchronous decoder MFT installed for it ("HEVC Video Extensions", "AV1 Video
+    /// Extension"; asynchronous vendor MFTs are skipped).
+    pub fn new_codec(kind: VideoCodec, hardware: bool) -> Result<Self, CodecError> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(|e| err("MFStartup", e))?;
-            let mft: IMFTransform =
-                CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER)
+            let (mft, activate): (IMFTransform, Option<IMFActivate>) = if kind == VideoCodec::H264 {
+                let mft = CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER)
                     .map_err(|e| err("create", e))?;
+                (mft, None)
+            } else {
+                let activate = decoders(kind)
+                    .into_iter()
+                    .find(|a| a.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) == 0)
+                    .ok_or_else(|| {
+                        CodecError::OpenH264(format!("no {} decoder installed", kind.name()))
+                    })?;
+                let mft = activate
+                    .ActivateObject::<IMFTransform>()
+                    .map_err(|e| err("activate", e))?;
+                (mft, Some(activate))
+            };
             let attrs = mft.GetAttributes().map_err(|e| err("attributes", e))?;
             let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
             let codec = mft.cast::<ICodecAPI>().ok();
             if let Some(c) = &codec {
                 let _ = c.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
-                let _ = c.SetValue(
-                    &CODECAPI_AVDecVideoAcceleration_H264,
-                    &VARIANT::from(u32::from(hardware)),
-                );
+                if kind == VideoCodec::H264 {
+                    let _ = c.SetValue(
+                        &CODECAPI_AVDecVideoAcceleration_H264,
+                        &VARIANT::from(u32::from(hardware)),
+                    );
+                }
             }
             let gpu = if hardware {
                 if attrs.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) == 0 {
@@ -243,7 +333,7 @@ impl MfH264Decoder {
                         "decoder is not Direct3D 11 aware".into(),
                     ));
                 }
-                let gpu = Gpu::new()?;
+                let gpu = Gpu::new(kind)?;
                 mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, gpu.manager.as_raw() as usize)
                     .map_err(|e| err("SET_D3D_MANAGER", e))?;
                 Some(gpu)
@@ -256,7 +346,7 @@ impl MfH264Decoder {
                 .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
                 .map_err(|e| err("input type", e))?;
             input
-                .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
+                .SetGUID(&MF_MT_SUBTYPE, &crate::mf::subtype(kind))
                 .map_err(|e| err("input type", e))?;
             input
                 .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
@@ -271,6 +361,8 @@ impl MfH264Decoder {
                 out_size: 0,
                 time: 0,
                 on_gpu: false,
+                kind,
+                activate,
             };
             dec.choose_output()?;
             dec.mft
@@ -349,15 +441,26 @@ impl MfH264Decoder {
         }
     }
 
-    /// Decode one Annex-B access unit into tight NV12 planes in `out`. Returns the picture
-    /// size, or `None` if the unit gave no picture (yet). `size_hint` is the SPS's cropped
-    /// size, used where the decoder reports none.
+    /// Decode one access unit (Annex-B; AV1: a temporal unit's OBUs) into tight NV12
+    /// planes in `out`. Returns the picture size, or `None` if the unit gave no picture
+    /// (yet). `size_hint` is the SPS's cropped size, used where the decoder reports none.
     pub fn decode(
         &mut self,
         annex_b: &[u8],
         size_hint: Option<(usize, usize)>,
         out: &mut Vec<u8>,
     ) -> Result<Option<(usize, usize)>, CodecError> {
+        // A temporal unit starts with a temporal delimiter, which RTP leaves out.
+        let with_delimiter;
+        let annex_b = if self.kind == VideoCodec::Av1
+            && annex_b.first().is_none_or(|&b| {
+                rconn_core::codec::obu::kind(b) != rconn_core::codec::obu::TEMPORAL_DELIMITER
+            }) {
+            with_delimiter = [&[0x12, 0x00][..], annex_b].concat();
+            &with_delimiter[..]
+        } else {
+            annex_b
+        };
         let sample = unsafe {
             let len = u32::try_from(annex_b.len())
                 .map_err(|_| CodecError::OpenH264("access unit too large".into()))?;
@@ -524,6 +627,9 @@ impl Drop for MfH264Decoder {
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
             if self.gpu.is_some() {
                 let _ = self.mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+            }
+            if let Some(a) = &self.activate {
+                let _ = a.ShutdownObject();
             }
         }
     }

@@ -566,6 +566,8 @@ async fn session(
     let opts = PeerOptions {
         udp_addrs: args.udp_addrs.clone(),
         relay_only: args.relay_only,
+        // HEVC/AV1 where this machine decodes them (H.264 always).
+        video_codecs: rconn_media::caps::viewer_codecs(),
     };
     let mut session = open_viewer_session(sig, host, opts).await?;
     let mut exchange = args
@@ -802,9 +804,15 @@ async fn session(
                 }
                 compositor.lost();
             }
+            let codec = rx.codec();
+            if dec.codec() != codec {
+                // The host's choice from what this viewer offered (see `caps`).
+                tracing::info!(codec = codec.name(), "video codec");
+                dec.set_codec(codec)?;
+            }
             for au in aus {
                 bytes += au.len();
-                let tag = rconn_peer::frames::read(&au);
+                let (au, tag) = rconn_peer::frames::take(codec, &au);
                 match &tag {
                     Some(t) => {
                         stages.host(t.host_us);
@@ -819,7 +827,7 @@ async fn session(
                     }
                     None => {}
                 }
-                let (bits, ops) = copyrect::split(&au);
+                let (bits, ops) = copyrect::split_in(codec, &au);
                 match dec.decode(&bits) {
                     Ok(Some(mut f)) => {
                         if compositor.compose(ops.as_ref(), &mut f) == Composed::Resync {

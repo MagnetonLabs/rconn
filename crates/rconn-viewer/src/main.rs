@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
                 PeerOptions {
                     udp_addrs: udp.clone(),
                     relay_only: *relay_only,
+                    video_codecs: rconn_media::caps::viewer_codecs(),
                 },
                 *tap_key,
                 *fit,
@@ -270,6 +271,7 @@ async fn ping(
         PeerOptions {
             udp_addrs: udp,
             relay_only,
+            ..Default::default()
         },
     )
     .await?;

@@ -194,8 +194,13 @@ pub async fn run(
             tracing::warn!("video packets lost");
             need.lost();
         }
+        if dec.codec() != rx.codec() {
+            println!("video codec: {}", rx.codec().name());
+            dec.set_codec(rx.codec())?;
+        }
         for au in aus {
             window.bytes += au.len();
+            let (au, _) = rconn_peer::frames::take(rx.codec(), &au);
             let d0 = Instant::now();
             match dec.decode(&au) {
                 Ok(Some(f)) => {

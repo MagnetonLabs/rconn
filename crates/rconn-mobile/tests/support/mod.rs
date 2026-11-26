@@ -103,6 +103,7 @@ pub async fn start(setup: HostSetup) -> (String, String, Arc<HostLog>) {
     let opts = PeerOptions {
         udp_addrs: vec!["127.0.0.1:0".into()],
         relay_only: false,
+        ..Default::default()
     };
     tokio::spawn(run_host(sig, opts, handler));
     (url, host_id.short_code(), log)

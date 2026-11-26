@@ -279,6 +279,8 @@ async fn main() -> Result<()> {
                 let opts = PeerOptions {
                     udp_addrs: cli.udp.clone(),
                     relay_only: false,
+                    // HEVC/AV1 where this machine encodes them in hardware.
+                    video_codecs: rconn_media::caps::encodable(),
                 };
                 let cli2 = cli.clone();
                 let openh264 = openh264.clone();
@@ -489,6 +491,7 @@ async fn serve_session(
         max_size: (mw.parse()?, mh.parse()?),
         motion_half_res: cli.motion_half_res,
         software: false,
+        codec: session.video.codec(),
     };
     // Host sound runs alongside the picture; losing it never ends the session.
     if let (Some(audio_track), false) = (session.audio.take(), cli.no_audio) {

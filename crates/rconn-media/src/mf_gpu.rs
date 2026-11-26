@@ -7,6 +7,7 @@
 use super::{MfH264Encoder, err};
 use crate::codec::CodecError;
 use crate::d3d11::{Converter, GpuDevice, GpuFrame};
+use rconn_core::codec::VideoCodec;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFDXGIDeviceManager, MF_VERSION, MFCreateDXGIDeviceManager,
@@ -46,6 +47,29 @@ impl MfH264Encoder {
         bitrate_bps: u32,
         software: bool,
     ) -> Result<Self, CodecError> {
+        Self::new_d3d11_codec(
+            VideoCodec::H264,
+            gpu,
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            software,
+        )
+    }
+
+    /// [`Self::new_d3d11`] for `kind` (H.264, or HEVC/AV1 on a GPU that encodes them; the
+    /// software encoder is H.264 only).
+    pub fn new_d3d11_codec(
+        kind: VideoCodec,
+        gpu: &GpuDevice,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u32,
+        software: bool,
+    ) -> Result<Self, CodecError> {
+        let software = software && kind == VideoCodec::H264;
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(err)?;
@@ -66,9 +90,10 @@ impl MfH264Encoder {
         }
         for hardware in kinds {
             let vendor = hardware.then_some(gpu.vendor_id);
-            for activate in Self::candidates(hardware, vendor).unwrap_or_default() {
+            for activate in Self::candidates(kind, hardware, vendor).unwrap_or_default() {
                 let started = Self::open(
                     activate,
+                    kind,
                     hardware,
                     hardware.then_some(&manager),
                     width,
@@ -96,10 +121,11 @@ impl MfH264Encoder {
             }
         }
         Err(CodecError::OpenH264(if tried.is_empty() {
-            format!("no GPU H.264 encoder (adapter {})", gpu.adapter)
+            format!("no GPU {} encoder (adapter {})", kind.name(), gpu.adapter)
         } else {
             format!(
-                "no GPU H.264 encoder takes D3D11 textures on {}: {}",
+                "no GPU {} encoder takes D3D11 textures on {}: {}",
+                kind.name(),
                 gpu.adapter,
                 tried.join("; ")
             )

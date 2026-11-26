@@ -316,6 +316,13 @@ impl SignalingTx {
             .send(msg)
             .map_err(|_| anyhow::anyhow!("signaling connection closed"))
     }
+
+    /// A sender whose messages go to the returned receiver (tests without a server).
+    #[cfg(test)]
+    pub(crate) fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<ClientMessage>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self(tx), rx)
+    }
 }
 
 impl SignalingClient {

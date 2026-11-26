@@ -10,6 +10,7 @@
 #![allow(unsafe_code)]
 
 use crate::codec::CodecError;
+use rconn_core::codec::VideoCodec;
 use std::time::{Duration, Instant};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
@@ -28,9 +29,10 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
     MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_LowDelayVBR,
-    eAVEncH264VProfile_Base,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_AV1,
+    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    eAVEncAV1VProfile_Main_420_8, eAVEncCommonRateControlMode_LowDelayVBR, eAVEncH264VProfile_Base,
+    eAVEncH265VProfile_Main_420_8,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::System::Variant::VARIANT;
@@ -70,6 +72,8 @@ pub struct MfH264Encoder {
     ltr_info: Option<u32>,
     /// The encoder took a maximum QP: refinement passes lower it for one frame.
     max_qp: bool,
+    /// What it encodes.
+    kind: VideoCodec,
 }
 
 /// Quantizer ceiling of ordinary frames (as on the openh264 path): never blocky text.
@@ -102,18 +106,32 @@ impl MfH264Encoder {
     /// A low-latency H.264 encoder for `width` x `height` NV12 frames: the GPU's if it
     /// works, Microsoft's software encoder otherwise.
     pub fn new(width: u32, height: u32, fps: u32, bitrate_bps: u32) -> Result<Self, CodecError> {
+        Self::new_codec(VideoCodec::H264, width, height, fps, bitrate_bps)
+    }
+
+    /// A low-latency `kind` encoder: the GPU's if one works. H.264 falls back to
+    /// Microsoft's software encoder; HEVC and AV1 only use a software MFT (one a Store
+    /// extension installed) when `RCONN_CODEC` forces that codec, and are never bundled.
+    pub fn new_codec(
+        kind: VideoCodec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u32,
+    ) -> Result<Self, CodecError> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(err)?;
         }
-        if std::env::var("RCONN_ENCODER").is_ok_and(|v| v == "software") {
-            return Self::open_software(width, height, fps, bitrate_bps);
+        let software_ok = kind == VideoCodec::H264 || VideoCodec::from_env() == Some(kind);
+        if software_ok && std::env::var("RCONN_ENCODER").is_ok_and(|v| v == "software") {
+            return Self::open_software(kind, width, height, fps, bitrate_bps);
         }
         // Every GPU encoder registered, best first: one that fails to start (a vendor's
         // MFT left behind by an old driver, a second GPU's) must not hide the next.
-        let mut why = CodecError::OpenH264("no GPU H.264 encoder".into());
-        for activate in Self::candidates(true, None).unwrap_or_default() {
-            match Self::open(activate, true, None, width, height, fps, bitrate_bps)
+        let mut why = CodecError::OpenH264(format!("no GPU {} encoder", kind.name()));
+        for activate in Self::candidates(kind, true, None).unwrap_or_default() {
+            match Self::open(activate, kind, true, None, width, height, fps, bitrate_bps)
                 .and_then(|mut e| e.self_test().map(|()| e))
             {
                 Ok(e) => return Ok(e),
@@ -123,22 +141,26 @@ impl MfH264Encoder {
                 }
             }
         }
+        if !software_ok {
+            return Err(why);
+        }
         tracing::info!(error = %why, "no usable GPU encoder; using software");
-        Self::open_software(width, height, fps, bitrate_bps)
+        Self::open_software(kind, width, height, fps, bitrate_bps)
     }
 
-    /// Microsoft's software encoder.
+    /// Microsoft's software encoder (H.264), or a forced codec's software MFT.
     fn open_software(
+        kind: VideoCodec,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_bps: u32,
     ) -> Result<Self, CodecError> {
-        let activate = Self::candidates(false, None)?
+        let activate = Self::candidates(kind, false, None)?
             .into_iter()
             .next()
-            .ok_or_else(|| CodecError::OpenH264("no H.264 encoder MFT".into()))?;
-        Self::open(activate, false, None, width, height, fps, bitrate_bps)
+            .ok_or_else(|| CodecError::OpenH264(format!("no {} encoder MFT", kind.name())))?;
+        Self::open(activate, kind, false, None, width, height, fps, bitrate_bps)
     }
 
     /// Is a hardware H.264 encoder registered (without starting it)?
@@ -149,7 +171,7 @@ impl MfH264Encoder {
                 return false;
             }
         }
-        Self::candidates(true, None).is_ok_and(|c| !c.is_empty())
+        Self::candidates(VideoCodec::H264, true, None).is_ok_and(|c| !c.is_empty())
     }
 
     /// Is this the GPU's encoder?
@@ -157,9 +179,13 @@ impl MfH264Encoder {
         self.events.is_some()
     }
 
-    /// The registered NV12 -> H.264 encoders of the given kind, in Media Foundation's
+    /// The registered NV12 -> `codec` encoders of the given kind, in Media Foundation's
     /// order of merit; those of PCI vendor `vendor` (if given) first.
-    fn candidates(hardware: bool, vendor: Option<u32>) -> Result<Vec<IMFActivate>, CodecError> {
+    fn candidates(
+        codec: VideoCodec,
+        hardware: bool,
+        vendor: Option<u32>,
+    ) -> Result<Vec<IMFActivate>, CodecError> {
         let flags = if hardware {
             MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER
         } else {
@@ -171,7 +197,7 @@ impl MfH264Encoder {
         };
         let output = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_H264,
+            guidSubtype: subtype(codec),
         };
         unsafe {
             let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
@@ -202,8 +228,10 @@ impl MfH264Encoder {
 
     /// Start the encoder `activate` makes. With `d3d`, it reads D3D11 textures from that
     /// device manager's device (the encoder must be D3D11-aware).
+    #[allow(clippy::too_many_arguments)]
     fn open(
         activate: IMFActivate,
+        kind: VideoCodec,
         hardware: bool,
         d3d: Option<&IMFDXGIDeviceManager>,
         width: u32,
@@ -211,23 +239,30 @@ impl MfH264Encoder {
         fps: u32,
         bitrate_bps: u32,
     ) -> Result<Self, CodecError> {
-        let (mft, codec, name, events, ltr_slots) =
-            match Self::start(&activate, hardware, d3d, (width, height, fps, bitrate_bps)) {
-                Ok(started) => started,
-                Err(e) => {
-                    // Don't leave a half-started encoder's threads behind.
-                    let _ = unsafe { activate.ShutdownObject() };
-                    return Err(e);
-                }
-            };
+        let (mft, codec, name, events, ltr_slots) = match Self::start(
+            &activate,
+            kind,
+            hardware,
+            d3d,
+            (width, height, fps, bitrate_bps),
+        ) {
+            Ok(started) => started,
+            Err(e) => {
+                // Don't leave a half-started encoder's threads behind.
+                let _ = unsafe { activate.ShutdownObject() };
+                return Err(e);
+            }
+        };
         let info = unsafe { mft.GetOutputStreamInfo(0) }.map_err(err)?;
         // A maximum QP the encoder takes (Windows 8+ encoders may change it while
         // encoding; vendors' are not obliged to, and then say so here or ignore it).
-        let max_qp = codec.as_ref().is_some_and(|c| unsafe {
-            c.IsSupported(&CODECAPI_AVEncVideoMaxQP).is_ok()
-                && c.SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(u32::from(MAX_QP)))
-                    .is_ok()
-        });
+        // (Not AV1: its quantizer scale is 0-255.)
+        let max_qp = kind != VideoCodec::Av1
+            && codec.as_ref().is_some_and(|c| unsafe {
+                c.IsSupported(&CODECAPI_AVEncVideoMaxQP).is_ok()
+                    && c.SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(u32::from(MAX_QP)))
+                        .is_ok()
+            });
         Ok(Self {
             activate,
             mft,
@@ -245,12 +280,14 @@ impl MfH264Encoder {
             ltr_slots,
             ltr_info: None,
             max_qp,
+            kind,
         })
     }
 
     /// Activate and configure the encoder: (transform, codec API, name, async events).
     fn start(
         activate: &IMFActivate,
+        kind: VideoCodec,
         hardware: bool,
         d3d: Option<&IMFDXGIDeviceManager>,
         (width, height, fps, bitrate_bps): (u32, u32, u32, u32),
@@ -308,8 +345,11 @@ impl MfH264Encoder {
                 let _ =
                     codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32));
                 // Same quality floor as the openh264 path: never blocky text.
-                let _ =
-                    codec.SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(u32::from(MAX_QP)));
+                // (H.264 and HEVC share the 0-51 scale; AV1's is 0-255: left alone.)
+                if kind != VideoCodec::Av1 {
+                    let _ = codec
+                        .SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(u32::from(MAX_QP)));
+                }
             }
             // Long-term references for repairing losses without a keyframe (Windows 8.1+;
             // optional for vendors' encoders, so asked for and checked, never assumed).
@@ -341,7 +381,7 @@ impl MfH264Encoder {
                 .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
                 .map_err(err)?;
             out_type
-                .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
+                .SetGUID(&MF_MT_SUBTYPE, &subtype(kind))
                 .map_err(err)?;
             out_type
                 .SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps)
@@ -352,7 +392,7 @@ impl MfH264Encoder {
                 .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
                 .map_err(err)?;
             out_type
-                .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
+                .SetUINT32(&MF_MT_MPEG2_PROFILE, profile(kind))
                 .map_err(err)?;
             mft.SetOutputType(0, &out_type, 0).map_err(named)?;
 
@@ -447,6 +487,11 @@ impl MfH264Encoder {
     /// The encoder in use (e.g. "H264 Encoder MFT", or a GPU vendor's).
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// What it encodes.
+    pub fn codec(&self) -> VideoCodec {
+        self.kind
     }
 
     /// A GPU encoder must turn a few frames into output before we trust it.
@@ -607,6 +652,36 @@ impl MfH264Encoder {
             }
         }
     }
+}
+
+/// The Media Foundation subtype of `codec`.
+/// The profile asked for: the one every decoder of the codec has (8-bit 4:2:0).
+fn profile(codec: VideoCodec) -> u32 {
+    match codec {
+        VideoCodec::H264 => eAVEncH264VProfile_Base.0 as u32,
+        VideoCodec::H265 => eAVEncH265VProfile_Main_420_8.0 as u32,
+        VideoCodec::Av1 => eAVEncAV1VProfile_Main_420_8.0 as u32,
+    }
+}
+
+pub(crate) fn subtype(codec: VideoCodec) -> windows::core::GUID {
+    match codec {
+        VideoCodec::H264 => MFVideoFormat_H264,
+        VideoCodec::H265 => MFVideoFormat_HEVC,
+        VideoCodec::Av1 => MFVideoFormat_AV1,
+    }
+}
+
+/// Is an NV12 -> `codec` encoder registered (a hardware one, if `hardware`)? Enumerated
+/// only, not started.
+pub fn encoder_exists(codec: VideoCodec, hardware: bool) -> bool {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if MFStartup(MF_VERSION, MFSTARTUP_FULL).is_err() {
+            return false;
+        }
+    }
+    MfH264Encoder::candidates(codec, hardware, None).is_ok_and(|c| !c.is_empty())
 }
 
 /// The PCI vendor of a hardware encoder ("VEN_10DE" -> 0x10DE).

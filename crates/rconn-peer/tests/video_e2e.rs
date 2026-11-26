@@ -9,7 +9,7 @@ use rconn_peer::rtc::{PeerEvent, PeerOptions};
 use rconn_peer::session::{HostSession, SessionHandler, open_viewer_session, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
 use rconn_peer::trust::ServerTrust;
-use rconn_peer::video::VideoReceiver;
+use rconn_peer::video::{VideoCodec, VideoReceiver};
 use rconn_signaling::auth::OperatorIdentity;
 use rconn_signaling::fleet_auth::FleetAuthenticator;
 use rconn_signaling::{AppState, router};
@@ -47,12 +47,26 @@ fn frame(t: usize) -> Frame {
 
 #[tokio::test]
 async fn screen_video_reaches_the_viewer_intact() {
-    tokio::time::timeout(Duration::from_secs(40), run())
+    tokio::time::timeout(Duration::from_secs(40), run(VideoCodec::H264))
         .await
         .expect("test timed out");
 }
 
-async fn run() {
+/// The same in HEVC where both ends have it (negotiated: both peers list it).
+#[tokio::test]
+async fn hevc_screen_video_reaches_the_viewer_intact() {
+    let both = rconn_media::caps::encodable().contains(&VideoCodec::H265)
+        && rconn_media::caps::decodable().contains(&VideoCodec::H265);
+    if !both || VideoCodec::from_env().is_some() {
+        eprintln!("no HEVC encoder and decoder here; skipping");
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(40), run(VideoCodec::H265))
+        .await
+        .expect("test timed out");
+}
+
+async fn run(codec: VideoCodec) {
     let lib = local_binary_path().expect("no Cisco binary for this platform");
     assert!(
         lib.exists(),
@@ -82,6 +96,10 @@ async fn run() {
     let opts = PeerOptions {
         udp_addrs: vec!["127.0.0.1:0".into()],
         relay_only: false,
+        video_codecs: [codec]
+            .into_iter()
+            .filter(|c| *c != VideoCodec::H264)
+            .collect(),
     };
     let host_sig = SignalingClient::connect_host(
         &url,
@@ -111,6 +129,8 @@ async fn run() {
                 }
             }
             let mut enc = VideoEncoder::new(&lib, EncoderSettings::default()).unwrap();
+            assert_eq!(s.video.codec(), codec, "negotiated");
+            enc.set_codec(s.video.codec());
             let mut tick = tokio::time::interval(Duration::from_millis(1000 / FPS));
             for t in 0..(4 * FPS as usize) {
                 tick.tick().await;
@@ -156,6 +176,8 @@ async fn run() {
         };
         packets += 1;
         for au in rx.push(pkt) {
+            assert_eq!(rx.codec(), codec);
+            dec.set_codec(rx.codec()).unwrap();
             bytes += au.len();
             if let Ok(Some(f)) = dec.decode(&au) {
                 first_frame_at.get_or_insert_with(|| started.elapsed());
