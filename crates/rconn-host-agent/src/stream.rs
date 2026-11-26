@@ -8,10 +8,10 @@
 //!   or when a large area changes (scrolling, video); small background changes (spinners,
 //!   blinking carets) are batched to a few frames per second.
 
-use crate::frames::Frames;
 use anyhow::Result;
-use rconn_media::capture::{Captured, Capturer};
+use rconn_media::capture::{Captured, Capturer, Surface};
 use rconn_media::video::{EncoderSettings, VideoEncoder, should_retarget};
+use rconn_media::yuv::I420;
 use rconn_peer::video::{TargetBitrate, VideoSender};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -196,7 +196,7 @@ fn run_generation(
 ) -> Result<bool> {
     let cfg = &ctx.cfg;
     let budget = Duration::from_secs(1) / cfg.max_fps.max(1);
-    let cap = make()?;
+    let mut cap = make()?;
     let mut enc = VideoEncoder::new(
         &cfg.openh264,
         EncoderSettings {
@@ -206,8 +206,13 @@ fn run_generation(
             slice_bytes: None,
         },
     )?;
-    // The picture: in memory, or on the GPU on Windows when a hardware encoder takes it.
-    let mut frames = Frames::new(cap, &mut enc, cfg.max_size);
+    // A hardware encoder that reads the capturer's GPU surfaces (macOS VideoToolbox) gets
+    // them as they are: no CPU conversion, and no half-size motion frames (a CPU saving it
+    // doesn't need).
+    let surfaces = enc.wants_surfaces() && cap.use_surfaces(cfg.max_size);
+    let mut surface: Option<Surface> = None;
+    let mut picture: Option<I420> = None;
+    let mut small: Option<I420> = None;
     let mut motion = false;
     let mut big_streak = 0u32;
     let mut last_big = Instant::now();
@@ -254,12 +259,22 @@ fn run_generation(
             .unwrap_or(Duration::from_millis(100))
             .clamp(Duration::from_millis(1), Duration::from_millis(100));
         let t0 = Instant::now();
-        match frames.next(timeout, cfg.max_size) {
+        let got = if surfaces {
+            cap.next_surface(timeout).map(|r| {
+                r.map(|(s, c)| {
+                    surface = Some(s);
+                    c
+                })
+            })
+        } else {
+            cap.next_into(timeout, &mut picture, cfg.max_size)
+        };
+        match got {
             Ok(Some(c)) => {
                 stats.capture += t0.elapsed();
                 stats.captures += 1;
                 if !produced {
-                    let (w, h) = frames.dimensions().unwrap_or_default();
+                    let (w, h) = picture_size(&picture, &surface).unwrap_or((0, 0));
                     tracing::info!(
                         w,
                         h,
@@ -288,7 +303,7 @@ fn run_generation(
             }
             Err(e) => return Err(e.into()),
         }
-        let Some((w, h)) = frames.dimensions() else {
+        let Some((w, h)) = picture_size(&picture, &surface) else {
             continue;
         };
 
@@ -301,7 +316,7 @@ fn run_generation(
         if force {
             enc.request_keyframe();
         }
-        let may_halve = cfg.motion_half_res && w * h >= MOTION_MIN_PIXELS;
+        let may_halve = !surfaces && cfg.motion_half_res && w * h >= MOTION_MIN_PIXELS;
         // Motion over: one sharp full-size picture.
         let sharpen = motion && last_big.elapsed() >= MOTION_SETTLE;
         if sharpen {
@@ -349,11 +364,16 @@ fn run_generation(
             motion = true;
         }
         let t0 = Instant::now();
-        let half = motion && may_halve;
-        if half {
-            stats.half += 1;
-        }
-        let encoded = frames.encode(&mut enc, half, rows)?;
+        let encoded = match (&surface, &picture) {
+            (Some(s), _) => enc.encode_surface(s)?,
+            (None, Some(pic)) if motion && may_halve => {
+                pic.half_into(&mut small);
+                stats.half += 1;
+                enc.encode_yuv(small.as_ref().expect("allocated by half_into"), None)?
+            }
+            (None, Some(pic)) => enc.encode_yuv(pic, Some(rows))?,
+            (None, None) => unreachable!("checked above"),
+        };
         stats.encode += t0.elapsed();
         last_encode = Instant::now();
         if urgent {
@@ -393,10 +413,26 @@ fn run_generation(
             if tx.blocking_send(au).is_err() {
                 break; // the session ended
             }
+        } else if let Some(p) = p {
+            // The rate controller dropped the frame (VideoToolbox's low-latency mode does
+            // under load): its change still has to reach the viewer, with the next frame.
+            pending = Some(p);
         }
         stats.maybe_log((w, h), ctx.target.get());
     }
     Ok(produced)
+}
+
+/// The size of the current picture: a converted one, or a GPU surface (even part).
+fn picture_size(picture: &Option<I420>, surface: &Option<Surface>) -> Option<(usize, usize)> {
+    match (picture, surface) {
+        (Some(p), _) => Some(p.dimensions()),
+        (None, Some(s)) => {
+            let (w, h) = s.dimensions();
+            Some((w & !1, h & !1))
+        }
+        (None, None) => None,
+    }
 }
 
 /// CPU seconds used so far by (this process, the calling thread). Windows only.

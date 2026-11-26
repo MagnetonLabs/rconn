@@ -492,8 +492,17 @@ impl DxgiCapturer {
 }
 
 impl Capturer for DxgiCapturer {
-    fn as_dxgi(&mut self) -> Option<&mut DxgiCapturer> {
-        Some(self)
+    /// Keep the picture on the GPU, when a hardware encoder can take it from there
+    /// ([`crate::video::VideoEncoder::wants_surfaces`] says so before this is asked).
+    fn use_surfaces(&mut self, max: (usize, usize)) -> bool {
+        self.use_gpu_surfaces(max)
+    }
+
+    fn next_surface(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<(super::Surface, Captured)>, CaptureError> {
+        self.next_gpu_surface(timeout)
     }
 
     fn next_into(

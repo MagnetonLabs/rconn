@@ -109,6 +109,10 @@ enum Engine {
     /// and the GPU's encoder where a vendor registers one.
     #[cfg(windows)]
     MediaFoundation(crate::mf::MfH264Encoder),
+    /// Apple's encoder (the hardware one where there is one), in low-latency mode; it
+    /// can also take the capturer's GPU surfaces without a copy.
+    #[cfg(target_os = "macos")]
+    VideoToolbox(Box<crate::vt_encode::VtEncoder>),
 }
 
 pub struct VideoEncoder {
@@ -129,20 +133,31 @@ pub struct VideoEncoder {
     scale: f32,
     last_was_key: bool,
     force_key: bool,
-    /// Windows: encoders are built to read D3D11 textures on this device
-    /// ([`Self::use_gpu`]).
+    /// macOS: openh264 rather than VideoToolbox, as asked for (`RCONN_ENCODER=openh264`,
+    /// [`VideoEncoder::software`]) or because VideoToolbox failed.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    software_only: bool,
+    /// VideoToolbox failures in a row.
+    #[cfg(target_os = "macos")]
+    vt_failures: u32,
+    /// Windows: the D3D11 device of the surfaces being encoded; engines built while it is
+    /// set read textures on it ([`crate::mf::MfH264Encoder::new_d3d11`]).
     #[cfg(windows)]
     gpu: Option<crate::d3d11::GpuDevice>,
 }
 
-/// A picture to encode: in memory, or (Windows) a texture on the GPU.
-enum Input<'a> {
-    Yuv(&'a I420, Option<(usize, usize)>),
-    #[cfg(windows)]
-    Gpu(&'a crate::d3d11::GpuFrame),
-}
-
 impl VideoEncoder {
+    /// Cisco's openh264 rather than VideoToolbox (comparisons, tests).
+    #[cfg(target_os = "macos")]
+    pub fn software(
+        openh264_path: &std::path::Path,
+        settings: EncoderSettings,
+    ) -> Result<Self, CodecError> {
+        let mut enc = Self::new(openh264_path, settings)?;
+        enc.software_only = true;
+        Ok(enc)
+    }
+
     /// `openh264_path` is Cisco's shared library (see [`crate::cisco`]).
     pub fn new(
         openh264_path: &std::path::Path,
@@ -163,56 +178,41 @@ impl VideoEncoder {
             scale: 1.0,
             last_was_key: false,
             force_key: false,
+            software_only: std::env::var("RCONN_ENCODER").is_ok_and(|v| v == "openh264"),
+            #[cfg(target_os = "macos")]
+            vt_failures: 0,
             #[cfg(windows)]
             gpu: None,
         })
     }
 
-    /// Windows: encode D3D11 textures on `gpu` from now on ([`Self::encode_gpu`]), with a
-    /// D3D11-aware hardware encoder, built and tested here for `size`. On error (no such
-    /// encoder) nothing changes.
-    #[cfg(windows)]
-    pub fn use_gpu(
-        &mut self,
-        gpu: &crate::d3d11::GpuDevice,
-        size: (usize, usize),
-    ) -> Result<(), CodecError> {
-        let mf = self.build_d3d11(gpu, size.0, size.1)?;
-        self.gpu = Some(gpu.clone());
-        self.encoder = Some(Engine::MediaFoundation(mf));
-        self.dims = Some(size);
-        self.spare = None;
-        self.headers.clear();
-        self.nv12.clear();
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn build_d3d11(
-        &mut self,
-        gpu: &crate::d3d11::GpuDevice,
-        width: usize,
-        height: usize,
-    ) -> Result<crate::mf::MfH264Encoder, CodecError> {
-        let mf = crate::mf::MfH264Encoder::new_d3d11(
-            gpu,
-            width as u32,
-            height as u32,
-            self.settings.max_fps.round().max(1.0) as u32,
-            self.settings.bitrate_bps,
-            std::env::var("RCONN_TEXTURE_ENCODER").is_ok_and(|v| v == "software"),
-        )?;
-        self.engine_name = format!("Media Foundation D3D11 ({})", mf.name());
-        Ok(mf)
-    }
-
     fn build(&mut self, width: usize, height: usize) -> Result<Engine, CodecError> {
         #[cfg(windows)]
         if let Some(gpu) = self.gpu.clone() {
-            // Textures in: only a texture encoder will do (the caller falls back).
-            return Ok(Engine::MediaFoundation(
-                self.build_d3d11(&gpu, width, height)?,
-            ));
+            // Surfaces in: only an encoder that reads textures will do.
+            let mf = crate::mf::MfH264Encoder::new_d3d11(
+                &gpu,
+                width as u32,
+                height as u32,
+                self.settings.max_fps.round().max(1.0) as u32,
+                self.settings.bitrate_bps,
+                crate::d3d11::software_texture_test(),
+            )?;
+            self.engine_name = format!("Media Foundation D3D11 ({})", mf.name());
+            return Ok(Engine::MediaFoundation(mf));
+        }
+        #[cfg(target_os = "macos")]
+        if !self.software_only {
+            match crate::vt_encode::VtEncoder::new(width, height, &self.settings) {
+                Ok(vt) => {
+                    self.engine_name = vt.name().to_owned();
+                    return Ok(Engine::VideoToolbox(Box::new(vt)));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "VideoToolbox encoder unavailable; using openh264");
+                    self.software_only = true;
+                }
+            }
         }
         #[cfg(windows)]
         match crate::mf::MfH264Encoder::new(
@@ -291,6 +291,8 @@ impl VideoEncoder {
         match &mut self.encoder {
             #[cfg(windows)]
             Some(Engine::MediaFoundation(mf)) => mf.set_bitrate(bps), // live, no keyframe
+            #[cfg(target_os = "macos")]
+            Some(Engine::VideoToolbox(vt)) => vt.set_bitrate(bps), // live, no keyframe
             _ => self.encoder = None, // openh264: rebuilt lazily; the first frame out is an IDR
         }
     }
@@ -330,28 +332,147 @@ impl VideoEncoder {
         yuv: &I420,
         changed_rows: Option<(usize, usize)>,
     ) -> Result<Option<Vec<u8>>, CodecError> {
-        self.encode_input(yuv.dimensions(), Input::Yuv(yuv, changed_rows))
+        let (w, h) = yuv.dimensions();
+        self.ensure_engine(w, h)?;
+        let force_key = std::mem::take(&mut self.force_key);
+        let out = match self.encoder.as_mut().expect("built above") {
+            Engine::OpenH264(encoder) => {
+                if force_key {
+                    encoder.force_intra_frame();
+                }
+                let bits = encoder
+                    .encode(yuv)
+                    .map_err(|e| CodecError::OpenH264(e.to_string()))?;
+                self.last_was_key = matches!(
+                    bits.frame_type(),
+                    openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
+                );
+                bits.to_vec()
+            }
+            #[cfg(windows)]
+            Engine::MediaFoundation(mf) => {
+                if force_key {
+                    mf.force_keyframe();
+                }
+                yuv.write_nv12(&mut self.nv12, changed_rows);
+                let out = mf.encode(&self.nv12)?;
+                self.last_was_key = has_idr(&out);
+                out
+            }
+            #[cfg(target_os = "macos")]
+            Engine::VideoToolbox(vt) => match vt.encode_i420(yuv, changed_rows, force_key) {
+                Ok(au) => self.vt_output(au),
+                Err(e) => {
+                    // A new session (or openh264) gets the whole picture again.
+                    self.vt_failed(&e, force_key);
+                    return self.encode_yuv(yuv, None);
+                }
+            },
+        };
+        let _ = changed_rows; // only the NV12 paths can use it
+        Ok(self.finish(out, force_key))
     }
 
-    /// Windows: encode the GPU picture `frame` (the captured desktop) at `size` (even),
-    /// converted and scaled on the GPU. Needs [`Self::use_gpu`] first.
-    #[cfg(windows)]
-    pub fn encode_gpu(
+    /// Can this encoder take the capturer's GPU surfaces as they are? macOS: VideoToolbox
+    /// can. Windows: is there a hardware encoder that may read D3D11 textures (and has the
+    /// texture path not failed lately)? Whether it really does is found out on the first
+    /// surface; if not, that capture generation ends and the next one uses memory.
+    pub fn wants_surfaces(&self) -> bool {
+        #[cfg(windows)]
+        return crate::d3d11::texture_path_allowed()
+            && (crate::d3d11::software_texture_test()
+                || crate::mf::MfH264Encoder::hardware_available());
+        #[cfg(not(windows))]
+        return cfg!(target_os = "macos") && !self.software_only;
+    }
+
+    /// Encode a captured GPU surface. VideoToolbox reads it where it is (no copy); a
+    /// software encoder gets a CPU conversion of it.
+    pub fn encode_surface(
         &mut self,
-        frame: &crate::d3d11::GpuFrame,
-        size: (usize, usize),
+        surface: &crate::capture::Surface,
     ) -> Result<Option<Vec<u8>>, CodecError> {
-        if self.gpu.is_none() {
-            return Err(CodecError::OpenH264("encode_gpu without use_gpu".into()));
+        let (w, h) = surface.dimensions();
+        let (w, h) = (w & !1, h & !1);
+        if w == 0 || h == 0 {
+            return Ok(None);
         }
-        self.encode_input(size, Input::Gpu(frame))
+        #[cfg(target_os = "macos")]
+        {
+            if !self.software_only {
+                self.ensure_engine(w, h)?;
+            }
+            if let Some(Engine::VideoToolbox(vt)) = self.encoder.as_mut() {
+                let force_key = std::mem::take(&mut self.force_key);
+                return match vt.encode_surface(surface, force_key) {
+                    Ok(au) => {
+                        let out = self.vt_output(au);
+                        Ok(self.finish(out, force_key))
+                    }
+                    Err(e) => {
+                        self.vt_failed(&e, force_key);
+                        self.encode_surface(surface)
+                    }
+                };
+            }
+            let mut yuv = self.yuv.take();
+            if !surface.to_i420(&mut yuv) {
+                return Err(CodecError::VideoToolbox(
+                    "could not read the captured surface".into(),
+                ));
+            }
+            let yuv = yuv.expect("allocated by to_i420");
+            let out = self.encode_yuv(&yuv, None);
+            self.yuv = Some(yuv);
+            out
+        }
+        #[cfg(windows)]
+        {
+            let out = self.encode_texture(surface, w, h);
+            if let Err(e) = &out {
+                crate::d3d11::texture_path_failed(&format!("encode: {e}"));
+            }
+            out
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        match *surface {}
     }
 
-    fn encode_input(
+    /// Windows: convert and encode the desktop texture on the GPU, at `w` x `h`.
+    #[cfg(windows)]
+    fn encode_texture(
         &mut self,
-        (w, h): (usize, usize),
-        input: Input<'_>,
+        surface: &crate::capture::Surface,
+        w: usize,
+        h: usize,
     ) -> Result<Option<Vec<u8>>, CodecError> {
+        if self.gpu.as_ref().is_none_or(|g| !g.is(&surface.gpu)) {
+            // A new device (a new capture): encoders of the old one can't read it.
+            self.gpu = Some(surface.gpu.clone());
+            self.encoder = None;
+            self.spare = None;
+        }
+        self.ensure_engine(w, h)?;
+        let force_key = std::mem::take(&mut self.force_key);
+        let out = match self.encoder.as_mut().expect("built above") {
+            Engine::MediaFoundation(mf) => {
+                if force_key {
+                    mf.force_keyframe();
+                }
+                mf.encode_frame(&surface.frame)?
+            }
+            Engine::OpenH264(_) => {
+                return Err(CodecError::OpenH264(
+                    "openh264 can't encode GPU textures".into(),
+                ));
+            }
+        };
+        self.last_was_key = has_idr(&out);
+        Ok(self.finish(out, force_key))
+    }
+
+    /// Make sure the engine encodes `w` x `h` pictures.
+    fn ensure_engine(&mut self, w: usize, h: usize) -> Result<(), CodecError> {
         if self.dims != Some((w, h)) || self.encoder.is_none() {
             // Switching between two sizes (full / half while things move) reuses the
             // encoder kept for the other size; its next frame must be a keyframe.
@@ -374,48 +495,44 @@ impl VideoEncoder {
             if let Some(Engine::MediaFoundation(mf)) = &mut self.encoder {
                 mf.set_bitrate(self.settings.bitrate_bps);
             }
+            #[cfg(target_os = "macos")]
+            if let Some(Engine::VideoToolbox(vt)) = &mut self.encoder {
+                vt.set_bitrate(self.settings.bitrate_bps);
+                vt.forget_picture(); // a kept session's copy predates the rows reported
+            }
         }
-        let force_key = std::mem::take(&mut self.force_key);
-        let out = match (self.encoder.as_mut().expect("built above"), input) {
-            (Engine::OpenH264(encoder), Input::Yuv(yuv, _)) => {
-                if force_key {
-                    encoder.force_intra_frame();
-                }
-                let bits = encoder
-                    .encode(yuv)
-                    .map_err(|e| CodecError::OpenH264(e.to_string()))?;
-                self.last_was_key = matches!(
-                    bits.frame_type(),
-                    openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
-                );
-                bits.to_vec()
-            }
-            #[cfg(windows)]
-            (Engine::MediaFoundation(mf), Input::Yuv(yuv, changed_rows)) => {
-                if force_key {
-                    mf.force_keyframe();
-                }
-                yuv.write_nv12(&mut self.nv12, changed_rows);
-                let out = mf.encode(&self.nv12)?;
-                self.last_was_key = has_idr(&out);
-                out
-            }
-            #[cfg(windows)]
-            (Engine::MediaFoundation(mf), Input::Gpu(frame)) => {
-                if force_key {
-                    mf.force_keyframe();
-                }
-                let out = mf.encode_frame(frame)?;
-                self.last_was_key = has_idr(&out);
-                out
-            }
-            #[cfg(windows)]
-            (Engine::OpenH264(_), Input::Gpu(_)) => {
-                return Err(CodecError::OpenH264(
-                    "openh264 can't encode GPU textures".into(),
-                ));
-            }
-        };
+        Ok(())
+    }
+
+    /// A VideoToolbox frame out: `None` (dropped) becomes an empty unit.
+    #[cfg(target_os = "macos")]
+    fn vt_output(&mut self, au: Option<(Vec<u8>, bool)>) -> Vec<u8> {
+        self.vt_failures = 0;
+        let (out, key) = au.unwrap_or_default();
+        self.last_was_key = key;
+        out
+    }
+
+    /// VideoToolbox failed to encode (its session dies on sleep/wake or a GPU change):
+    /// drop the session so the next frame makes a new one. After a few failures in a row,
+    /// openh264 takes over for good.
+    #[cfg(target_os = "macos")]
+    fn vt_failed(&mut self, error: &str, force_key: bool) {
+        self.vt_failures += 1;
+        self.encoder = None;
+        self.spare = None;
+        self.force_key |= force_key;
+        if self.vt_failures >= 3 {
+            tracing::warn!(error, "VideoToolbox keeps failing; using openh264");
+            self.software_only = true;
+        } else {
+            tracing::warn!(error, "VideoToolbox encode failed; starting a new session");
+        }
+    }
+
+    /// Bookkeeping after a frame: a keyframe still owed, and stream headers in front of
+    /// keyframes. `None` for an empty unit (a skipped frame).
+    fn finish(&mut self, out: Vec<u8>, force_key: bool) -> Option<Vec<u8>> {
         // A keyframe asked for (a viewer lost its picture) is owed until one comes out: the
         // rate controller may skip the frame it was asked of, and a viewer without a
         // picture has nothing to show until it gets one.
@@ -434,7 +551,16 @@ impl VideoEncoder {
             }
         }
         let out = with_headers(out, &mut self.headers);
-        Ok(if out.is_empty() { None } else { Some(out) })
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// The VideoToolbox session in use, if any.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn vt_for_test(&mut self) -> Option<&mut crate::vt_encode::VtEncoder> {
+        match self.encoder.as_mut() {
+            Some(Engine::VideoToolbox(vt)) => Some(vt),
+            _ => None,
+        }
     }
 
     /// Was the last encoded frame a keyframe? (Keyframes are always slow and large.)
@@ -483,7 +609,7 @@ pub(crate) fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// The sequence parameter set (SPS) in `annex_b`, if any (without its start code).
-fn sequence_header(annex_b: &[u8]) -> Option<&[u8]> {
+pub(crate) fn sequence_header(annex_b: &[u8]) -> Option<&[u8]> {
     nal_units(annex_b).find(|nal| nal[0] & 0x1f == 7)
 }
 

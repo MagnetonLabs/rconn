@@ -118,6 +118,17 @@ impl MfH264Encoder {
         Self::open(activate, false, None, width, height, fps, bitrate_bps)
     }
 
+    /// Is a hardware H.264 encoder registered (without starting it)?
+    pub fn hardware_available() -> bool {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if MFStartup(MF_VERSION, MFSTARTUP_FULL).is_err() {
+                return false;
+            }
+        }
+        Self::candidates(true, None).is_ok_and(|c| !c.is_empty())
+    }
+
     /// Is this the GPU's encoder?
     pub fn is_hardware(&self) -> bool {
         self.events.is_some()

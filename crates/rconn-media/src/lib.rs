@@ -18,4 +18,6 @@ pub mod portal;
 pub mod video;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod vt;
+#[cfg(target_os = "macos")]
+pub mod vt_encode;
 pub mod yuv;

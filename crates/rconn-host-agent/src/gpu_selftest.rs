@@ -26,10 +26,9 @@ pub use imp::run;
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI: the test window, GetProcessTimes
 mod imp {
-    use crate::frames::Frames;
     use anyhow::{Context, Result};
-    use rconn_media::capture::Capturer;
     use rconn_media::capture::dxgi::DxgiCapturer;
+    use rconn_media::capture::{Captured, Capturer, Surface};
     use rconn_media::d3d11::{Converter, GpuDevice, Readback, fitted};
     use rconn_media::mf::MfH264Encoder;
     use rconn_media::video::{EncoderSettings, Frame, VideoDecoder, VideoEncoder};
@@ -38,6 +37,76 @@ mod imp {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+
+    /// Capture and encode as `stream.rs` does: GPU surfaces when the encoder takes them
+    /// and the capturer can keep them, converted pictures in memory otherwise.
+    struct Frames {
+        cap: Box<dyn Capturer>,
+        surfaces: bool,
+        picture: Option<I420>,
+        small: Option<I420>,
+        surface: Option<Surface>,
+    }
+
+    impl Frames {
+        fn memory(cap: Box<dyn Capturer>) -> Self {
+            Self {
+                cap,
+                surfaces: false,
+                picture: None,
+                small: None,
+                surface: None,
+            }
+        }
+
+        fn new(mut cap: Box<dyn Capturer>, enc: &VideoEncoder, max: (usize, usize)) -> Self {
+            let surfaces = enc.wants_surfaces() && cap.use_surfaces(max);
+            Self {
+                surfaces,
+                ..Self::memory(cap)
+            }
+        }
+
+        fn on_gpu(&self) -> bool {
+            self.surfaces
+        }
+
+        fn next(&mut self, timeout: Duration, max: (usize, usize)) -> Result<Option<Captured>> {
+            Ok(if self.surfaces {
+                self.cap.next_surface(timeout)?.map(|(s, c)| {
+                    self.surface = Some(s);
+                    c
+                })
+            } else {
+                self.cap.next_into(timeout, &mut self.picture, max)?
+            })
+        }
+
+        fn dimensions(&self) -> Option<(usize, usize)> {
+            match (&self.surface, &self.picture) {
+                (Some(s), _) => Some(s.dimensions()),
+                (None, Some(p)) => Some(p.dimensions()),
+                (None, None) => None,
+            }
+        }
+
+        fn encode(
+            &mut self,
+            enc: &mut VideoEncoder,
+            half: bool,
+            rows: (usize, usize),
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(match (&self.surface, &self.picture) {
+                (Some(s), _) => enc.encode_surface(s)?,
+                (None, Some(p)) if half => {
+                    p.half_into(&mut self.small);
+                    enc.encode_yuv(self.small.as_ref().expect("allocated"), None)?
+                }
+                (None, Some(p)) => enc.encode_yuv(p, Some(rows))?,
+                (None, None) => None,
+            })
+        }
+    }
 
     const BITRATE: u32 = 8_000_000;
     const FPS: u32 = 30;
@@ -320,7 +389,7 @@ mod imp {
             )?;
         }
 
-        // 2. GPU path, as streaming uses it (Frames picks it when it works).
+        // 2. GPU path, as streaming uses it (when the encoder and capturer can).
         let gpu = {
             let mut cap = DxgiCapturer::new(0)?;
             match cap.enable_gpu(max) {
@@ -342,8 +411,7 @@ mod imp {
             let mut hardware = true;
             for attempt in 0..2 {
                 let mut enc = VideoEncoder::new(openh264, settings())?;
-                let mut frames =
-                    Frames::new(rconn_media::capture::primary_display()?, &mut enc, max);
+                let mut frames = Frames::new(rconn_media::capture::primary_display()?, &enc, max);
                 if frames.on_gpu() {
                     let name = if hardware {
                         "GPU path"
@@ -372,7 +440,7 @@ mod imp {
                     // SAFETY: set before any other thread of this process reads it (the
                     // test window's thread never reads the environment).
                     unsafe { std::env::set_var("RCONN_TEXTURE_ENCODER", "software") };
-                    crate::frames::retry_gpu();
+                    rconn_media::d3d11::texture_path_retry();
                     hardware = false;
                 }
             }

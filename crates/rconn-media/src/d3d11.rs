@@ -101,6 +101,11 @@ impl GpuDevice {
         })
     }
 
+    /// Is this the same device as `other`?
+    pub fn is(&self, other: &GpuDevice) -> bool {
+        self.device == other.device
+    }
+
     /// Wait until the GPU has finished everything queued so far (timing, readback).
     pub fn finish(&self) -> Result<(), GpuError> {
         let mut query: Option<ID3D11Query> = None;
@@ -225,6 +230,62 @@ pub struct GpuFrame {
 
 // SAFETY: a texture reference; used by the thread that owns the capturer and encoder.
 unsafe impl Send for GpuFrame {}
+
+/// A captured desktop kept on the GPU ([`crate::capture::Capturer::next_surface`]), to
+/// be converted and encoded at [`Surface::dimensions`] on its device.
+#[derive(Clone)]
+pub struct Surface {
+    pub frame: GpuFrame,
+    pub gpu: GpuDevice,
+    /// The size it is sent at (the desktop halved to fit the largest size), even.
+    pub size: (usize, usize),
+}
+
+impl Surface {
+    pub fn dimensions(&self) -> (usize, usize) {
+        self.size
+    }
+}
+
+/// After the texture path fails (no encoder takes textures after all, wrong colours, an
+/// encode error), it is tried again only after this long; meanwhile capture uses memory.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+static TEXTURE_FAILED_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// The GPU texture path failed: memory capture for a while (see [`texture_path_allowed`]).
+pub fn texture_path_failed(why: &str) {
+    tracing::info!(error = why, "GPU frame path off; capturing to memory");
+    *TEXTURE_FAILED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+}
+
+/// Forget an earlier failure (tests).
+pub fn texture_path_retry() {
+    *TEXTURE_FAILED_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// May frames stay on the GPU? Not with `RCONN_GPU=0` or `RCONN_ENCODER=software`, and
+/// not for a while after the path failed.
+pub fn texture_path_allowed() -> bool {
+    let env = |k: &str| std::env::var(k).ok();
+    if env("RCONN_GPU").is_some_and(|v| v == "0" || v == "off")
+        || env("RCONN_ENCODER").is_some_and(|v| v == "software")
+    {
+        return false;
+    }
+    TEXTURE_FAILED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none_or(|t| t.elapsed() >= RETRY_AFTER)
+}
+
+/// `RCONN_TEXTURE_ENCODER=software`: run the texture path with Microsoft's software
+/// encoder (which reads each texture back) and without the colour check: tests on
+/// machines without a hardware encoder.
+pub fn software_texture_test() -> bool {
+    std::env::var("RCONN_TEXTURE_ENCODER").is_ok_and(|v| v == "software")
+}
 
 /// BT.601 limited range, the same colours as the CPU conversion ([`crate::yuv`]).
 const RGB_FULL: D3D11_VIDEO_PROCESSOR_COLOR_SPACE = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {

@@ -25,6 +25,27 @@ pub mod portal;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
+/// A captured picture still on the GPU, handed straight to a hardware encoder (macOS:
+/// ScreenCaptureKit's IOSurface-backed pixel buffer, for VideoToolbox).
+#[cfg(target_os = "macos")]
+pub use macos::Surface;
+
+/// A captured picture still on the GPU, converted and encoded there (Windows: the
+/// desktop as a D3D11 texture, for a D3D11-aware hardware encoder).
+#[cfg(windows)]
+pub use crate::d3d11::Surface;
+
+/// A captured picture still on the GPU. Only macOS and Windows have them so far.
+#[cfg(not(any(target_os = "macos", windows)))]
+pub enum Surface {}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+impl Surface {
+    pub fn dimensions(&self) -> (usize, usize) {
+        match *self {}
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("no display output to capture")]
@@ -55,11 +76,21 @@ pub trait Capturer: Send {
         Ok(convert_whole(frame, picture, max))
     }
 
-    /// The Desktop Duplication capturer behind this one, for keeping frames on the GPU
-    /// ([`dxgi::DxgiCapturer::enable_gpu`]).
-    #[cfg(windows)]
-    fn as_dxgi(&mut self) -> Option<&mut dxgi::DxgiCapturer> {
-        None
+    /// Deliver GPU surfaces ([`Capturer::next_surface`]) from now on instead of converted
+    /// pictures, at most `max` in size (halved to fit, as [`Capturer::next_into`] does).
+    /// `false` if this backend has none; it then carries on as before.
+    fn use_surfaces(&mut self, _max: (usize, usize)) -> bool {
+        false
+    }
+
+    /// Surface mode: wait up to `timeout` for a change. `Ok(None)` means nothing changed.
+    fn next_surface(
+        &mut self,
+        _timeout: Duration,
+    ) -> Result<Option<(Surface, Captured)>, CaptureError> {
+        Err(CaptureError::Backend(
+            "this capturer has no GPU surfaces".into(),
+        ))
     }
 }
 

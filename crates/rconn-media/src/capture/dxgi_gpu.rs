@@ -13,7 +13,7 @@
 //! fallback picture from a buffer of exactly `width * height * 4` bytes.
 
 use super::{CaptureError, Captured, DxgiCapturer, FIRST_FRAME_FALLBACK, Held, backend};
-use crate::d3d11::{Converter, GpuDevice, GpuFrame, fitted};
+use crate::d3d11::{Converter, GpuDevice, GpuFrame, Surface, fitted};
 use crate::yuv::Rect;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::RECT;
@@ -40,6 +40,7 @@ pub(super) struct GpuState {
     frame: Option<GpuFrame>,
     /// The size it is sent at (within `max`).
     fitted: (usize, usize),
+    max: (usize, usize),
     moves: Vec<MoveRect>,
     dirty: Vec<Rect>,
 }
@@ -79,6 +80,7 @@ impl DxgiCapturer {
             cpu,
             frame: None,
             fitted: out,
+            max,
             moves: Vec::new(),
             dirty: Vec::new(),
         });
@@ -97,6 +99,64 @@ impl DxgiCapturer {
         Converter::new(&s.gpu, (w as u32, h as u32), (out.0 as u32, out.1 as u32))
             .and_then(|mut c| c.check_colours())
             .map_err(gpu_backend)
+    }
+
+    /// [`super::Capturer::use_surfaces`]: keep the picture on the GPU if its video
+    /// processor converts with the right colours. A failure turns the texture path off
+    /// for a while ([`crate::d3d11::texture_path_failed`]).
+    pub(super) fn use_gpu_surfaces(&mut self, max: (usize, usize)) -> bool {
+        if !crate::d3d11::texture_path_allowed() {
+            return false;
+        }
+        let t = Instant::now();
+        let ready = self.enable_gpu(max).and_then(|_| {
+            if crate::d3d11::software_texture_test() {
+                Ok(()) // tests on adapters with other colours (Parallels)
+            } else {
+                self.check_gpu_colours(max)
+            }
+        });
+        match ready {
+            Ok(()) => {
+                let s = self.gpu.as_ref().expect("enabled above");
+                tracing::info!(
+                    adapter = %s.gpu.adapter,
+                    setup_ms = t.elapsed().as_millis() as u64,
+                    "frames stay on the GPU (capture, convert, encode)"
+                );
+                true
+            }
+            Err(e) => {
+                self.disable_gpu();
+                crate::d3d11::texture_path_failed(&e.to_string());
+                false
+            }
+        }
+    }
+
+    /// [`super::Capturer::next_surface`]: [`Self::next_gpu`] as a surface.
+    pub(super) fn next_gpu_surface(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<(Surface, Captured)>, CaptureError> {
+        let max = self
+            .gpu
+            .as_ref()
+            .ok_or_else(|| CaptureError::Backend("GPU capture is not enabled".into()))?
+            .max;
+        let Some(c) = self.next_gpu(timeout, max)? else {
+            return Ok(None);
+        };
+        let s = self.gpu.as_ref().expect("checked above");
+        let frame = s.frame.clone().expect("set by next_gpu");
+        Ok(Some((
+            Surface {
+                frame,
+                gpu: s.gpu.clone(),
+                size: s.fitted,
+            },
+            c,
+        )))
     }
 
     /// Back to the CPU path (the capturer's own device), e.g. when no encoder takes

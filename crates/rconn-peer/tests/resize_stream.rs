@@ -225,8 +225,13 @@ fn a_lost_keyframe_at_the_new_size_is_recovered() {
                 );
                 let o = run(&*make, loss, busy);
                 assert_follows_every_size(name, &o, &case);
+                // A still screen whose keyframe lost all but its tail (VideoToolbox's
+                // keyframe of this flat screen is 7 packets) gives the viewer nothing to
+                // decode or count as lost; the host's repeat of that keyframe (after 1 s)
+                // gets there as the viewer's stall timer (1 s) would ask for it.
+                let fewest = u32::from(busy || loss == Loss::WholeKeyframe);
                 assert!(
-                    (1..=4).contains(&o.requests),
+                    (fewest..=4).contains(&o.requests),
                     "{name}, {case}: asked for a keyframe, without a storm: {}",
                     o.requests
                 );

@@ -8,7 +8,6 @@ mod awake;
 mod cursor;
 mod display;
 mod files;
-mod frames;
 mod gpu_selftest;
 mod hostkind;
 mod indicator;
