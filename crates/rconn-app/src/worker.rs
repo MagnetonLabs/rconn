@@ -51,6 +51,9 @@ pub struct Paths {
     pub settings_exe: PathBuf,
     /// Windows: the host service program (sets admin-only settings when elevated).
     pub service_exe: PathBuf,
+    /// The app runs this computer's host per user (see `userhost`): macOS, Linux, and
+    /// Windows installed "just for me" (no service beside the app).
+    pub user_host: bool,
 }
 
 impl Paths {
@@ -61,10 +64,14 @@ impl Paths {
                 .with_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX))
         };
         let config = profile::config_dir();
-        // macOS and Linux: the app sets the host up per user (see userhost); Windows: the
-        // installer.
+        // macOS and Linux, and Windows without the service: the app sets the host up per
+        // user (see userhost). Windows with the service: the installer did.
+        let user_host = cfg!(unix) || !beside("rconn-host-service").exists();
         let (status_file, host_data) = if cfg!(unix) {
             (config.join("host").join("status.json"), config.join("host"))
+        } else if user_host {
+            let dir = crate::userhost::windows_host_dir();
+            (dir.join("status.json"), dir)
         } else {
             (
                 rconn_host_settings::platform::status_file(),
@@ -78,6 +85,7 @@ impl Paths {
             viewer_exe: beside("rconn-viewer"),
             settings_exe: beside("rconn-settings"),
             service_exe: beside("rconn-host-service"),
+            user_host,
         }
     }
 }
@@ -165,7 +173,7 @@ impl Worker {
     /// "allow" step), unless incoming connections were turned off here before.
     async fn first_launch(&self) {
         let decided = self.home(|h| h.profile.incoming);
-        if cfg!(unix)
+        if self.paths.user_host
             && decided != Some(false)
             && !rconn_peer::identity::has_identity(&self.paths.host_data)
         {
@@ -179,12 +187,14 @@ impl Worker {
         // macOS/Linux: installed while the start-at-login definition exists (host.toml
         // stays when incoming connections are turned off); Windows: the admin-only folder
         // exists (its contents aren't visible to ordinary users).
-        #[cfg(unix)]
-        let installed = crate::userhost::installed();
-        #[cfg(not(unix))]
-        let installed = self.paths.host_data.exists();
+        let installed = if self.paths.user_host {
+            crate::userhost::installed()
+        } else {
+            self.paths.host_data.exists()
+        };
         // The settings are worth showing even while off (the access password is kept).
-        let readable = installed || (cfg!(unix) && self.paths.host_data.join("host.toml").exists());
+        let readable =
+            installed || (self.paths.user_host && self.paths.host_data.join("host.toml").exists());
         let settings = (settings_too && readable)
             .then(|| rconn_host_settings::model::Model::load(&self.paths.host_data));
         let signed_in = self.token().is_some();
@@ -389,8 +399,9 @@ impl Worker {
             }
             Request::EnableHost => self.enable_host().await,
             Request::DisableHost => {
-                #[cfg(unix)]
-                crate::userhost::uninstall(&self.paths.host_data);
+                if self.paths.user_host {
+                    crate::userhost::uninstall(&self.paths.host_data);
+                }
                 self.home(|h| {
                     h.this = None;
                     h.host_settings = None;
@@ -415,7 +426,6 @@ impl Worker {
     }
 
     /// Why turning on incoming connections failed: shown in "This computer".
-    #[cfg(unix)]
     fn host_failed(&self, text: String) {
         self.home(|h| {
             h.host_setup = None;
@@ -427,9 +437,9 @@ impl Worker {
     /// then start the host agent at login. No account needed: the computer belongs to
     /// nobody and takes the access password. Signed in to a fleet, it joins the fleet.
     async fn enable_host(&self) {
-        #[cfg(not(unix))]
-        self.notice("Use the Rconn host installer on this OS", true);
-        #[cfg(unix)]
+        if !self.paths.user_host {
+            return self.notice("The Rconn installer set up this computer's host", true);
+        }
         {
             let this = if cfg!(target_os = "macos") {
                 "this Mac"
@@ -468,7 +478,7 @@ impl Worker {
             self.home(|h| h.host_setup = Some(format!("Starting the host on {this}…")));
             let agent = std::env::current_exe()
                 .unwrap_or_default()
-                .with_file_name("rconn-host-agent");
+                .with_file_name(format!("rconn-host-agent{}", std::env::consts::EXE_SUFFIX));
             match crate::userhost::install(&agent, &dir, &server, fp.as_deref()) {
                 Ok(()) => {
                     self.home(|h| {
@@ -521,8 +531,9 @@ impl Worker {
         };
         let on = !verifier.is_empty();
         let (host_data, service) = (self.paths.host_data.clone(), self.paths.service_exe.clone());
+        let user_host = self.paths.user_host;
         let result = tokio::task::spawn_blocking(move || {
-            if cfg!(windows) {
+            if !user_host {
                 let args: &[&str] = if verifier.is_empty() {
                     &["unset", "access_password"]
                 } else {
@@ -531,7 +542,6 @@ impl Worker {
                 rconn_host_settings::platform::run_elevated_wait(&service, args)
             } else {
                 // Possibly before the ID arrived: the folder may not exist yet.
-                #[cfg(unix)]
                 crate::userhost::ensure_settings_file(&host_data).map_err(|e| e.to_string())?;
                 rconn_core::settings::write_setting(
                     rconn_core::settings::SettingsLayers {
@@ -561,8 +571,11 @@ impl Worker {
                 self.refresh_local(true);
                 // Saving a password is what makes this computer take connections: turn them
                 // on if they were off (or the ID never arrived). Not while that is underway.
-                #[cfg(unix)]
-                if on && !crate::userhost::installed() && self.home(|h| h.host_setup.is_none()) {
+                if self.paths.user_host
+                    && on
+                    && !crate::userhost::installed()
+                    && self.home(|h| h.host_setup.is_none())
+                {
                     self.enable_host().await;
                 }
             }

@@ -1,9 +1,12 @@
-//! macOS and Linux: make this computer a host without an installer or root.
+//! Make this computer a host without an installer, root or administrator.
 //!
 //! The host agent runs per user and starts at login, restarting if it stops: a
-//! LaunchAgent on macOS, a systemd user unit on Linux. Its identity lives in the app's
-//! config folder under `host` (0700). This covers a logged-in desktop; connecting at the
-//! login screen needs a system service (not yet).
+//! LaunchAgent on macOS, a systemd user unit on Linux, and on Windows ("just for me"
+//! installs, without the service) `rconn --start-host` from the user's Run key, which
+//! keeps the agent running (see [`supervise`]). Its identity lives in the app's config
+//! folder under `host` (0700; on Windows `%LOCALAPPDATA%\rconn\host`, which doesn't roam).
+//! This covers a signed-in desktop; the sign-in screen and Windows' admin prompts need the
+//! system service (the Windows installer for everyone).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,6 +14,22 @@ use std::process::Command;
 pub const LABEL: &str = "app.rconn.host";
 /// Linux: the systemd user unit's name.
 pub const UNIT: &str = "rconn-host.service";
+/// Windows: the value under the user's Run key that starts the host at sign-in.
+#[cfg(windows)]
+const RUN_VALUE: &str = "rconn-host";
+#[cfg(windows)]
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+/// Windows: held by the one running [`supervise`].
+#[cfg(windows)]
+const SUPERVISOR_PORT: u16 = 47_394;
+
+/// Windows: the per-user host folder (machine-local, not roaming).
+pub fn windows_host_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "", "rconn").map_or_else(
+        || std::env::temp_dir().join("rconn").join("host"),
+        |d| d.data_local_dir().join("host"),
+    )
+}
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -18,9 +37,12 @@ fn home() -> PathBuf {
         .unwrap_or_default()
 }
 
-/// Where the start-at-login definition goes.
+/// Where the start-at-login definition goes (Windows: the agent's command line, which
+/// [`supervise`] runs).
 pub fn service_path() -> PathBuf {
-    if cfg!(target_os = "macos") {
+    if cfg!(windows) {
+        windows_host_dir().join("autostart.json")
+    } else if cfg!(target_os = "macos") {
         home()
             .join("Library/LaunchAgents")
             .join(format!("{LABEL}.plist"))
@@ -45,9 +67,25 @@ fn uid() -> String {
 }
 
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, contents)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// A command that never flashes a console window (the app is a GUI program on Windows).
+fn quiet(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut c = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
 }
 
 fn xml_escape(s: &str) -> String {
@@ -145,7 +183,7 @@ WantedBy=graphical-session.target
 }
 
 fn run(program: &str, args: &[&str]) -> Result<(), String> {
-    let out = Command::new(program)
+    let out = quiet(program)
         .args(args)
         .output()
         .map_err(|e| format!("{program}: {e}"))?;
@@ -168,11 +206,16 @@ pub fn installed() -> bool {
 /// Make sure the host's folder (0700) and settings file (0600, empty if new) exist, so
 /// single settings can be written into it (e.g. the access password before the ID came).
 pub fn ensure_settings_file(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
     let file = dir.join("host.toml");
     if !file.exists() {
         write_private(&file, "")?;
@@ -208,9 +251,13 @@ pub fn write_server_settings(
         };
         return write_private(&file, &toml).map_err(|e| e.to_string());
     }
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| e.to_string())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Write the settings file and the start-at-login definition, then (re)start the agent.
@@ -227,6 +274,9 @@ pub fn install(
     let service_file = service_path();
     if let Some(parent) = service_file.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if cfg!(windows) {
+        return start_windows(&service_file, &agent_args(agent, dir, server, fingerprint));
     }
     if !cfg!(target_os = "macos") {
         std::fs::write(&service_file, unit(agent, dir, server, fingerprint))
@@ -257,10 +307,44 @@ pub fn install(
     }
 }
 
+/// Windows: save the agent's command line, start the supervisor at sign-in, and now.
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn start_windows(service_file: &Path, args: &[String]) -> Result<(), String> {
+    #[cfg(not(windows))]
+    return Err("Windows only".into());
+    #[cfg(windows)]
+    {
+        let args = serde_json::to_string(args).map_err(|e| e.to_string())?;
+        std::fs::write(service_file, args).map_err(|e| e.to_string())?;
+        let app = std::env::current_exe().map_err(|e| e.to_string())?;
+        let start = format!("\"{}\" --start-host", app.display());
+        run(
+            "reg",
+            &[
+                "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &start, "/f",
+            ],
+        )?;
+        // A running supervisor restarts the agent with the new command line; otherwise
+        // this one starts (a second one exits at once).
+        stop_agent();
+        quiet(&app)
+            .arg("--start-host")
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("starting the host: {e}"))
+    }
+}
+
 /// Stop the agent and remove its start-at-login definition. The identity and the settings
 /// (with the access password) are kept for turning incoming connections on again.
 pub fn uninstall(dir: &Path) {
-    if cfg!(target_os = "macos") {
+    if cfg!(windows) {
+        // The supervisor stops once its command line is gone.
+        let _ = std::fs::remove_file(service_path());
+        #[cfg(windows)]
+        let _ = run("reg", &["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]);
+        stop_agent();
+    } else if cfg!(target_os = "macos") {
         let _ = Command::new("launchctl")
             .args(["bootout", &format!("gui/{}/{LABEL}", uid())])
             .status();
@@ -269,6 +353,63 @@ pub fn uninstall(dir: &Path) {
     }
     let _ = std::fs::remove_file(service_path());
     forget_status(dir);
+}
+
+/// Windows: end this user's host agent (the supervisor starts it again if it should run).
+fn stop_agent() {
+    if cfg!(windows) {
+        let _ = run("taskkill", &["/IM", "rconn-host-agent.exe", "/F"]);
+    }
+}
+
+/// Windows (`rconn --start-host`, at sign-in): keep the host agent running, as launchd and
+/// systemd do on macOS and Linux. Restarts it when it exits (after a pause if it keeps
+/// failing) and stops, ending the agent, once [`uninstall`] removed its command line. Only
+/// one runs per user.
+#[cfg(windows)]
+pub fn supervise() {
+    use std::os::windows::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let Ok(_only_one) = std::net::TcpListener::bind(("127.0.0.1", SUPERVISOR_PORT)) else {
+        return;
+    };
+    let mut child: Option<std::process::Child> = None;
+    let mut started = Instant::now();
+    loop {
+        let args: Option<Vec<String>> = std::fs::read_to_string(service_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .filter(|a: &Vec<String>| !a.is_empty());
+        let Some(args) = args else {
+            if let Some(c) = child.as_mut() {
+                let _ = c.kill();
+            }
+            return;
+        };
+        let running = child
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+        if !running {
+            if child.is_some() && started.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_secs(5)); // failing at start: don't spin
+            }
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(windows_host_dir().join("agent.log"));
+            let mut c = Command::new(&args[0]);
+            c.args(&args[1..])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            if let Ok(log) = log {
+                c.stderr(log);
+            }
+            started = Instant::now();
+            child = c.spawn().ok();
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Drop what only means something while the agent runs (its status file).
@@ -336,12 +477,15 @@ mod tests {
         let s = settings(d.path());
         assert_eq!(s.access_password, "v1$abc$def");
         assert_eq!(s.server.unwrap().fingerprint, None);
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(d.path().join("host.toml"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600, "the verifier stays private");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(d.path().join("host.toml"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the verifier stays private");
+        }
         // A file that doesn't parse is replaced rather than blocking the host.
         std::fs::write(d.path().join("host.toml"), "not = [toml").unwrap();
         write_server_settings(d.path(), "wss://c/v1/ws", None).unwrap();

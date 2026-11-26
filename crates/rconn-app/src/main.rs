@@ -54,6 +54,12 @@ fn main() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("--ask") {
         return rconn_app::ask::run(args.get(1).map_or("", String::as_str));
     }
+    // Windows "just for me": at sign-in, keep this user's host agent running.
+    if args.iter().any(|a| a == "--start-host") {
+        #[cfg(windows)]
+        rconn_app::userhost::supervise();
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--tray") {
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         return rconn_app::tray::run(rconn_app::worker::Paths::installed().status_file);
@@ -85,7 +91,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     let paths = Paths::installed();
-    let shared: worker::Shared = Arc::new(Mutex::new(Home::new(Profile::load(&paths.config))));
+    let mut home = Home::new(Profile::load(&paths.config));
+    home.can_host_here = paths.user_host;
+    let shared: worker::Shared = Arc::new(Mutex::new(home));
     let icon = rconn_app::icon::app();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

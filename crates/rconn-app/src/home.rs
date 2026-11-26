@@ -908,7 +908,7 @@ fn access_password_block(
                 }
             }
         });
-        if cfg!(windows) {
+        if cfg!(windows) && !h.can_host_here {
             ui.label(
                 RichText::new("Windows asks for administrator approval.")
                     .small()
