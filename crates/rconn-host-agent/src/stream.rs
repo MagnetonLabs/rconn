@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use rconn_media::capture::{Captured, Capturer, Surface};
+use rconn_media::copyrect::{Composer, Move};
 use rconn_media::video::{EncoderSettings, VideoEncoder, should_retarget};
 use rconn_media::yuv::I420;
 use rconn_peer::video::{TargetBitrate, VideoSender};
@@ -30,13 +31,25 @@ pub struct StreamConfig {
     pub motion_half_res: bool,
 }
 
-/// Asks the encoder for an IDR frame (viewer joined, decoder lost sync).
+/// Asks the encoder for an IDR frame (viewer joined, decoder lost sync), and carries the
+/// viewer's other wishes for the stream.
 #[derive(Clone, Default)]
-pub struct KeyframeRequests(Arc<Notify>);
+pub struct KeyframeRequests {
+    notify: Arc<Notify>,
+    copy_rects: Arc<AtomicBool>,
+}
 
 impl KeyframeRequests {
     pub fn request(&self) {
-        self.0.notify_one();
+        self.notify.notify_one();
+    }
+
+    /// The viewer composes its picture from copy instructions (see
+    /// [`rconn_media::copyrect`]): scrolls and window moves stop being re-encoded.
+    pub fn enable_copy_rects(&self) {
+        if !self.copy_rects.swap(true, Ordering::Relaxed) {
+            tracing::info!("viewer takes copy instructions: scrolls and moves sent as copies");
+        }
     }
 }
 
@@ -88,11 +101,12 @@ pub async fn run(
 ) -> Result<()> {
     let frame_budget = Duration::from_secs(1) / cfg.max_fps.max(1);
     let want_key = Arc::new(AtomicBool::new(false));
+    let copy_rects = keyframes.copy_rects.clone();
     let forward = {
         let want_key = want_key.clone();
         tokio::spawn(async move {
             loop {
-                keyframes.0.notified().await;
+                keyframes.notify.notified().await;
                 want_key.store(true, Ordering::Relaxed);
             }
         })
@@ -105,6 +119,7 @@ pub async fn run(
         want_key,
         stop: stop.clone(),
         first_sent: AtomicBool::new(false),
+        copy_rects,
     };
     let worker = tokio::task::spawn_blocking(move || supervise(make_capturer, &ctx, &tx));
     while let Some(au) = rx.recv().await {
@@ -129,6 +144,8 @@ struct Ctx {
     want_key: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     first_sent: AtomicBool,
+    /// The viewer takes copy instructions ([`KeyframeRequests::enable_copy_rects`]).
+    copy_rects: Arc<AtomicBool>,
 }
 
 /// Each capture "generation" lives on a fresh OS thread: after a desktop switch (lock
@@ -206,13 +223,18 @@ fn run_generation(
             slice_bytes: None,
         },
     )?;
-    // A hardware encoder that reads the capturer's GPU surfaces (macOS VideoToolbox) gets
-    // them as they are: no CPU conversion, and no half-size motion frames (a CPU saving it
-    // doesn't need).
+    // A hardware encoder that reads the capturer's GPU surfaces (macOS VideoToolbox;
+    // Windows: a D3D11-aware Media Foundation encoder, fed by the GPU's video processor)
+    // gets them as they are: no CPU conversion, and no half-size motion frames (a CPU
+    // saving it doesn't need). Otherwise pictures are converted in memory, as before.
     let surfaces = enc.wants_surfaces() && cap.use_surfaces(cfg.max_size);
     let mut surface: Option<Surface> = None;
     let mut picture: Option<I420> = None;
     let mut small: Option<I420> = None;
+    // Copy instructions (scrolls and moves as copies), once the viewer asks for them.
+    // Pictures only: GPU surfaces go to the encoder untouched.
+    let mut composer: Option<Composer> = None;
+    let mut hints: Vec<Move> = Vec::new();
     let mut motion = false;
     let mut big_streak = 0u32;
     let mut last_big = Instant::now();
@@ -269,6 +291,8 @@ fn run_generation(
         } else {
             cap.next_into(timeout, &mut picture, cfg.max_size)
         };
+        hints.extend(cap.take_moves());
+        hints.truncate(64);
         match got {
             Ok(Some(c)) => {
                 stats.capture += t0.elapsed();
@@ -313,10 +337,19 @@ fn run_generation(
             resends.remove(0);
             force = true;
         }
+        if composer.is_none() && !surfaces && ctx.copy_rects.load(Ordering::Relaxed) {
+            composer = Some(Composer::new()); // its first picture is whole
+        }
         if force {
             enc.request_keyframe();
+            if let Some(c) = composer.as_mut() {
+                c.request_full();
+            }
         }
-        let may_halve = !surfaces && cfg.motion_half_res && w * h >= MOTION_MIN_PIXELS;
+        // Not with copy instructions: they keep scrolls cheap at full size, and a size
+        // switch costs a keyframe.
+        let may_halve =
+            !surfaces && composer.is_none() && cfg.motion_half_res && w * h >= MOTION_MIN_PIXELS;
         // Motion over: one sharp full-size picture.
         let sharpen = motion && last_big.elapsed() >= MOTION_SETTLE;
         if sharpen {
@@ -371,7 +404,34 @@ fn run_generation(
                 stats.half += 1;
                 enc.encode_yuv(small.as_ref().expect("allocated by half_into"), None)?
             }
-            (None, Some(pic)) => enc.encode_yuv(pic, Some(rows))?,
+            (None, Some(pic)) => match composer.as_mut() {
+                Some(c) => {
+                    let (canvas, found) = c.prepare(pic, &std::mem::take(&mut hints));
+                    match enc.encode_yuv(canvas, found.rows)? {
+                        Some(au) => {
+                            stats.moved += f64::from(c.last().moved);
+                            Some(c.sent(pic, au))
+                        }
+                        None => {
+                            // openh264's rate control drops frames for good; another
+                            // encoder may hand the picture out later.
+                            let was = c.is_passthrough();
+                            c.no_output(enc.engine_name() == "openh264");
+                            if !was && c.is_passthrough() {
+                                tracing::info!(
+                                    engine = %enc.engine_name(),
+                                    "encoder gave no picture; copy instructions off for this capture"
+                                );
+                            }
+                            None
+                        }
+                    }
+                }
+                None => {
+                    hints.clear();
+                    enc.encode_yuv(pic, Some(rows))?
+                }
+            },
             (None, None) => unreachable!("checked above"),
         };
         stats.encode += t0.elapsed();
@@ -473,6 +533,8 @@ struct Stats {
     encode: Duration,
     latency: Duration,
     changed: f64,
+    /// Share of the screen sent as copy instructions instead of pixels (summed per frame).
+    moved: f64,
     since: Option<Instant>,
     /// Process and stream-thread CPU seconds at `since`.
     cpu_at_start: (f64, f64),
@@ -497,6 +559,7 @@ impl Stats {
             fps = format!("{:.1}", f64::from(self.frames) / secs),
             urgent_fps = format!("{:.1}", f64::from(self.urgent) / secs),
             half_size_fps = format!("{:.1}", f64::from(self.half) / secs),
+            moved_pct = format!("{:.1}", self.moved * 100.0 / n),
             kbps = format!("{:.0}", self.bytes as f64 * 8.0 / secs / 1000.0),
             changed_pct = format!("{:.1}", self.changed * 100.0 / n),
             capture_ms = per(self.capture, f64::from(self.captures.max(1))),

@@ -71,6 +71,8 @@ pub struct DxgiCapturer {
     access_lost: u32,
     /// Frames kept on the GPU (see [`gpu`]), when enabled.
     gpu: Option<gpu::GpuState>,
+    /// Move rectangles DXGI reported since the last `take_moves` (picture coordinates).
+    moves: Vec<crate::copyrect::Move>,
 }
 
 /// Keeping frames on the GPU for a hardware encoder.
@@ -127,6 +129,7 @@ impl DxgiCapturer {
                     started: Instant::now(),
                     access_lost: 0,
                     gpu: None,
+                    moves: Vec::new(),
                 });
             }
             Err(CaptureError::NoOutput)
@@ -347,7 +350,7 @@ impl DxgiCapturer {
 
     /// The areas DXGI says changed in `held` (moved areas count as changed), or `None`
     /// if it can't say.
-    fn changed_rects(held: &Held) -> Option<Vec<Rect>> {
+    fn changed_rects(held: &Held, moved: &mut Vec<crate::copyrect::Move>) -> Option<Vec<Rect>> {
         let size = held.info.TotalMetadataBufferSize as usize;
         if size == 0 {
             return None;
@@ -376,6 +379,14 @@ impl DxgiCapturer {
         .ok()?;
         moves.truncate(used as usize / move_size);
         rects.extend(moves.iter().filter_map(|m| to_rect(m.DestinationRect)));
+        moved.extend(moves.iter().filter_map(|m| {
+            let to = to_rect(m.DestinationRect)?;
+            Some(crate::copyrect::Move {
+                from_x: usize::try_from(m.SourcePoint.x).ok()?,
+                from_y: usize::try_from(m.SourcePoint.y).ok()?,
+                to,
+            })
+        }));
         let rect_size = std::mem::size_of::<RECT>();
         let mut dirty = vec![RECT::default(); size / rect_size + 1];
         unsafe {
@@ -431,7 +442,7 @@ impl DxgiCapturer {
         let rects: Vec<Rect> = if fresh {
             vec![whole]
         } else {
-            Self::changed_rects(held)
+            Self::changed_rects(held, &mut self.moves)
                 .unwrap_or_else(|| vec![whole])
                 .into_iter()
                 .filter_map(|r| r.even_within(ew, eh))
@@ -533,6 +544,14 @@ impl Capturer for DxgiCapturer {
             self.want_full = false;
         }
         result
+    }
+
+    fn take_moves(&mut self) -> Vec<crate::copyrect::Move> {
+        // A pile-up means nobody asks (copy instructions are off): keep it bounded.
+        if self.moves.len() > 64 {
+            self.moves.clear();
+        }
+        std::mem::take(&mut self.moves)
     }
 
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {

@@ -40,6 +40,14 @@ impl I420 {
         (self.width, self.height)
     }
 
+    /// The Y, U and V planes, writable (`width`, `width / 2`, `width / 2` bytes per row).
+    pub fn planes_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
+        let n = self.width * self.height;
+        let (y, uv) = self.data.split_at_mut(n);
+        let (u, v) = uv.split_at_mut(n / 4);
+        (y, u, v)
+    }
+
     /// Convert the top-left `width` x `height` of a BGRA image with `src_width` pixels per row.
     pub fn fill_from_bgra(&mut self, bgra: &[u8], src_width: usize) {
         let (w, h) = (self.width, self.height);
