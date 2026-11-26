@@ -307,6 +307,16 @@ impl VideoDecoder {
     /// Move to openh264 if the engine (not the stream) failed: Media Foundation that
     /// fails before its first picture, VideoToolbox without a hardware decoder for the
     /// stream. `false`: keep the engine.
+    #[cfg(not(any(windows, target_os = "macos", target_os = "ios")))]
+    #[expect(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn fall_back(&self, _e: &CodecError) -> Result<bool, CodecError> {
+        Ok(false) // openh264 is the only engine here
+    }
+
+    /// Move to openh264 if the engine (not the stream) failed: Media Foundation that
+    /// fails before its first picture, VideoToolbox without a hardware decoder for the
+    /// stream. `false`: keep the engine.
+    #[cfg(any(windows, target_os = "macos", target_os = "ios"))]
     fn fall_back(&mut self, e: &CodecError) -> Result<bool, CodecError> {
         #[cfg(windows)]
         if self.pictures > 0 {
