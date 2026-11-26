@@ -155,7 +155,7 @@ const anyHash = (p: (typeof platforms)[number]) => p.files.some((f) => f.sha256)
                 <div class="prose">
                   <h3>Just for me</h3>
                   <p>No sudo needed. Unpack the archive, then run <code>./install.sh</code> from the folder it unpacks to:</p>
-                  <pre><code>{pick(p, 'user').map((f) => `tar -xzf ${f.file}`).join('\n# or\n')}</code></pre>
+                  <pre><code>{pick(p, 'user').map((f) => `tar -xzf ${f.file}\ncd ${f.file.replace(/\.tar\.gz$/, '')} && ./install.sh`).join('\n# or\n')}</code></pre>
                   <p>
                     On Wayland, Ubuntu asks you to allow screen sharing the first time someone
                     connects. Rconn remembers your answer. On X11 there’s no prompt.
