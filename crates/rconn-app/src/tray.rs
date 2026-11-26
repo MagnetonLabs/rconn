@@ -1,15 +1,24 @@
 //! Tray icon (`rconn --tray`): shows this computer's ID and status, opens the window.
 //! Runs as its own small process, started at login, so it costs nothing while idle.
+//! macOS and Windows drive it with winit; Linux with GTK (AppIndicator, which Ubuntu's
+//! desktop shows in the top bar).
 
 use rconn_core::status::HostStatus;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+#[cfg(not(target_os = "linux"))]
 use winit::application::ApplicationHandler;
+#[cfg(not(target_os = "linux"))]
 use winit::event::{StartCause, WindowEvent};
+#[cfg(not(target_os = "linux"))]
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+#[cfg(not(target_os = "linux"))]
 use winit::window::WindowId;
+
+/// How often the tray handles clicks (and, every 5 s, re-reads the status).
+const TICK: Duration = Duration::from_millis(200);
 
 /// Held while a tray runs, so a second one exits at once.
 pub const TRAY_PORT: u16 = 47_392;
@@ -38,15 +47,7 @@ pub fn run(status_file: PathBuf) -> anyhow::Result<()> {
             }
         }
     });
-    #[allow(unused_mut)]
-    let mut builder = EventLoop::builder();
-    #[cfg(target_os = "macos")]
-    {
-        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-        builder.with_activation_policy(ActivationPolicy::Accessory); // menu bar only, no Dock icon
-    }
-    let event_loop = builder.build()?;
-    let mut tray = Tray {
+    let tray = Tray {
         status_file,
         icon: None,
         id_item: MenuItem::new("ID: not set up", false, None),
@@ -55,7 +56,38 @@ pub fn run(status_file: PathBuf) -> anyhow::Result<()> {
         quit: MenuItem::new("Quit Rconn", true, None),
         next_status: Instant::now(),
     };
+    run_loop(tray)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_loop(mut tray: Tray) -> anyhow::Result<()> {
+    #[allow(unused_mut)]
+    let mut builder = EventLoop::builder();
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        builder.with_activation_policy(ActivationPolicy::Accessory); // menu bar only, no Dock icon
+    }
+    let event_loop = builder.build()?;
     event_loop.run_app(&mut tray)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_loop(mut tray: Tray) -> anyhow::Result<()> {
+    gtk::init()?;
+    tray.build()?;
+    let mut tray = Some(tray);
+    gtk::glib::timeout_add_local(TICK, move || {
+        if tray.as_mut().is_some_and(Tray::tick) {
+            gtk::glib::ControlFlow::Continue
+        } else {
+            tray = None; // removes the icon
+            gtk::main_quit();
+            gtk::glib::ControlFlow::Break
+        }
+    });
+    gtk::main();
     Ok(())
 }
 
@@ -153,29 +185,15 @@ impl Tray {
     }
 }
 
-impl ApplicationHandler for Tray {
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        if cause == StartCause::Init
-            && let Err(e) = self.build()
-        {
-            tracing::error!(error = %e, "tray icon failed");
-            event_loop.exit();
-        }
-    }
-
-    fn resumed(&mut self, _: &ActiveEventLoop) {}
-
-    fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+impl Tray {
+    /// Handle clicks and refresh the status. `false` once the user chose Quit.
+    fn tick(&mut self) -> bool {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == *self.open.id() {
                 open_window();
             } else if ev.id == *self.quit.id() {
                 quit_app();
-                self.icon = None;
-                event_loop.exit();
-                return;
+                return false;
             }
         }
         while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
@@ -196,8 +214,31 @@ impl ApplicationHandler for Tray {
             self.refresh_status();
             self.next_status = Instant::now() + Duration::from_secs(5);
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(200),
-        ));
+        true
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl ApplicationHandler for Tray {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if cause == StartCause::Init
+            && let Err(e) = self.build()
+        {
+            tracing::error!(error = %e, "tray icon failed");
+            event_loop.exit();
+        }
+    }
+
+    fn resumed(&mut self, _: &ActiveEventLoop) {}
+
+    fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.tick() {
+            self.icon = None;
+            event_loop.exit();
+            return;
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
     }
 }

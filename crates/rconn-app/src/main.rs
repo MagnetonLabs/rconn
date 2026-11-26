@@ -20,7 +20,7 @@ struct App {
 impl eframe::App for App {
     fn on_exit(&mut self) {
         if !self.closed_by_window {
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             if let Ok(mut s) =
                 std::net::TcpStream::connect(("127.0.0.1", rconn_app::tray::TRAY_PORT))
             {
@@ -48,9 +48,9 @@ fn main() -> anyhow::Result<()> {
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--tray") {
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         return rconn_app::tray::run(rconn_app::worker::Paths::installed().status_file);
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         return Ok(());
     }
 
@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     // Make sure the tray icon is running (a duplicate exits immediately).
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     if !args.iter().any(|a| a == "--no-tray")
         && let Ok(exe) = std::env::current_exe()
     {

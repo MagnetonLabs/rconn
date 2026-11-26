@@ -3,7 +3,7 @@
 pub mod home;
 pub mod icon;
 pub mod profile;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub mod tray;
 #[cfg(unix)]
 pub mod userhost;

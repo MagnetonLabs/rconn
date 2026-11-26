@@ -37,6 +37,10 @@ workspace = true
 tray-icon = "0.26"
 winit = { version = "0.30", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = "0.26"
+gtk = "0.18"  # the version tray-icon drives on Linux
+
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
 tempfile.workspace = true

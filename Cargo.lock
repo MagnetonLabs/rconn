@@ -5334,6 +5334,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_kittest",
+ "gtk",
  "png",
  "rconn-core",
  "rconn-host-settings",
