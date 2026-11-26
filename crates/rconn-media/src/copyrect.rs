@@ -39,6 +39,18 @@ pub fn enabled() -> bool {
     std::env::var("RCONN_COPY_RECTS").map_or(true, |v| v != "0" && v != "off")
 }
 
+/// Whether a host offers copy instructions. By default only Windows hosts do: there the
+/// capture reports window moves, so drags save 29–55%. Elsewhere drags cost 7–20% more,
+/// and copied areas stay at the sharpness they were first sent at.
+/// `RCONN_COPY_RECTS=1` turns it on anywhere, `=0` off.
+pub fn host_enabled() -> bool {
+    match std::env::var("RCONN_COPY_RECTS").as_deref() {
+        Ok("0" | "off") => false,
+        Ok(_) => true,
+        Err(_) => cfg!(windows),
+    }
+}
+
 /// A move must cover this many rows to be worth an instruction.
 const MIN_RUN: usize = 24;
 /// Rows of the new picture that must agree on a scroll distance before it is checked.

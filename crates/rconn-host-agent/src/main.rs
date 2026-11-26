@@ -598,7 +598,7 @@ async fn serve_channel(
                         resize.send_replace(Some(display::Want::Restore));
                     }
                     Ok(DataMessage::Control(Control::CopyRects { version })) => {
-                        if version == rconn_media::copyrect::VERSION && rconn_media::copyrect::enabled() {
+                        if version == rconn_media::copyrect::VERSION && rconn_media::copyrect::host_enabled() {
                             keyframes.enable_copy_rects();
                         } else {
                             tracing::debug!(version, "copy instructions not used");
