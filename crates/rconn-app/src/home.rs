@@ -36,7 +36,13 @@ pub enum Request {
     ConnectGuest {
         id: String,
         password: Secret,
+        /// Keep the password in the system's credential store once it's let in.
+        remember: bool,
     },
+    /// A recent computer whose password is remembered: connect with it.
+    ConnectSaved(String),
+    /// Forget the remembered password of this ID ("123 456 789").
+    ForgetPassword(String),
     Connect(HostId, Option<String>),
     SaveServer {
         server: String,
@@ -115,11 +121,14 @@ pub struct Home {
     pub changing_password: bool,
     /// Move the keyboard focus to the access-password field (after picking a recent ID).
     pub focus_password: bool,
+    /// "Remember the password" is ticked under the password field.
+    pub remember_password: bool,
 }
 
 impl Home {
     pub fn new(profile: Profile) -> Self {
         Self {
+            remember_password: profile.remember_passwords,
             server_edit: profile.server.clone(),
             fingerprint_edit: profile.fingerprint.clone(),
             username: profile.username.clone(),
@@ -362,6 +371,13 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             if !wide {
                 ui.horizontal(|ui| password_and_connect(ui, h, out, enter, height));
             }
+            if !h.access_password.is_empty() {
+                ui.checkbox(&mut h.remember_password, "Remember this password")
+                    .on_hover_text(
+                        "Kept in this computer's password store (Keychain, Credential \
+                         Manager, Secret Service), so next time a click on its card connects",
+                    );
+            }
             if !h.signed_in {
                 ui.label(
                     RichText::new(if h.access_password.is_empty() {
@@ -414,6 +430,7 @@ fn password_and_connect(
             Request::ConnectGuest {
                 id,
                 password: Secret(std::mem::take(&mut h.access_password)),
+                remember: h.remember_password,
             }
         } else {
             Request::ConnectTyped(id)
@@ -463,6 +480,7 @@ fn tabs(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CardClick {
     Connect,
+    ForgetPassword,
     Remove,
     Rename,
     SaveName,
@@ -479,6 +497,7 @@ fn computer_card(
     code: &str,
     label: Option<&str>,
     online: Option<bool>,
+    saved: bool,
     enabled: bool,
     editable: bool,
     renaming: Option<&mut String>,
@@ -543,6 +562,14 @@ fn computer_card(
                             ui.add_space(4.0);
                             status_dot(ui, c);
                             ui.label(RichText::new(t).color(c).size(12.0));
+                        }
+                        if saved
+                            && ui
+                                .add(egui::Button::new(RichText::new("🔑").size(12.0)).frame(false))
+                                .on_hover_text("Password remembered: click to forget it")
+                                .clicked()
+                        {
+                            clicked = Some(CardClick::ForgetPassword);
                         }
                     });
                 });
@@ -611,7 +638,7 @@ fn computers(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     let enabled = h.busy.is_none();
     let cards: Vec<_> = list
         .iter()
-        .map(|c| (c.host_id.short_code(), c.label.clone(), Some(true)))
+        .map(|c| (c.host_id.short_code(), c.label.clone(), Some(true), false))
         .collect();
     if let Some((i, CardClick::Connect)) = card_grid(ui, &cards, enabled, false, None) {
         out.push(Request::Connect(list[i].host_id, list[i].label.clone()));
@@ -643,12 +670,12 @@ fn recent(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             let code = r.code();
             let seen = h.presence.get(&code.replace(' ', "")).copied();
             let state = if in_account { Some(true) } else { seen };
-            (code, r.label.clone(), state, in_account)
+            (code, r.label.clone(), state, in_account, r.password_saved)
         })
         .collect();
     let shown: Vec<_> = cards
         .iter()
-        .map(|(c, l, o, _)| (c.clone(), l.clone(), *o))
+        .map(|(c, l, o, _, saved)| (c.clone(), l.clone(), *o, *saved))
         .collect();
     let Some((i, click)) = card_grid(ui, &shown, enabled, true, h.renaming.as_mut()) else {
         return;
@@ -656,6 +683,7 @@ fn recent(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     let code = cards[i].0.clone();
     match click {
         CardClick::Remove => return out.push(Request::ForgetRecent(code)),
+        CardClick::ForgetPassword => return out.push(Request::ForgetPassword(code)),
         CardClick::Rename => {
             h.renaming = Some((code, cards[i].1.clone().unwrap_or_default()));
             return;
@@ -678,6 +706,8 @@ fn recent(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
         match r.host_id {
             // One of the signed-in fleet's computers: no password needed.
             Some(id) if in_list => out.push(Request::Connect(id, r.label)),
+            // Its password is remembered: connect with it.
+            _ if r.password_saved => out.push(Request::ConnectSaved(r.code())),
             // Otherwise it takes the access password: fill in the ID, ask for it.
             _ => {
                 h.connect_to = r.code();
@@ -1001,7 +1031,7 @@ pub fn card_columns(available: f32) -> (usize, f32) {
 /// Cards (ID, name, online?) in even rows; returns the index of the one clicked and how.
 fn card_grid(
     ui: &mut egui::Ui,
-    cards: &[(String, Option<String>, Option<bool>)],
+    cards: &[(String, Option<String>, Option<bool>, bool)],
     enabled: bool,
     editable: bool,
     mut renaming: Option<&mut (String, String)>,
@@ -1012,7 +1042,7 @@ fn card_grid(
     ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
     for (r, row) in cards.chunks(per_row).enumerate() {
         ui.horizontal_top(|ui| {
-            for (i, (code, label, online)) in row.iter().enumerate() {
+            for (i, (code, label, online, saved)) in row.iter().enumerate() {
                 let edit = match renaming.as_deref_mut() {
                     Some((c, text)) if c == code => Some(text),
                     _ => None,
@@ -1023,6 +1053,7 @@ fn card_grid(
                     code,
                     label.as_deref(),
                     *online,
+                    *saved,
                     enabled,
                     editable,
                     edit,

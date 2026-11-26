@@ -212,6 +212,7 @@ fn without_a_password_the_home_screen_says_connections_need_approval_here() {
         vec![Request::ConnectGuest {
             id: "987 654 321".into(),
             password: home::Secret(String::new()),
+            remember: false,
         }]
     );
 }
@@ -340,7 +341,55 @@ fn without_an_account_the_window_asks_for_the_password_and_connects_by_id() {
         vec![Request::ConnectGuest {
             id: "987 654 321".into(),
             password: home::Secret("correct horse".into()),
+            remember: false,
         }]
+    );
+}
+
+/// "Remember this password" goes with the connection; a remembered computer's card
+/// connects with one click, and its key forgets the password.
+#[test]
+fn a_remembered_password_connects_with_one_click() {
+    use egui_kittest::kittest::Queryable;
+    let mut hs = harness(no_account(false));
+    hs.run();
+    assert!(
+        hs.query_by_label("Remember this password").is_none(),
+        "only with a password typed"
+    );
+    hs.state_mut().0.connect_to = "987 654 321".into();
+    hs.state_mut().0.access_password = "correct horse".into();
+    hs.run();
+    hs.get_by_label("Remember this password").click();
+    hs.run();
+    hs.get_all_by_label("  Connect  ").next().unwrap().click();
+    hs.run();
+    assert_eq!(
+        hs.state().1,
+        vec![Request::ConnectGuest {
+            id: "987 654 321".into(),
+            password: home::Secret("correct horse".into()),
+            remember: true,
+        }]
+    );
+    hs.state_mut().1.clear();
+    hs.state_mut()
+        .0
+        .profile
+        .set_password_saved("987 654 321", true);
+    hs.run();
+    hs.get_by_label("Connect").click();
+    hs.run();
+    assert_eq!(
+        hs.state().1,
+        vec![Request::ConnectSaved("987 654 321".into())]
+    );
+    hs.state_mut().1.clear();
+    hs.get_by_label("🔑").click();
+    hs.run();
+    assert_eq!(
+        hs.state().1,
+        vec![Request::ForgetPassword("987 654 321".into())]
     );
 }
 
@@ -398,6 +447,7 @@ fn many_recent() -> Home {
         h.profile.remember_code(code);
         h.profile.recent[0].label = label.map(str::to_owned);
     }
+    h.profile.set_password_saved("123 456 789", true);
     for (code, on) in [
         ("111222333", true),
         ("123456789", false),

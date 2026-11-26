@@ -196,6 +196,7 @@ async fn main() -> Result<()> {
                     None => host_id.short_code(),
                 }),
                 guest,
+                app_files: gui::AppFiles::from_env(),
             };
             // A session window is already open: add a tab to it instead of a new window.
             if gui::hand_off(&args) {

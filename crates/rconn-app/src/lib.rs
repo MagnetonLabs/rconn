@@ -4,6 +4,7 @@ pub mod ask;
 pub mod home;
 pub mod icon;
 pub mod profile;
+pub mod saved;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub mod tray;
 pub mod userhost;

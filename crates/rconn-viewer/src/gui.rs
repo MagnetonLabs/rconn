@@ -42,6 +42,34 @@ pub struct ConnectArgs {
     /// Connecting with the computer's ID and access password instead of an account.
     #[serde(default)]
     pub guest: Option<crate::access::GuestLogin>,
+    /// The Rconn app's files for this connection (`RCONN_NAME_FILE`, `RCONN_REPORT_FILE`):
+    /// carried with the connection, so a tab handed to an open window writes its own.
+    #[serde(default)]
+    pub app_files: AppFiles,
+}
+
+/// Where the viewer tells the Rconn app about a connection it opened.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AppFiles {
+    /// The computer's name, once it is let in (labels the recent list).
+    pub name: Option<PathBuf>,
+    /// How the guest login went: `admitted`, or `refused: <why>`.
+    pub report: Option<PathBuf>,
+}
+
+impl AppFiles {
+    pub fn from_env() -> Self {
+        Self {
+            name: std::env::var_os("RCONN_NAME_FILE").map(PathBuf::from),
+            report: std::env::var_os("RCONN_REPORT_FILE").map(PathBuf::from),
+        }
+    }
+
+    fn report(&self, what: &str) {
+        if let Some(path) = &self.report {
+            let _ = std::fs::write(path, what);
+        }
+    }
 }
 
 /// The local hotkey that toggles the toolbar: Ctrl+Alt+Shift+M. Never sent to the host.
@@ -586,6 +614,7 @@ async fn session(
         files_repaint,
     ));
     let guest = args.guest.is_some();
+    let app_files = args.app_files.clone();
     // Scrolls and window moves as copy instructions (see rconn_media::copyrect).
     let copy_rects = rconn_media::copyrect::enabled();
     let dc_task = tokio::spawn(async move {
@@ -617,7 +646,7 @@ async fn session(
                         Ok(DataMessage::HostName(name)) => {
                             // The Rconn app asks for the name to label its recent list.
                             if let (Some(path), Some(name)) = (
-                                std::env::var_os("RCONN_NAME_FILE"),
+                                app_files.name.as_ref(),
                                 rconn_core::protocol::tidy_host_name(&name),
                             ) {
                                 let _ = std::fs::write(path, name);
@@ -638,6 +667,7 @@ async fn session(
                                         }
                                     }
                                     rconn_peer::guest::Step::Accepted => {
+                                        app_files.report("admitted");
                                         let _ = allowed_tx.send(true);
                                         status_shared.lock().expect("ui state").status =
                                             "accepted, waiting for the picture…".into();
@@ -651,6 +681,7 @@ async fn session(
                                         }
                                     }
                                     rconn_peer::guest::Step::Refused(why) => {
+                                        app_files.report(&format!("refused: {why}"));
                                         if let Some(tx) = refused_tx.take() {
                                             let _ = tx.send(why);
                                         }
