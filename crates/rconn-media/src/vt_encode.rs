@@ -1122,7 +1122,7 @@ mod tests {
                         .unwrap_or_else(|| panic!("{decoder} {w}x{h} frame {k}: no picture"));
                     assert_eq!((f.width, f.height), (w, h), "{decoder}");
                     if k == 0 || k == last {
-                        let d = mean_diff(&f.rgba, &p.rgba(k));
+                        let d = mean_diff(&f.to_rgba(), &p.rgba(k));
                         println!("  {decoder} decodes frame {k}: mean difference {d:.2}");
                         assert!(d < 8.0, "{decoder} {w}x{h} frame {k} differs: {d:.2}");
                     }
@@ -1212,7 +1212,7 @@ mod tests {
             (w / 4, 3 * h / 4),
             (3 * w / 4, 3 * h / 4),
         ] {
-            let got = &f.rgba[(y * w + x) * 4..(y * w + x) * 4 + 3];
+            let got = &f.to_rgba()[(y * w + x) * 4..(y * w + x) * 4 + 3];
             let [b, g, r, _] = colour_at(x, y);
             let want = [r, g, b];
             let off = got
@@ -1249,7 +1249,7 @@ mod tests {
         let mut dec = VideoDecoder::software(&lib).unwrap();
         let f = dec.decode(&au).unwrap().expect("decodes on its own");
         assert!(
-            mean_diff(&f.rgba, &p.rgba(3)) < 8.0,
+            mean_diff(&f.to_rgba(), &p.rgba(3)) < 8.0,
             "the whole picture, not a stale one"
         );
     }
@@ -1273,7 +1273,7 @@ mod tests {
             .decode(&au)
             .unwrap()
             .expect("a picture");
-        assert!(mean_diff(&f.rgba, &p.rgba(2)) < 8.0);
+        assert!(mean_diff(&f.to_rgba(), &p.rgba(2)) < 8.0);
     }
 
     /// ScreenCaptureKit's own surfaces, straight into the encoder: the capture-to-unit path

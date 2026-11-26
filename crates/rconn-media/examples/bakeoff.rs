@@ -149,7 +149,7 @@ mod imp {
             if let Some(au) = au {
                 s.bytes += au.len();
                 if let Ok(Some(d)) = dec.decode(&au) {
-                    s.psnr.push(psnr(f, &d.rgba, d.width, d.height));
+                    s.psnr.push(psnr(f, &d.to_rgba(), d.width, d.height));
                 }
             }
         }
@@ -180,7 +180,7 @@ mod imp {
                 // Compare with the frame this output belongs to (allowing encoder delay).
                 let src = &frames[decoded.min(frames.len() - 1)];
                 decoded += 1;
-                s.psnr.push(psnr(src, &d.rgba, d.width, d.height));
+                s.psnr.push(psnr(src, &d.to_rgba(), d.width, d.height));
             }
         }
         Ok((s, name))

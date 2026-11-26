@@ -1,8 +1,9 @@
 //! macOS hardware H.264 decoding through VideoToolbox.
 //!
-//! Annex-B access units in, RGBA out. The hardware hands back YUV (NV12) and our own
-//! multi-core conversion makes RGBA: the stream carries no colour-matrix tag, and the
-//! hardware would guess BT.709 for HD sizes while hosts encode BT.601.
+//! Annex-B access units in, NV12 planes out. The pixels are copied as decoded (no colour
+//! conversion here): the viewer converts on the GPU with the stream's own colour
+//! signalling ([`crate::sps`]), where the hardware would guess BT.709 for HD sizes while
+//! hosts encode BT.601.
 
 #![allow(unsafe_code, non_upper_case_globals)]
 
@@ -196,12 +197,12 @@ impl VtDecoder {
         }
     }
 
-    /// Decode one Annex-B access unit into `rgba` (resized as needed). Returns the
+    /// Decode one Annex-B access unit into tight NV12 planes in `nv12`. Returns the
     /// picture size, or `None` if this unit held no picture.
     pub fn decode(
         &mut self,
         annex_b: &[u8],
-        rgba: &mut Vec<u8>,
+        nv12: &mut Vec<u8>,
     ) -> Result<Option<(usize, usize)>, String> {
         let (mut sps, mut pps) = (None, None);
         self.avcc.clear();
@@ -289,7 +290,7 @@ impl VtDecoder {
         let Some(image) = image else {
             return Ok(None);
         };
-        Ok(Some(copy_nv12_to_rgba(&image, rgba)))
+        Ok(Some(copy_nv12(&image, nv12)))
     }
 
     fn open(&mut self) -> Result<(), String> {
@@ -379,8 +380,8 @@ impl Drop for VtDecoder {
     }
 }
 
-/// NV12 pixel buffer -> tightly packed RGBA.
-fn copy_nv12_to_rgba(image: &Cf, rgba: &mut Vec<u8>) -> (usize, usize) {
+/// NV12 pixel buffer -> tight NV12 planes (Y rows, then interleaved CbCr rows).
+fn copy_nv12(image: &Cf, out: &mut Vec<u8>) -> (usize, usize) {
     // SAFETY: the buffer is locked read-only while we read each plane's
     // `stride * rows` bytes.
     unsafe {
@@ -391,13 +392,18 @@ fn copy_nv12_to_rgba(image: &Cf, rgba: &mut Vec<u8>) -> (usize, usize) {
             CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
             CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
         );
+        let ch = h.div_ceil(2);
+        let cw = w.div_ceil(2) * 2;
         let y = std::slice::from_raw_parts(CVPixelBufferGetBaseAddressOfPlane(pb, 0), ys * h);
-        let uv = std::slice::from_raw_parts(
-            CVPixelBufferGetBaseAddressOfPlane(pb, 1),
-            uvs * h.div_ceil(2),
-        );
-        rgba.resize(w * h * 4, 0);
-        crate::yuv::nv12_to_rgba((y, uv), (ys, uvs), (w, h), rgba);
+        let uv = std::slice::from_raw_parts(CVPixelBufferGetBaseAddressOfPlane(pb, 1), uvs * ch);
+        out.clear();
+        out.reserve(w * h + cw * ch);
+        for row in y.chunks_exact(ys) {
+            out.extend_from_slice(&row[..w]);
+        }
+        for row in uv.chunks_exact(uvs) {
+            out.extend_from_slice(&row[..cw]);
+        }
         CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
         (w, h)
     }

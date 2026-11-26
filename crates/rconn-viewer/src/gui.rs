@@ -6,7 +6,7 @@
 use crate::keymap::to_hid;
 use anyhow::{Result, anyhow};
 use bytes::BytesMut;
-use egui::{Color32, ColorImage, Pos2, Rect, Sense, TextureHandle, TextureOptions, Vec2};
+use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use rconn_core::ids::HostId;
 use rconn_core::protocol::{Control, DataMessage, InputEvent, MouseButton};
 use rconn_media::video::{DecodedFrame, VideoDecoder};
@@ -164,6 +164,8 @@ struct Shared {
     status: String,
     fps: f32,
     kbps: f32,
+    /// Mean decode time per picture over the last second.
+    decode_ms: f32,
 }
 
 /// Local port of the open session window: later connections become tabs in it.
@@ -233,7 +235,8 @@ fn open_tab(args: ConnectArgs, ctx_slot: Arc<Mutex<Option<egui::Context>>>) -> V
         shared,
         input: input_tx,
         keyframe: kf_ui,
-        texture: None,
+        video: crate::video_render::VideoView::new(),
+        frame_size: None,
         last_pointer: None,
         keys: KeyGate::default(),
         fullscreen: false,
@@ -318,6 +321,9 @@ pub fn run(args: ConnectArgs) -> Result<()> {
         options,
         Box::new(move |cc| {
             *ctx_slot.lock().expect("ctx") = Some(cc.egui_ctx.clone());
+            if let Some(rs) = &cc.wgpu_render_state {
+                crate::video_render::install(rs);
+            }
             let first = open_tab(args, ctx_slot.clone());
             Ok(Box::new(Window {
                 title: String::new(),
@@ -700,7 +706,9 @@ async fn session(
 
     let mut rx = VideoReceiver::default();
     let mut dec = VideoDecoder::new(&args.openh264)?;
+    tracing::info!(decoder = dec.engine_name(), "video decoder");
     let (mut frames, mut bytes, mut since) = (0u32, 0usize, Instant::now());
+    let mut decode_time = Duration::ZERO;
     // Lost packets, decode errors, or video with no picture coming out of it: ask for a
     // fresh keyframe (throttled; each one costs the host a full-size encode).
     let mut need = KeyframeNeed::default();
@@ -731,6 +739,7 @@ async fn session(
                 match dec.decode(&au) {
                     Ok(Some(f)) => {
                         frames += 1;
+                        decode_time += f.decode_time;
                         need.picture();
                         let mut s = shared.lock().expect("ui state");
                         s.frame = Some(f);
@@ -755,8 +764,12 @@ async fn session(
             let mut s = shared.lock().expect("ui state");
             s.fps = frames as f32 / secs;
             s.kbps = bytes as f32 * 8.0 / secs / 1000.0;
+            if frames > 0 {
+                s.decode_ms = decode_time.as_secs_f32() * 1e3 / frames as f32;
+            }
             drop(s);
             (frames, bytes, since) = (0, 0, Instant::now());
+            decode_time = Duration::ZERO;
             repaint(); // the toolbar's numbers, also when no picture comes
         }
     }
@@ -832,7 +845,10 @@ struct ViewerApp {
     input: mpsc::UnboundedSender<InputEvent>,
     /// Control messages for the host (keyframe requests, toolbar actions).
     keyframe: mpsc::UnboundedSender<Control>,
-    texture: Option<TextureHandle>,
+    /// The picture on screen (uploaded and drawn on the GPU).
+    video: crate::video_render::VideoView,
+    /// The remote picture's size, once one has arrived.
+    frame_size: Option<[usize; 2]>,
     last_pointer: Option<(f32, f32)>,
     keys: KeyGate,
     fullscreen: bool,
@@ -849,7 +865,7 @@ struct ViewerApp {
     /// The host's pointer shape, shown with the local pointer over the picture.
     cursor: Arc<Mutex<Option<rconn_core::protocol::CursorShape>>>,
     /// The latest picture (for "Save screenshot").
-    last_frame: Option<DecodedFrame>,
+    last_frame: Option<Arc<DecodedFrame>>,
     /// "Match resolution to window": the remote screen's resolution follows this window.
     /// Off (the default) keeps the remote resolution and scales the picture.
     match_resolution: bool,
@@ -1128,12 +1144,11 @@ impl ViewerApp {
         }
     }
 
-    fn stats(&self, fps: f32, kbps: f32) -> String {
-        match &self.texture {
-            Some(t) => format!(
-                "{}x{}  ·  {fps:.0} fps  ·  {kbps:.0} kbps",
-                t.size()[0],
-                t.size()[1]
+    fn stats(&self, fps: f32, kbps: f32, decode_ms: f32) -> String {
+        match self.frame_size {
+            Some([w, h]) => format!(
+                "{w}x{h}  ·  {fps:.0} fps  ·  {kbps:.0} kbps  ·  decode {decode_ms:.1} + upload {:.1} ms",
+                self.video.upload_ms()
             ),
             None => "connecting…".into(),
         }
@@ -1321,7 +1336,7 @@ impl ViewerApp {
     /// (in pixels) once the window has stopped changing size for a moment: no black bars,
     /// and the host's pixels map 1:1 to ours.
     fn fit_remote_to(&mut self, area: Rect, ctx: &egui::Context) {
-        if self.texture.is_none() || !self.match_resolution {
+        if self.frame_size.is_none() || !self.match_resolution {
             return; // not connected yet, or scaling the picture instead
         }
         let ppp = ctx.pixels_per_point();
@@ -1354,41 +1369,31 @@ impl ViewerApp {
     }
 
     fn draw(&mut self, ui: &mut egui::Ui) {
-        let (new_frame, status, fps, kbps) = {
+        let (new_frame, status, fps, kbps, decode_ms) = {
             let mut s = self.shared.lock().expect("ui state");
-            (s.frame.take(), s.status.clone(), s.fps, s.kbps)
+            (s.frame.take(), s.status.clone(), s.fps, s.kbps, s.decode_ms)
         };
         if let Some(f) = new_frame {
-            // Hand the pixels over without converting them one by one (opaque RGBA is
-            // already what egui stores): saves a full-picture pass on this thread.
-            let img = Arc::new(ColorImage::new(
-                [f.width, f.height],
-                bytemuck::cast_slice::<u8, Color32>(&f.rgba).to_vec(),
-            ));
-            match &mut self.texture {
-                Some(t) if t.size() == [f.width, f.height] => t.set(img, TextureOptions::LINEAR),
-                _ => {
-                    // Fit the window to the first picture only: later size changes are the
-                    // host trading resolution for speed, and keep the same shape.
-                    self.fit_window |= self.texture.is_none();
-                    self.texture =
-                        Some(ui.ctx().load_texture("screen", img, TextureOptions::LINEAR));
-                }
-            }
+            // The YUV planes go to the GPU as they are (see `video_render`).
+            let f = Arc::new(f);
+            self.video.submit(f.clone());
+            // Fit the window to the first picture only: later size changes are the host
+            // trading resolution for speed, and keep the same shape.
+            self.fit_window |= self.frame_size.is_none();
+            self.frame_size = Some([f.width, f.height]);
             self.last_frame = Some(f);
         }
         let fullscreen = self.is_fullscreen(ui);
         if std::mem::take(&mut self.fit_window)
             && !fullscreen
-            && let Some(t) = &self.texture
+            && let Some([w, h]) = self.frame_size
         {
-            let [w, h] = t.size();
             let monitor = ui.ctx().input(|i| i.viewport().monitor_size);
             let size = window_size_for(Vec2::new(w as f32, h as f32), monitor);
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
-        let stats = self.stats(fps, kbps);
+        let stats = self.stats(fps, kbps, decode_ms);
         self.last_stats.clone_from(&stats);
         let ctx = ui.ctx().clone();
         self.restart_dialog(&ctx);
@@ -1418,15 +1423,9 @@ impl ViewerApp {
             self.fit_remote_to(area, ui.ctx());
             ui.painter().rect_filled(area, 0.0, Color32::BLACK);
             let _ = ui.allocate_rect(area, Sense::click_and_drag());
-            let image = self.texture.as_ref().map(|tex| {
-                let [w, h] = tex.size();
+            let image = self.frame_size.map(|[w, h]| {
                 let image = fit(area, Vec2::new(w as f32, h as f32));
-                ui.painter().image(
-                    tex.id(),
-                    image,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                self.video.paint(ui.painter(), image);
                 image
             });
             if fullscreen {
@@ -1657,14 +1656,11 @@ mod render_tests {
             *px = [(x * 255 / w) as u8, 90, (y * 255 / h) as u8, 255];
         }
         let shared = Arc::new(Mutex::new(Shared {
-            frame: Some(DecodedFrame {
-                width: w,
-                height: h,
-                rgba,
-            }),
+            frame: Some(DecodedFrame::from_rgba(w, h, &rgba)),
             status: String::new(),
             fps: 29.0,
             kbps: 2400.0,
+            decode_ms: 2.0,
         }));
         let keys = KeyGate {
             toolbar: hotkey,
@@ -1674,7 +1670,8 @@ mod render_tests {
             shared,
             input,
             keyframe,
-            texture: None,
+            video: crate::video_render::VideoView::new(),
+            frame_size: None,
             last_pointer: None,
             keys,
             fullscreen,
@@ -1705,11 +1702,7 @@ mod render_tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut a = app(false, false);
         a.keyframe = tx;
-        a.texture = Some(egui::Context::default().load_texture(
-            "t",
-            ColorImage::new([4, 4], vec![Color32::BLACK; 16]),
-            TextureOptions::LINEAR,
-        ));
+        a.frame_size = Some([4, 4]);
         let ctx = egui::Context::default();
         let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
         a.fit_remote_to(area, &ctx);
@@ -1777,9 +1770,20 @@ mod render_tests {
         assert_eq!(a.files.active(), 1);
     }
 
+    /// The test renderer, with the video pipelines installed (as the window has).
+    fn renderer() -> egui_kittest::wgpu::WgpuTestRenderer {
+        let rs = egui_kittest::wgpu::create_render_state(
+            egui_kittest::wgpu::default_wgpu_setup(),
+            eframe::egui_wgpu::RendererOptions::PREDICTABLE,
+        );
+        crate::video_render::install(&rs);
+        egui_kittest::wgpu::WgpuTestRenderer::from_render_state(rs)
+    }
+
     fn render(name: &str, app: ViewerApp) -> ViewerApp {
         let mut harness = Harness::builder()
             .with_size(egui::vec2(1100.0, 700.0))
+            .renderer(renderer())
             .build_ui_state(|ui, app: &mut ViewerApp| app.draw(ui), app);
         harness.run_steps(3);
         let image = harness.render().expect("offscreen render");
@@ -1805,6 +1809,7 @@ mod render_tests {
         };
         let mut harness = Harness::builder()
             .with_size(egui::vec2(1100.0, 700.0))
+            .renderer(renderer())
             .build_ui_state(
                 |ui, w: &mut Window| eframe::App::ui(w, ui, &mut eframe::Frame::_new_kittest()),
                 window,
