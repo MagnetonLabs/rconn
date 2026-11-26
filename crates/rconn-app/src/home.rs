@@ -56,6 +56,8 @@ pub enum Request {
     SetAccessPassword(Secret),
     /// Turn access by password off for this computer.
     ClearAccessPassword,
+    /// Take this ID ("123 456 789") off the recent list.
+    ForgetRecent(String),
 }
 
 /// A password that must not show up in logs or debug output.
@@ -84,6 +86,9 @@ pub struct Home {
     pub host_password_saved: Option<(bool, u64)>,
     /// None until loaded.
     pub computers: Option<Vec<HostInfo>>,
+    /// Recent IDs (digits only) the server last said were online or not; no account needed.
+    /// Empty when the server hasn't answered (or is too old to know the question).
+    pub presence: std::collections::HashMap<String, bool>,
     pub username: String,
     pub password: String,
     pub server_edit: String,
@@ -121,6 +126,7 @@ impl Home {
             new_host_password: String::new(),
             host_password_saved: None,
             computers: None,
+            presence: Default::default(),
             password: String::new(),
             notice: None,
             busy: None,
@@ -417,14 +423,22 @@ fn tabs(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     });
 }
 
+/// What was clicked on a computer card.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardClick {
+    Connect,
+    Remove,
+}
+
 fn computer_card(
     ui: &mut egui::Ui,
     code: &str,
     label: Option<&str>,
     online: Option<bool>,
     enabled: bool,
-) -> bool {
-    let mut clicked = false;
+    removable: bool,
+) -> Option<CardClick> {
+    let mut clicked = None;
     egui::Frame::group(ui.style())
         .corner_radius(10.0)
         .inner_margin(12.0)
@@ -449,9 +463,22 @@ fn computer_card(
                 });
             });
             ui.add_space(6.0);
-            clicked = ui
-                .add_enabled(enabled, egui::Button::new("Connect"))
-                .clicked();
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Connect"))
+                    .clicked()
+                {
+                    clicked = Some(CardClick::Connect);
+                }
+                if removable
+                    && ui
+                        .add(egui::Button::new(RichText::new("Remove").small()).frame(false))
+                        .on_hover_text("Take it off this list")
+                        .clicked()
+                {
+                    clicked = Some(CardClick::Remove);
+                }
+            });
         });
     clicked
 }
@@ -484,7 +511,7 @@ fn computers(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
         .iter()
         .map(|c| (c.host_id.short_code(), c.label.clone(), Some(true)))
         .collect();
-    if let Some(i) = card_grid(ui, &cards, enabled) {
+    if let Some((i, CardClick::Connect)) = card_grid(ui, &cards, enabled, false) {
         out.push(Request::Connect(list[i].host_id, list[i].label.clone()));
     }
 }
@@ -507,16 +534,30 @@ fn recent(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
         .recent
         .iter()
         .map(|r| {
-            let listed = match (&online, r.host_id) {
-                (Some(o), Some(id)) if h.signed_in => Some(o.contains(&id)),
-                _ => None,
+            let in_account = match (&online, r.host_id) {
+                (Some(o), Some(id)) if h.signed_in => o.contains(&id),
+                _ => false,
             };
-            (r.code(), r.label.clone(), listed)
+            let code = r.code();
+            let seen = h.presence.get(&code.replace(' ', "")).copied();
+            let state = if in_account { Some(true) } else { seen };
+            (code, r.label.clone(), state, in_account)
         })
         .collect();
-    if let Some(i) = card_grid(ui, &cards, enabled) {
+    let shown: Vec<_> = cards
+        .iter()
+        .map(|(c, l, o, _)| (c.clone(), l.clone(), *o))
+        .collect();
+    let Some((i, click)) = card_grid(ui, &shown, enabled, true) else {
+        return;
+    };
+    if click == CardClick::Remove {
+        out.push(Request::ForgetRecent(cards[i].0.clone()));
+        return;
+    }
+    {
         let r = h.profile.recent[i].clone();
-        let in_list = cards[i].2 == Some(true);
+        let in_list = cards[i].3;
         match r.host_id {
             // One of the signed-in fleet's computers: no password needed.
             Some(id) if in_list => out.push(Request::Connect(id, r.label)),
@@ -836,12 +877,13 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
 
 const CARD_W: f32 = 210.0;
 
-/// Cards (ID, name, online?) in even rows; returns the index of the one clicked.
+/// Cards (ID, name, online?) in even rows; returns the index of the one clicked and how.
 fn card_grid(
     ui: &mut egui::Ui,
     cards: &[(String, Option<String>, Option<bool>)],
     enabled: bool,
-) -> Option<usize> {
+    removable: bool,
+) -> Option<(usize, CardClick)> {
     let per_row = ((ui.available_width() + 12.0) / (CARD_W + 12.0 + 26.0))
         .floor()
         .max(1.0) as usize;
@@ -851,8 +893,10 @@ fn card_grid(
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
             for (i, (code, label, online)) in row.iter().enumerate() {
-                if computer_card(ui, code, label.as_deref(), *online, enabled) {
-                    clicked = Some(r * per_row + i);
+                if let Some(c) =
+                    computer_card(ui, code, label.as_deref(), *online, enabled, removable)
+                {
+                    clicked = Some((r * per_row + i, c));
                 }
             }
         });

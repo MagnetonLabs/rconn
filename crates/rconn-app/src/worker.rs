@@ -116,6 +116,10 @@ pub fn spawn(shared: Shared, ctx: egui::Context, paths: Paths) -> mpsc::Unbounde
                                 let w = w.clone();
                                 tokio::spawn(async move { w.fetch_computers(false).await; });
                             }
+                            if n.is_multiple_of(3) {
+                                let w = w.clone();
+                                tokio::spawn(async move { w.fetch_presence().await });
+                            }
                             n += 1;
                         }
                     }
@@ -227,6 +231,37 @@ impl Worker {
         }
     }
 
+    /// Ask the server which recent computers are online (no account needed).
+    async fn fetch_presence(&self) {
+        let ids: Vec<String> = self.home(|h| {
+            h.profile
+                .recent
+                .iter()
+                .map(|r| r.code().replace(' ', ""))
+                .filter(|c| c.len() == 9 && c.bytes().all(|b| b.is_ascii_digit()))
+                .take(rconn_core::protocol::MAX_PRESENCE_IDS)
+                .collect()
+        });
+        if ids.is_empty() {
+            return;
+        }
+        let (server, trust, _) = self.server();
+        let presence = match SignalingClient::presence(&server, &trust, ids.clone()).await {
+            Ok(online) => ids
+                .into_iter()
+                .map(|id| {
+                    let up = online.contains(&id);
+                    (id, up)
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!("presence: {e:#}");
+                Default::default()
+            }
+        };
+        self.home(|h| h.presence = presence);
+    }
+
     async fn handle(&self, req: Request) {
         match req {
             Request::SignIn { username, password } => {
@@ -320,6 +355,10 @@ impl Worker {
                 });
                 self.connect_guest(id, password.0).await
             }
+            Request::ForgetRecent(code) => self.home(|h| {
+                h.profile.recent.retain(|r| r.code() != code);
+                let _ = h.profile.save(&self.paths.config);
+            }),
             Request::SetAccessPassword(p) => self.set_access_password(Some(p.0)).await,
             Request::ClearAccessPassword => self.set_access_password(None).await,
             Request::SaveServer {
@@ -330,6 +369,7 @@ impl Worker {
                     h.profile.server = server;
                     h.profile.fingerprint = fingerprint;
                     h.computers = None;
+                    h.presence.clear();
                     let _ = h.profile.save(&self.paths.config);
                 });
                 let signed_in = self.token().is_some();

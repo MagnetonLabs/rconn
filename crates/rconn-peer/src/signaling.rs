@@ -183,6 +183,25 @@ impl SignalingClient {
         }
     }
 
+    /// Which of these 9-digit IDs are online (no account needed). An older server that
+    /// doesn't know the question answers with an error.
+    pub async fn presence(url: &str, trust: &ServerTrust, ids: Vec<String>) -> Result<Vec<String>> {
+        let mut ws = open(url, trust).await?;
+        send_on(
+            &mut ws,
+            &ClientMessage::Presence {
+                protocol_version: PROTOCOL_VERSION,
+                ids,
+            },
+        )
+        .await?;
+        match recv_on(&mut ws).await? {
+            ServerMessage::Presence { online } => Ok(online),
+            ServerMessage::Error { message, .. } => bail!("{message}"),
+            other => bail!("unexpected answer to presence: {other:?}"),
+        }
+    }
+
     /// The org's online computers (needs an operator token).
     pub async fn list_hosts(
         url: &str,

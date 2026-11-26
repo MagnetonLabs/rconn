@@ -74,11 +74,16 @@ struct Registry {
     sessions: HashMap<SessionId, SessionEntry>,
     /// Recent access-password requests per computer (rate limit).
     guest_requests: HashMap<HostId, Vec<std::time::Instant>>,
+    /// Recent presence questions per source address (rate limit).
+    presence_requests: HashMap<Option<IpAddr>, Vec<std::time::Instant>>,
 }
 
 /// Access-password requests allowed per computer per minute. Each one is a live guess the
 /// host checks (and locks out after repeated failures); this caps the attempt rate early.
 pub const GUEST_REQUESTS_PER_MINUTE: usize = 10;
+
+/// Presence questions allowed per source address per minute (apps ask about every 15 s).
+pub const PRESENCE_REQUESTS_PER_MINUTE: usize = 12;
 
 struct SessionEntry {
     host: HostIdentity,
@@ -598,6 +603,18 @@ async fn step(
             guest_hello(state, tx, &host).await
         }
         (
+            Phase::New,
+            ClientMessage::Presence {
+                protocol_version,
+                ids,
+            },
+        ) => {
+            if check_version(tx, protocol_version) {
+                presence(state, tx, source, ids).await;
+            }
+            Next::Close(Phase::New)
+        }
+        (
             Phase::Ready(Peer::Guest { op, host_id }),
             ClientMessage::RequestSession { host_id: h },
         ) => {
@@ -706,6 +723,44 @@ async fn guest_hello(state: &AppState, tx: &Outbox, typed: &str) -> Next {
         op,
         host_id: host.host_id,
     }))
+}
+
+/// Which of `ids` are online. An ID counts only when exactly one online computer has it
+/// (as for [`guest_hello`]); unknown and offline answer the same.
+async fn presence(state: &AppState, tx: &Outbox, source: Option<IpAddr>, ids: Vec<String>) {
+    if ids.len() > rconn_core::protocol::MAX_PRESENCE_IDS {
+        return send_err(tx, ErrorCode::BadRequest, "too many IDs".into());
+    }
+    let mut reg = state.inner.registry.lock().await;
+    let now = std::time::Instant::now();
+    let fresh = |t: &std::time::Instant| now.duration_since(*t) < Duration::from_secs(60);
+    if reg.presence_requests.len() > 10_000 {
+        reg.presence_requests.retain(|_, v| v.iter().any(fresh));
+    }
+    let recent = reg.presence_requests.entry(source).or_default();
+    recent.retain(fresh);
+    if recent.len() >= PRESENCE_REQUESTS_PER_MINUTE {
+        drop(reg);
+        return send_err(
+            tx,
+            ErrorCode::BadRequest,
+            "too many questions; try again in a minute".into(),
+        );
+    }
+    recent.push(now);
+    let online = ids
+        .into_iter()
+        .filter(|typed| {
+            reg.hosts
+                .values()
+                .filter(|h| h.identity.host_id.matches(typed))
+                .take(2)
+                .count()
+                == 1
+        })
+        .collect();
+    drop(reg);
+    let _ = tx.send(ServerMessage::Presence { online });
 }
 
 /// A computer without an account asks for an ID.

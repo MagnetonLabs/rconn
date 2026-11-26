@@ -641,3 +641,53 @@ async fn guest_ids_are_not_probeable_and_attempts_are_rate_limited() {
         "over the limit: {first:?}"
     );
 }
+
+async fn ask_presence(url: &str, ids: Vec<String>) -> Option<ServerMessage> {
+    let (mut ws, _) = connect_async(url).await.unwrap();
+    send(
+        &mut ws,
+        &ClientMessage::Presence {
+            protocol_version: PROTOCOL_VERSION,
+            ids,
+        },
+    )
+    .await;
+    recv(&mut ws).await
+}
+
+#[tokio::test]
+async fn anyone_can_ask_which_ids_are_online_within_a_rate_limit() {
+    let (url, _state) = start().await;
+    let (host, host_id) = connect_host(&url).await;
+    let code = host_id.short_code().replace(' ', "");
+
+    assert_eq!(
+        ask_presence(&url, vec![code.clone(), "000000000".into()]).await,
+        Some(ServerMessage::Presence {
+            online: vec![code.clone()]
+        })
+    );
+    // Offline once the host leaves.
+    drop(host);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        ask_presence(&url, vec![code.clone()]).await,
+        Some(ServerMessage::Presence { online: vec![] })
+    );
+    // Too many IDs at once, then too many questions.
+    let many = vec![code.clone(); rconn_core::protocol::MAX_PRESENCE_IDS + 1];
+    assert!(matches!(
+        ask_presence(&url, many).await,
+        Some(ServerMessage::Error { .. })
+    ));
+    for _ in 2..rconn_signaling::PRESENCE_REQUESTS_PER_MINUTE {
+        assert!(matches!(
+            ask_presence(&url, vec![code.clone()]).await,
+            Some(ServerMessage::Presence { .. })
+        ));
+    }
+    assert!(matches!(
+        ask_presence(&url, vec![code]).await,
+        Some(ServerMessage::Error { .. })
+    ));
+}

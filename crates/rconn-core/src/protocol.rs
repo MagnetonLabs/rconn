@@ -111,7 +111,18 @@ pub enum ClientMessage {
     /// [`ServerMessage::GuestHost`]; the password itself is checked by the host, later, on
     /// the session's encrypted data channel (see [`crate::guest`]).
     GuestHello { protocol_version: u16, host: String },
+    /// Which of these 9-digit IDs are online right now (no account; like the status lights in
+    /// AnyDesk's recent list). Answered with [`ServerMessage::Presence`], then the socket
+    /// closes. Unknown and offline IDs look the same, and nothing else about a computer is
+    /// revealed. At most [`MAX_PRESENCE_IDS`] IDs per question.
+    Presence {
+        protocol_version: u16,
+        ids: Vec<String>,
+    },
 }
+
+/// IDs per [`ClientMessage::Presence`] question.
+pub const MAX_PRESENCE_IDS: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Signaling: server -> client
@@ -146,6 +157,10 @@ pub enum ServerMessage {
     /// a session with it (and only with it).
     GuestHost {
         host_id: HostId,
+    },
+    /// Answer to `Presence`: the asked IDs (as sent) that are online.
+    Presence {
+        online: Vec<String>,
     },
     /// Answer to `GetLoginOptions`.
     LoginOptions {
