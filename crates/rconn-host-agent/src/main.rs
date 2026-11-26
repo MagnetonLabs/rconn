@@ -42,14 +42,18 @@ struct Cli {
     /// Check that input injection reaches the active desktop, then exit.
     #[arg(long, exclusive = true)]
     selftest_input: bool,
+    /// Fit the screen to WxH as a viewer window would, check that capture follows, put
+    /// it back, then exit. With --state-dir, the portal restore token there is used.
+    #[arg(long, value_name = "WxH", conflicts_with = "selftest_input")]
+    selftest_fit: Option<String>,
     /// Signaling WebSocket URL, e.g. wss://rconn.example.com/v1/ws
-    #[arg(long, env = "RCONN_SERVER", required_unless_present = "selftest_input")]
+    #[arg(long, env = "RCONN_SERVER", required_unless_present_any = ["selftest_input", "selftest_fit"])]
     server: Option<String>,
     /// Server identity this host was enrolled for (bound into the auth proof).
     #[arg(
         long,
         env = "RCONN_SERVER_ID",
-        required_unless_present = "selftest_input"
+        required_unless_present_any = ["selftest_input", "selftest_fit"]
     )]
     server_id: Option<String>,
     /// Pinned server key (`sha256:...` from `rconn-signaling init`). Omit for servers
@@ -65,7 +69,7 @@ struct Cli {
     #[arg(
         long,
         env = "RCONN_IDENTITY_DIR",
-        required_unless_present = "selftest_input"
+        required_unless_present_any = ["selftest_input", "selftest_fit"]
     )]
     identity: Option<PathBuf>,
     /// Cisco openh264 library. Default: next to this executable.
@@ -156,6 +160,21 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.selftest_input {
         println!("{}", input::selftest()?);
+        return Ok(());
+    }
+    if let Some(size) = &cli.selftest_fit {
+        let (w, h) = size
+            .split_once('x')
+            .context("--selftest-fit must look like 1600x1000")?;
+        let want = (w.parse()?, h.parse()?);
+        println!(
+            "{}",
+            tokio::task::spawn_blocking({
+                let dir = cli.state_dir.clone();
+                move || display::selftest(want, dir.as_deref())
+            })
+            .await??
+        );
         return Ok(());
     }
     let (server, server_id, identity) = (

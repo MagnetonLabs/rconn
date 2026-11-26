@@ -247,32 +247,42 @@ fn main_display(content: &SCShareableContent) -> Option<Retained<SCDisplay>> {
     }
 }
 
-/// Native pixel size of `display`: the backing size of its current mode (2x points on a
-/// Retina panel), falling back to its size in points.
+/// The backing size of display `id`'s current mode (2x points on a Retina panel).
+fn mode_pixels(id: u32) -> Option<(usize, usize)> {
+    let mode = CGDisplayCopyDisplayMode(id);
+    let (w, h) = (
+        CGDisplayMode::pixel_width(mode.as_deref()),
+        CGDisplayMode::pixel_height(mode.as_deref()),
+    );
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// Native pixel size of `display`, falling back to its size in points.
 fn pixel_size(display: &SCDisplay) -> (usize, usize) {
-    // SAFETY: property reads on a valid SCDisplay; the display mode is a retained copy.
+    // SAFETY: property reads on a valid SCDisplay.
     unsafe {
-        let mode = CGDisplayCopyDisplayMode(display.displayID());
-        let (w, h) = (
-            CGDisplayMode::pixel_width(mode.as_deref()),
-            CGDisplayMode::pixel_height(mode.as_deref()),
-        );
-        if w > 0 && h > 0 {
-            (w, h)
-        } else {
+        mode_pixels(display.displayID()).unwrap_or_else(|| {
             (
                 usize::try_from(display.width()).unwrap_or(0),
                 usize::try_from(display.height()).unwrap_or(0),
             )
-        }
+        })
     }
 }
+
+/// How often to look for a display mode change (the host fitting the screen to the
+/// viewer, or someone changing the resolution here).
+const MODE_CHECK: Duration = Duration::from_millis(250);
 
 pub struct MacCapturer {
     stream: Retained<SCStream>,
     output: Retained<StreamOutput>,
     _queue: DispatchRetained<DispatchQueue>,
     shared: Arc<Shared>,
+    config: Retained<SCStreamConfiguration>,
+    display: u32,
+    size: (usize, usize),
+    checked: Instant,
 }
 
 // SCStream may be driven from any thread (its callbacks arrive on our dispatch queue);
@@ -295,7 +305,7 @@ impl MacCapturer {
 
         // SAFETY: Objective-C calls on freshly created, valid objects with the argument
         // types the bindings declare. CMTime is built field by field (1/60 s, valid).
-        let stream = unsafe {
+        let (stream, config) = unsafe {
             let filter = SCContentFilter::initWithDisplay_excludingWindows(
                 SCContentFilter::alloc(),
                 &display,
@@ -325,7 +335,7 @@ impl MacCapturer {
                     Some(&queue),
                 )
                 .map_err(|e| sck_error("SCStream addStreamOutput", describe(&e)))?;
-            stream
+            (stream, config)
         };
 
         // SAFETY: the handler matches the declared block signature.
@@ -338,12 +348,48 @@ impl MacCapturer {
             output,
             _queue: queue,
             shared,
+            config,
+            // SAFETY: property read on a valid SCDisplay.
+            display: unsafe { display.displayID() },
+            size: (width, height),
+            checked: Instant::now(),
         })
+    }
+
+    /// After a display mode change, stream at the new size (ScreenCaptureKit would
+    /// otherwise keep scaling the screen to the old one).
+    fn follow_mode_change(&mut self) -> Result<(), CaptureError> {
+        if self.checked.elapsed() < MODE_CHECK {
+            return Ok(());
+        }
+        self.checked = Instant::now();
+        let Some(size) = mode_pixels(self.display).filter(|&s| s != self.size) else {
+            return Ok(());
+        };
+        tracing::info!(
+            width = size.0,
+            height = size.1,
+            "display size changed; capturing at the new size"
+        );
+        // SAFETY: setters on our configuration, then an update of our running stream with
+        // a handler of the declared block signature.
+        unsafe {
+            self.config.setWidth(size.0);
+            self.config.setHeight(size.1);
+        }
+        wait_completion(|h| unsafe {
+            self.stream
+                .updateConfiguration_completionHandler(&self.config, Some(h))
+        })
+        .map_err(|e| CaptureError::Backend(format!("SCStream updateConfiguration: {e}")))?;
+        self.size = size;
+        Ok(())
     }
 }
 
 impl Capturer for MacCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        self.follow_mode_change()?;
         let deadline = Instant::now() + timeout;
         let mut slot = self.shared.lock();
         loop {
