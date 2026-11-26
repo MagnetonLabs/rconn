@@ -5750,7 +5750,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-app"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "directories",
@@ -5776,7 +5776,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argon2",
  "ed25519-dalek",
@@ -5799,7 +5799,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-host-agent"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5825,7 +5825,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-host-service"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -5838,7 +5838,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-host-settings"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "eframe",
  "egui",
@@ -5849,7 +5849,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-media"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -5878,7 +5878,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-mobile"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -5897,7 +5897,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-peer"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5926,7 +5926,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-signaling"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5960,7 +5960,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-viewer"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "arboard",
