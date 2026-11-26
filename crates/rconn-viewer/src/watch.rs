@@ -40,7 +40,7 @@ pub async fn run(
     let mut session = open_viewer_session(sig, host, opts).await?;
     let mut exchange = guest
         .as_ref()
-        .map(|g| crate::access::Exchange::new(g.password.clone(), session.session_id));
+        .map(|g| rconn_peer::guest::Exchange::new(g.password.clone(), session.session_id));
     let (refused_tx, mut refused_rx) = tokio::sync::oneshot::channel::<String>();
     let mut refused_tx = Some(refused_tx);
 
@@ -91,16 +91,16 @@ pub async fn run(
                             (DataMessage::decode(&m.data), exchange.as_mut())
                         {
                             match ex.handle(g).await {
-                                crate::access::Step::Send(reply) => {
+                                rconn_peer::guest::Step::Send(reply) => {
                                     if let Ok(b) = reply.encode() {
                                         let _ = dc.send(BytesMut::from(&b[..])).await;
                                     }
                                 }
-                                crate::access::Step::Accepted => {
+                                rconn_peer::guest::Step::Accepted => {
                                     println!("access password accepted");
                                     send_kf(dc.clone()).await;
                                 }
-                                crate::access::Step::Refused(why) => {
+                                rconn_peer::guest::Step::Refused(why) => {
                                     if let Some(tx) = refused_tx.take() {
                                         let _ = tx.send(why);
                                     }

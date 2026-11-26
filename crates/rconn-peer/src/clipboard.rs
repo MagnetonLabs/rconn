@@ -12,11 +12,13 @@ use tokio::sync::mpsc as tmpsc;
 /// How often the local clipboard is checked for changes.
 pub const POLL: Duration = Duration::from_millis(300);
 
+#[cfg(feature = "clipboard")]
 pub struct ClipboardSync {
     to_os: mpsc::Sender<String>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(feature = "clipboard")]
 impl ClipboardSync {
     /// Start syncing. Local changes arrive on the returned receiver, to send to the peer.
     pub fn start() -> (Self, tmpsc::UnboundedReceiver<String>) {
@@ -41,6 +43,7 @@ impl ClipboardSync {
     }
 }
 
+#[cfg(feature = "clipboard")]
 impl Drop for ClipboardSync {
     fn drop(&mut self) {
         let (dead, _) = mpsc::channel();
@@ -57,6 +60,7 @@ pub trait ClipBackend {
     fn set_text(&mut self, text: String) -> bool;
 }
 
+#[cfg(feature = "clipboard")]
 impl ClipBackend for arboard::Clipboard {
     fn get_text(&mut self) -> Option<String> {
         arboard::Clipboard::get_text(self).ok()
@@ -66,6 +70,7 @@ impl ClipBackend for arboard::Clipboard {
     }
 }
 
+#[cfg(feature = "clipboard")]
 fn run(from_peer: mpsc::Receiver<String>, to_peer: tmpsc::UnboundedSender<String>) {
     match arboard::Clipboard::new() {
         Ok(mut c) => sync_loop(&mut c, &from_peer, &to_peer),

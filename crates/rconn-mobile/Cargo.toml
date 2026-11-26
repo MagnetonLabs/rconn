@@ -1,0 +1,42 @@
+[package]
+name = "rconn-mobile"
+description = "Viewer core for the iOS app: a guest session (computer ID + access password) behind a uniffi interface; H.264 out, input in."
+license = "LicenseRef-Proprietary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+# staticlib: linked into the iOS app (ios/build-rust.sh). lib: tests and bindgen.
+crate-type = ["lib", "staticlib"]
+
+[[bin]]
+# Generates the Swift bindings from the built library (library mode).
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+rconn-core.workspace = true
+# The app owns the iOS clipboard (UIPasteboard), so no arboard.
+rconn-peer = { path = "../rconn-peer", default-features = false }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { version = "1.54.1", features = ["full"] }
+bytes = "1.12.2"
+webrtc = "=0.21.1"
+rtc = "=0.21.1"
+uniffi = "0.33.0"
+
+[dev-dependencies]
+axum = "0.8.9"
+rconn-media = { path = "../rconn-media" }
+rconn-signaling = { path = "../rconn-signaling" }
+
+[lints]
+workspace = true

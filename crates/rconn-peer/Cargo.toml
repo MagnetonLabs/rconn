@@ -21,7 +21,13 @@ uuid = { workspace = true, features = ["v4"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1.0.12"
 rtc = "=0.21.1"
-arboard = { version = "3.7.0", default-features = false }
+arboard = { version = "3.7.0", default-features = false, optional = true }
+
+[features]
+default = ["clipboard"]
+# The OS clipboard via arboard ([`clipboard::ClipboardSync`]). Off for iOS, whose app
+# reads the clipboard itself.
+clipboard = ["dep:arboard"]
 
 [lints]
 workspace = true

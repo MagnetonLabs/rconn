@@ -15,8 +15,16 @@ pub enum CodecError {
 
 /// Load Cisco's openh264 shared library from `path`. Fails if the file's SHA-256 is not
 /// a known Cisco build.
+#[cfg(not(target_os = "ios"))]
 pub fn load_openh264(path: &Path) -> Result<openh264::OpenH264API, CodecError> {
     openh264::OpenH264API::from_blob_path(path).map_err(|e| CodecError::OpenH264(e.to_string()))
+}
+
+/// iOS apps may not load downloaded code, so there is no openh264 there (VideoToolbox
+/// decodes; iOS is never a host).
+#[cfg(target_os = "ios")]
+pub fn load_openh264(_path: &Path) -> Result<openh264::OpenH264API, CodecError> {
+    Err(CodecError::OpenH264("not available on iOS".into()))
 }
 
 /// Opus encoder tuned for remote-desktop audio: 48 kHz stereo, lowest-delay mode.

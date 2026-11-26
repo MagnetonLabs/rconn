@@ -2,6 +2,7 @@
 //! capture and the encode loop arrive in phase 3.
 
 pub mod capture;
+#[cfg(not(target_os = "ios"))]
 pub mod cisco;
 pub mod codec;
 #[cfg(windows)]
@@ -11,6 +12,6 @@ mod opus_shim;
 #[cfg(target_os = "linux")]
 pub mod portal;
 pub mod video;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod vt;
 pub mod yuv;
