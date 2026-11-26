@@ -6,6 +6,8 @@ struct ConnectView: View {
     @State private var fingerprint = ""
     @State private var computerID = ""
     @State private var password = ""
+    /// "Remember this password" (the toggle starts as it was left).
+    @AppStorage("rememberPasswords") private var rememberPassword = false
     @State private var recents = Recents.load()
     @State private var session: SessionModel?
     @State private var lastError: String?
@@ -35,9 +37,13 @@ struct ConnectView: View {
                         .textContentType(.password)
                         .focused($focus, equals: .password)
                         .submitLabel(.go)
-                        .onSubmit(connect)
+                        .onSubmit { connect() }
                         .accessibilityIdentifier("password")
-                    Button(action: connect) {
+                    if !password.isEmpty {
+                        Toggle("Remember this password", isOn: $rememberPassword)
+                            .accessibilityIdentifier("rememberPassword")
+                    }
+                    Button { connect() } label: {
                         Text("Connect").frame(maxWidth: .infinity).bold()
                     }
                     .disabled(!canConnect)
@@ -74,7 +80,12 @@ struct ConnectView: View {
                                 server = r.server
                                 computerID = r.computerID
                                 fingerprint = Keychain.fingerprint(for: r.server) ?? ""
-                                focus = .password
+                                if r.passwordSaved == true,
+                                   let saved = SavedPasswords.password(server: r.server, computerID: r.computerID) {
+                                    connect(saved: saved)
+                                } else {
+                                    focus = .password
+                                }
                             } label: {
                                 HStack {
                                     VStack(alignment: .leading) {
@@ -83,6 +94,12 @@ struct ConnectView: View {
                                             .foregroundStyle(.secondary)
                                     }
                                     Spacer()
+                                    if r.passwordSaved == true {
+                                        Image(systemName: "key.fill")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .accessibilityLabel("Password remembered")
+                                    }
                                     if let online {
                                         let up = online.contains(r.id)
                                         Label(up ? "online" : "offline", systemImage: "circle.fill")
@@ -96,6 +113,10 @@ struct ConnectView: View {
                                     Recents.remove(r)
                                     recents = Recents.load()
                                 }
+                                if r.passwordSaved == true {
+                                    Button("Forget password") { forgetPassword(r) }
+                                        .tint(.orange)
+                                }
                                 Button("Rename") {
                                     newName = r.name ?? ""
                                     renaming = r
@@ -106,6 +127,9 @@ struct ConnectView: View {
                                 Button("Rename", systemImage: "pencil") {
                                     newName = r.name ?? ""
                                     renaming = r
+                                }
+                                if r.passwordSaved == true {
+                                    Button("Forget password", systemImage: "key.slash") { forgetPassword(r) }
                                 }
                                 Button("Remove", systemImage: "trash", role: .destructive) {
                                     Recents.remove(r)
@@ -172,17 +196,49 @@ struct ConnectView: View {
         online = known ? up : nil
     }
 
-    private func connect() {
+    private func forgetPassword(_ r: RecentComputer) {
+        SavedPasswords.forget(server: r.server, computerID: r.computerID)
+        Recents.setPasswordSaved(server: r.server, computerID: r.computerID, false)
+        recents = Recents.load()
+    }
+
+    /// Connect with the typed password, or with `saved` (a remembered one).
+    private func connect(saved: String? = nil) {
         guard canConnect else { return }
         let url = server.trimmingCharacters(in: .whitespaces)
         let pin = fingerprint.trimmingCharacters(in: .whitespaces)
+        let id = computerID
+        let pw = saved ?? password
         Keychain.setFingerprint(pin.isEmpty ? nil : pin, for: url)
-        Recents.remember(server: url, computerID: computerID)
+        Recents.remember(server: url, computerID: id)
+        // Not ticked: nothing stays remembered for this computer.
+        if saved == nil && (!rememberPassword || pw.isEmpty) {
+            SavedPasswords.forget(server: url, computerID: id)
+            Recents.setPasswordSaved(server: url, computerID: id, false)
+        }
         recents = Recents.load()
         lastError = nil
         focus = nil
-        let model = SessionModel(server: url, fingerprint: pin.isEmpty ? nil : pin, computerID: computerID, password: password)
-        model.onHostName = { _ in recents = Recents.load() }
+        let model = SessionModel(server: url, fingerprint: pin.isEmpty ? nil : pin, computerID: id, password: pw)
+        let keep = saved == nil && rememberPassword && !pw.isEmpty
+        // The computer sends its name only once it has let us in: then the password worked.
+        model.onHostName = { _ in
+            if keep {
+                let ok = SavedPasswords.set(pw, server: url, computerID: id)
+                Recents.setPasswordSaved(server: url, computerID: id, ok)
+            }
+            recents = Recents.load()
+        }
+        if saved != nil {
+            model.onClosedReason = { reason in
+                guard reason.contains("wrong access password") else { return }
+                SavedPasswords.forget(server: url, computerID: id)
+                Recents.setPasswordSaved(server: url, computerID: id, false)
+                recents = Recents.load()
+                lastError = "The remembered password no longer works: type the current one."
+                focus = .password
+            }
+        }
         session = model
         password = ""
     }

@@ -17,6 +17,9 @@ pub struct Profile {
     /// turns them on), `Some(false)` once turned off here.
     #[serde(default)]
     pub incoming: Option<bool>,
+    /// "Remember the password" was ticked last time (the box starts that way).
+    #[serde(default)]
+    pub remember_passwords: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +35,10 @@ pub struct Recent {
     /// The name was typed here (Rename): the computer's own name doesn't replace it.
     #[serde(default)]
     pub renamed: bool,
+    /// Its access password is in the system's credential store ([`crate::saved`]): a click
+    /// connects without asking.
+    #[serde(default)]
+    pub password_saved: bool,
 }
 
 impl Recent {
@@ -90,7 +97,7 @@ impl Profile {
     }
 
     /// Move `host` to the front of the recent list.
-    pub fn remember(&mut self, host_id: HostId, label: Option<String>) {
+    pub fn remember(&mut self, host_id: HostId, label: Option<String>) -> Vec<String> {
         let code = host_id.short_code();
         let own = self
             .recent
@@ -106,18 +113,21 @@ impl Profile {
                 code,
                 renamed: own.is_some(),
                 label: own.or(label),
+                password_saved: false,
             },
         );
-        self.recent.truncate(MAX_RECENT);
+        self.trim()
     }
 
     /// Move a computer connected to by its typed ID to the front of the recent list.
-    pub fn remember_code(&mut self, typed: &str) {
+    pub fn remember_code(&mut self, typed: &str) -> Vec<String> {
         let code = tidy_code(typed);
         let old = self.recent.iter().position(|r| r.code() == code);
-        let (host_id, label, renamed) = old
+        let (host_id, label, renamed, password_saved) = old
             .map(|i| self.recent.remove(i))
-            .map_or((None, None, false), |r| (r.host_id, r.label, r.renamed));
+            .map_or((None, None, false, false), |r| {
+                (r.host_id, r.label, r.renamed, r.password_saved)
+            });
         self.recent.insert(
             0,
             Recent {
@@ -125,9 +135,28 @@ impl Profile {
                 code,
                 label,
                 renamed,
+                password_saved,
             },
         );
-        self.recent.truncate(MAX_RECENT);
+        self.trim()
+    }
+
+    /// Keep the list at [`MAX_RECENT`]; returns the IDs dropped whose passwords were
+    /// remembered (to forget them too).
+    fn trim(&mut self) -> Vec<String> {
+        let dropped = self.recent.split_off(self.recent.len().min(MAX_RECENT));
+        dropped
+            .into_iter()
+            .filter(|r| r.password_saved)
+            .map(|r| r.code())
+            .collect()
+    }
+
+    /// Note whether computer `code`'s password is remembered.
+    pub fn set_password_saved(&mut self, code: &str, saved: bool) {
+        for r in self.recent.iter_mut().filter(|r| r.code() == code) {
+            r.password_saved = saved;
+        }
     }
 
     /// Name a recent computer here; empty goes back to the computer's own name.

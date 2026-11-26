@@ -19,6 +19,7 @@ anyhow.workspace = true
 directories = "6"
 eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "clipboard"] }
 egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+keyring = "4"
 png = "0.18"
 rconn-core.workspace = true
 rconn-host-settings = { version = "0.1.0", path = "../rconn-host-settings" }

@@ -1,6 +1,6 @@
 //! Background worker: talks to the server and the local host so the window never blocks.
 
-use crate::home::{Home, Request, resolve};
+use crate::home::{Home, Request, Secret, resolve};
 use crate::profile::{self, SavedToken};
 use rconn_core::ids::HostId;
 use rconn_core::status::HostStatus;
@@ -358,21 +358,66 @@ impl Worker {
                 }
             }
             Request::Connect(id, label) => self.connect(id, label).await,
-            Request::ConnectGuest { id, password } => {
-                self.home(|h| {
-                    h.profile.remember_code(&id);
+            Request::ConnectGuest {
+                id,
+                password,
+                remember,
+            } => {
+                let dropped = self.home(|h| {
+                    h.profile.remember_passwords = remember;
+                    let d = h.profile.remember_code(&id);
                     let _ = h.profile.save(&self.paths.config);
+                    d
                 });
-                self.connect_guest(id, password.0).await
+                self.forget_passwords(&dropped);
+                let code = profile::tidy_code(&id);
+                if !remember {
+                    self.forget_password(&code);
+                }
+                let save = if remember {
+                    Saving::OnceLetIn
+                } else {
+                    Saving::No
+                };
+                self.connect_guest(id, password.0, save).await
+            }
+            Request::ConnectSaved(code) => {
+                let (server, _, _) = self.server();
+                match crate::saved::get(&server, &code) {
+                    Some(password) => {
+                        let dropped = self.home(|h| {
+                            let d = h.profile.remember_code(&code);
+                            let _ = h.profile.save(&self.paths.config);
+                            d
+                        });
+                        self.forget_passwords(&dropped);
+                        self.connect_guest(code, password, Saving::Used).await
+                    }
+                    // Gone from the store (or the store is unavailable): ask for it.
+                    None => self.home(|h| {
+                        h.profile.set_password_saved(&code, false);
+                        let _ = h.profile.save(&self.paths.config);
+                        h.connect_to = code;
+                        h.access_password.clear();
+                        h.focus_password = true;
+                    }),
+                }
+            }
+            Request::ForgetPassword(code) => {
+                self.forget_password(&code);
+                self.notice(format!("Forgot the password for {code}"), false);
             }
             Request::RenameRecent { code, label } => self.home(|h| {
                 h.profile.rename(&code, &label);
                 let _ = h.profile.save(&self.paths.config);
             }),
-            Request::ForgetRecent(code) => self.home(|h| {
-                h.profile.recent.retain(|r| r.code() != code);
-                let _ = h.profile.save(&self.paths.config);
-            }),
+            Request::ForgetRecent(code) => {
+                self.forget_password(&code);
+                self.home(|h| {
+                    h.profile.recent.retain(|r| r.code() != code);
+                    let _ = h.profile.save(&self.paths.config);
+                })
+            }
             Request::SetAccessPassword(p) => self.set_access_password(Some(p.0)).await,
             Request::ClearAccessPassword => self.set_access_password(None).await,
             Request::SaveServer {
@@ -584,9 +629,27 @@ impl Worker {
         }
     }
 
+    /// Forget computer `code`'s remembered password (store and recent list).
+    fn forget_password(&self, code: &str) {
+        let (server, _, _) = self.server();
+        crate::saved::forget(&server, code);
+        self.home(|h| {
+            h.profile.set_password_saved(code, false);
+            let _ = h.profile.save(&self.paths.config);
+        });
+    }
+
+    /// Recent computers that fell off the list: their passwords go too.
+    fn forget_passwords(&self, codes: &[String]) {
+        let (server, _, _) = self.server();
+        for code in codes {
+            crate::saved::forget(&server, code);
+        }
+    }
+
     /// Open a session window for the computer with ID `typed`, using its access password
     /// (no account). The password goes to the viewer in its environment, never argv.
-    async fn connect_guest(&self, typed: String, password: String) {
+    async fn connect_guest(&self, typed: String, password: String, save: Saving) {
         self.home(|h| h.busy = Some(format!("Connecting to {typed}…")));
         let (server, _, fp) = self.server();
         let log = self.paths.config.join("viewer.log");
@@ -597,16 +660,63 @@ impl Worker {
             .config
             .join(format!("name-{}.txt", code.replace(' ', "")));
         let _ = std::fs::remove_file(&name_file);
+        // ...and how the access password went here.
+        let report = name_file.with_file_name(format!("login-{}.txt", code.replace(' ', "")));
+        let _ = std::fs::remove_file(&report);
         let child =
             viewer_cmd(&self.paths.viewer_exe, &server, fp.as_deref(), &log).and_then(|mut c| {
                 c.env("RCONN_ACCESS_PASSWORD", &password)
                     .env("RCONN_NAME_FILE", &name_file)
+                    .env("RCONN_REPORT_FILE", &report)
                     .args(["connect", &typed]);
                 c.spawn()
                     .map_err(|e| format!("{}: {e}", self.paths.viewer_exe.display()))
             });
-        self.wait_session(child, typed, Some((code, name_file)))
-            .await;
+        let guest = Guest {
+            code,
+            name_file,
+            report,
+            password: (!password.is_empty()).then_some(Secret(password)),
+            save,
+        };
+        self.wait_session(child, typed, Some(guest)).await;
+    }
+
+    /// The viewer reported how the access password went (see [`Guest`]).
+    fn login_reported(&self, guest: &mut Guest, text: &str) {
+        let (server, _, _) = self.server();
+        if text.trim() == "admitted" {
+            if guest.save == Saving::OnceLetIn
+                && let Some(p) = &guest.password
+            {
+                let ok = crate::saved::set(&server, &guest.code, &p.0);
+                self.home(|h| {
+                    h.profile.set_password_saved(&guest.code, ok);
+                    let _ = h.profile.save(&self.paths.config);
+                });
+                if !ok {
+                    self.notice("Couldn't remember the password on this computer", true);
+                }
+            }
+        } else if text.contains("wrong access password") && guest.save == Saving::Used {
+            // The remembered password no longer works: forget it, ask for the new one.
+            self.forget_password(&guest.code);
+            let code = guest.code.clone();
+            self.home(|h| {
+                h.connect_to = code;
+                h.access_password.clear();
+                h.focus_password = true;
+            });
+            self.notice(
+                format!(
+                    "The remembered password for {} no longer works: type the current one",
+                    guest.code
+                ),
+                true,
+            );
+        }
+        guest.password = None; // not kept longer than needed
+        guest.save = Saving::No;
     }
 
     /// Open a session window (`rconn-viewer connect`) for `id`.
@@ -617,7 +727,10 @@ impl Worker {
         let name = label.clone().unwrap_or_else(|| id.short_code());
         self.home(|h| {
             h.busy = Some(format!("Connecting to {name}…"));
-            h.profile.remember(id, label.clone());
+            let dropped = h.profile.remember(id, label.clone());
+            for code in dropped {
+                crate::saved::forget(h.profile.server_url(), &code);
+            }
             let _ = h.profile.save(&self.paths.config);
         });
         let (server, _, fp) = self.server();
@@ -637,7 +750,7 @@ impl Worker {
         &self,
         child: Result<std::process::Child, String>,
         name: String,
-        mut name_file: Option<(String, std::path::PathBuf)>,
+        mut guest: Option<Guest>,
     ) {
         let mut child = match child {
             Ok(c) => c,
@@ -650,15 +763,20 @@ impl Worker {
         }
         let status = loop {
             let done = child.try_wait();
-            if let Some((code, path)) = &name_file
-                && let Ok(learned) = std::fs::read_to_string(path)
-            {
-                let _ = std::fs::remove_file(path);
-                self.home(|h| {
-                    h.profile.learn_name(code, &learned);
-                    let _ = h.profile.save(&self.paths.config);
-                });
-                name_file = None;
+            if let Some(g) = guest.as_mut() {
+                if let Ok(learned) = std::fs::read_to_string(&g.name_file) {
+                    let _ = std::fs::remove_file(&g.name_file);
+                    self.home(|h| {
+                        h.profile.learn_name(&g.code, &learned);
+                        let _ = h.profile.save(&self.paths.config);
+                    });
+                }
+                if let Ok(text) = std::fs::read_to_string(&g.report)
+                    && !text.is_empty()
+                {
+                    let _ = std::fs::remove_file(&g.report);
+                    self.login_reported(g, &text);
+                }
             }
             match done {
                 Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
@@ -666,8 +784,9 @@ impl Worker {
                 Err(e) => break Err(e),
             }
         };
-        if let Some((_, path)) = &name_file {
-            let _ = std::fs::remove_file(path);
+        if let Some(g) = &guest {
+            let _ = std::fs::remove_file(&g.name_file);
+            let _ = std::fs::remove_file(&g.report);
         }
         if let Ok(mut v) = SESSIONS.lock() {
             v.retain(|p| *p != pid);
@@ -684,6 +803,27 @@ impl Worker {
             );
         }
     }
+}
+
+/// What happens to an access password once the computer answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Saving {
+    No,
+    /// "Remember this password" was ticked: store it once the computer lets us in.
+    OnceLetIn,
+    /// It came from the store: forget it if the computer calls it wrong.
+    Used,
+}
+
+/// A connection by ID and access password, watched for the viewer's reports.
+struct Guest {
+    code: String,
+    /// The computer's name, once let in.
+    name_file: std::path::PathBuf,
+    /// `admitted` or `refused: <why>`.
+    report: std::path::PathBuf,
+    password: Option<Secret>,
+    save: Saving,
 }
 
 /// `rconn-viewer --server .. [--fingerprint ..]`, output to `log`, no console window.
