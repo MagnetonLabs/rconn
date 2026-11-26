@@ -181,6 +181,10 @@ pub struct VideoEncoder {
     last: FrameInfo,
     /// A loss was reported after this frame: repair at the next encode.
     repair: Option<u32>,
+    /// The next frame is a refinement pass at this quantizer ([`Self::refine_next`]).
+    refine: Option<u8>,
+    /// The frame being finished was encoded as a refinement pass.
+    refining: bool,
     /// Frames since the last long-term mark (Media Foundation).
     #[cfg_attr(not(windows), allow(dead_code))]
     since_mark: u32,
@@ -231,6 +235,8 @@ impl VideoEncoder {
             next_id: 0,
             last: FrameInfo::default(),
             repair: None,
+            refine: None,
+            refining: false,
             since_mark: 0,
             #[cfg(windows)]
             gpu: None,
@@ -405,6 +411,29 @@ impl VideoEncoder {
         }
     }
 
+    /// Make the next frame a refinement pass over a picture that has stopped changing:
+    /// a P-frame (never a keyframe) coded no coarser than quantizer `qp`, so the
+    /// viewer's copy of a still screen sharpens towards the original ("build to
+    /// lossless"). Ignored if the next frame must be a keyframe or a loss repair, or if
+    /// the engine can't ([`Self::can_refine`]).
+    pub fn refine_next(&mut self, qp: u8) {
+        self.refine = Some(qp.min(51));
+    }
+
+    /// Can the current engine code a frame at a chosen quantizer ([`Self::refine_next`])?
+    /// openh264 can once started (fixed-QP frames); Media Foundation and VideoToolbox
+    /// where their encoder takes a live maximum-QP setting.
+    pub fn can_refine(&self) -> bool {
+        match &self.encoder {
+            Some(Engine::OpenH264(o)) => o.started,
+            #[cfg(windows)]
+            Some(Engine::MediaFoundation(mf)) => mf.can_refine(),
+            #[cfg(target_os = "macos")]
+            Some(Engine::VideoToolbox(vt)) => vt.can_refine(),
+            None => false,
+        }
+    }
+
     /// Frame ids continue from `id` (a new encoder within the same stream).
     pub fn start_frame_ids_at(&mut self, id: u32) {
         self.next_id = id;
@@ -463,8 +492,9 @@ impl VideoEncoder {
         }
     }
 
-    /// Start a frame: the live bitrate, a pending loss repair, a keyframe asked for.
-    fn begin_frame(&mut self) -> (bool, Repair) {
+    /// Start a frame: the live bitrate, a pending loss repair, a keyframe asked for, and
+    /// the quantizer of a refinement pass (none on a keyframe or a repair).
+    fn begin_frame(&mut self) -> (bool, Repair, Option<u8>) {
         self.apply_bitrate();
         let mut repair = Repair {
             asked: self.repair.take(),
@@ -476,7 +506,13 @@ impl VideoEncoder {
                 self.force_key = true; // nothing to repair from
             }
         }
-        (std::mem::take(&mut self.force_key), repair)
+        let key = std::mem::take(&mut self.force_key);
+        let refine = self
+            .refine
+            .take()
+            .filter(|_| !key && repair.asked.is_none() && self.can_refine());
+        self.refining = refine.is_some();
+        (key, repair, refine)
     }
 
     /// Encode one frame into an Annex-B access unit. `None` means the rate controller
@@ -512,21 +548,34 @@ impl VideoEncoder {
         let (w, h) = yuv.dimensions();
         self.ensure_engine(w, h)?;
         #[cfg_attr(not(windows), allow(unused_mut))]
-        let (force_key, mut repair) = self.begin_frame();
+        let (force_key, mut repair, refine) = self.begin_frame();
         let out = match self.encoder.as_mut().expect("built above") {
             Engine::OpenH264(o) => {
                 if force_key {
                     o.encoder.force_intra_frame();
                 }
-                let bits = o
-                    .encoder
-                    .encode(yuv)
-                    .map_err(|e| CodecError::OpenH264(e.to_string()))?;
-                self.last_was_key = matches!(
-                    bits.frame_type(),
-                    openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
-                );
-                let out = bits.to_vec();
+                let fixed = refine.is_some_and(|qp| crate::oh264::fixed_qp(&mut o.encoder, qp));
+                let mut encode = || {
+                    o.encoder.encode(yuv).map(|bits| {
+                        let key = matches!(
+                            bits.frame_type(),
+                            openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
+                        );
+                        (key, bits.to_vec())
+                    })
+                };
+                let mut bits = encode();
+                if fixed && bits.as_ref().is_ok_and(|(_, out)| out.is_empty()) {
+                    // A skip the rate controller decided after the previous frame still
+                    // applies to this one (and is then cleared): the pass goes once more.
+                    bits = encode();
+                }
+                if fixed && !crate::oh264::rate_controlled(&mut o.encoder) {
+                    tracing::warn!("openh264 refused to resume rate control");
+                }
+                self.refining = fixed;
+                let (key, out) = bits.map_err(|e| CodecError::OpenH264(e.to_string()))?;
+                self.last_was_key = key;
                 if !o.started {
                     o.started = true;
                     // Changed before the first frame, the rate would have been lost.
@@ -544,13 +593,20 @@ impl VideoEncoder {
                 }
                 mf_mark(mf, &self.ledger, self.since_mark, force_key, &mut repair);
                 yuv.write_nv12(&mut self.nv12, changed_rows);
-                let out = mf.encode(&self.nv12)?;
+                self.refining = refine.is_some_and(|qp| mf.set_max_qp(qp));
+                let out = mf.encode(&self.nv12);
+                if self.refining {
+                    mf.set_max_qp(crate::mf::MAX_QP);
+                }
+                let out = out?;
                 self.last_was_key = has_idr(&out);
                 mf_report(mf, &mut repair);
                 out
             }
             #[cfg(target_os = "macos")]
-            Engine::VideoToolbox(vt) => match vt.encode_i420(yuv, changed_rows, force_key) {
+            Engine::VideoToolbox(vt) => match vt_refined(vt, refine, &mut self.refining, |vt| {
+                vt.encode_i420(yuv, changed_rows, force_key)
+            }) {
                 Ok(au) => self.vt_output(au),
                 Err(e) => {
                     // A new session (or openh264) gets the whole picture again.
@@ -594,11 +650,13 @@ impl VideoEncoder {
                 self.ensure_engine(w, h)?;
             }
             if matches!(self.encoder, Some(Engine::VideoToolbox(_))) {
-                let (force_key, repair) = self.begin_frame();
+                let (force_key, repair, refine) = self.begin_frame();
                 let Some(Engine::VideoToolbox(vt)) = self.encoder.as_mut() else {
                     unreachable!("checked above");
                 };
-                return match vt.encode_surface(surface, force_key) {
+                return match vt_refined(vt, refine, &mut self.refining, |vt| {
+                    vt.encode_surface(surface, force_key)
+                }) {
                     Ok(au) => {
                         let out = self.vt_output(au);
                         Ok(self.finish(out, force_key, repair))
@@ -648,14 +706,19 @@ impl VideoEncoder {
             self.spare = None;
         }
         self.ensure_engine(w, h)?;
-        let (force_key, mut repair) = self.begin_frame();
+        let (force_key, mut repair, refine) = self.begin_frame();
         let out = match self.encoder.as_mut().expect("built above") {
             Engine::MediaFoundation(mf) => {
                 if force_key {
                     mf.force_keyframe();
                 }
                 mf_mark(mf, &self.ledger, self.since_mark, force_key, &mut repair);
-                let out = mf.encode_frame(&surface.frame)?;
+                self.refining = refine.is_some_and(|qp| mf.set_max_qp(qp));
+                let out = mf.encode_frame(&surface.frame);
+                if self.refining {
+                    mf.set_max_qp(crate::mf::MAX_QP);
+                }
+                let out = out?;
                 mf_report(mf, &mut repair);
                 out
             }
@@ -806,6 +869,8 @@ impl VideoEncoder {
             id,
             key,
             recovers_from,
+            qp: slice.and_then(|s| s.qp),
+            refine: self.refining && !key,
         };
     }
 
@@ -822,6 +887,23 @@ impl VideoEncoder {
     pub fn last_was_key(&self) -> bool {
         self.last_was_key
     }
+}
+
+/// Run a VideoToolbox encode, as a refinement pass at quantizer `refine` if given (and
+/// the session takes the cap; `refining` says whether it did). The cap is lifted after.
+#[cfg(target_os = "macos")]
+fn vt_refined<T>(
+    vt: &mut crate::vt_encode::VtEncoder,
+    refine: Option<u8>,
+    refining: &mut bool,
+    encode: impl FnOnce(&mut crate::vt_encode::VtEncoder) -> T,
+) -> T {
+    *refining = refine.is_some_and(|qp| vt.set_max_qp(Some(qp)));
+    let out = encode(vt);
+    if *refining {
+        vt.set_max_qp(None);
+    }
+    out
 }
 
 /// Media Foundation long-term references, before a frame goes in: the keyframe into slot
@@ -1398,5 +1480,119 @@ mod hardware_decode {
             "{}x{}: VideoToolbox {hw_ms:.1} ms/frame, openh264 {sw_ms:.1} ms/frame",
             a[0].width, a[0].height
         );
+    }
+}
+
+#[cfg(test)]
+mod refine_tests {
+    //! Refinement passes over a still text screen.
+    //! `cargo test -p rconn-media refine_tests -- --nocapture` prints the numbers.
+    use super::*;
+    use crate::refine::measure::{quality, text_screen};
+
+    fn encoder(lib: &std::path::Path, bps: u32, hardware: bool) -> VideoEncoder {
+        let settings = EncoderSettings {
+            bitrate_bps: bps,
+            ..EncoderSettings::default()
+        };
+        if hardware {
+            return VideoEncoder::new(lib, settings).unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        return VideoEncoder::software(lib, settings).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        return VideoEncoder::new(lib, settings).unwrap();
+    }
+
+    /// Typing at 250 kbit/s leaves the text coarse (openh264 at its QP cap); one pass at
+    /// QP 24 sharpens the same picture, as a P-frame at that quantizer, and the encoder
+    /// goes back to its rate control after it.
+    #[test]
+    fn a_refinement_pass_sharpens_without_a_keyframe() {
+        let Some(lib) = crate::cisco::local_binary_path() else {
+            return;
+        };
+        let (w, h) = (640, 400);
+        let mut e = encoder(&lib, 250_000, false);
+        let mut d = VideoDecoder::software(&lib).unwrap();
+        let mut yuv = I420::new(w, h);
+        let mut shown = None;
+        assert!(!e.can_refine(), "openh264 starts on its first frame");
+        for k in 0..20 {
+            yuv.fill_from_bgra(&text_screen(w, h, 20 + k, 0).bgra, w);
+            if let Some(au) = e.encode_yuv(&yuv, None).unwrap() {
+                shown = d.decode(&au).unwrap().or(shown);
+            }
+        }
+        let before = quality(&yuv, shown.as_ref().unwrap());
+        assert!(e.can_refine());
+        e.refine_next(24);
+        let au = e.encode_yuv(&yuv, Some((0, 0))).unwrap().expect("a pass");
+        let info = e.last_frame();
+        assert!(!has_idr(&au) && !info.key);
+        assert!(info.refine);
+        assert_eq!(info.qp, Some(24));
+        let after = quality(&yuv, &d.decode(&au).unwrap().unwrap());
+        println!(
+            "{}: luma PSNR {:.2} -> {:.2} dB with a {} byte pass",
+            e.engine_name(),
+            before.0,
+            after.0,
+            au.len()
+        );
+        assert!(after.0 > before.0 + 3.0, "{before:?} -> {after:?}");
+        // Rate control again: the next change is not a pass.
+        yuv.fill_from_bgra(&text_screen(w, h, 50, 0).bgra, w);
+        if e.encode_yuv(&yuv, None).unwrap().is_some() {
+            assert!(!e.last_frame().refine);
+        }
+        // A pass is never a keyframe: a keyframe asked for wins over it.
+        e.request_keyframe();
+        e.refine_next(20);
+        e.encode_yuv(&yuv, Some((0, 0))).unwrap().unwrap();
+        assert!(e.last_frame().key && !e.last_frame().refine);
+    }
+
+    /// VideoToolbox takes the pass as a maximum frame QP.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn videotoolbox_refinement_pass() {
+        let Some(lib) = crate::cisco::local_binary_path() else {
+            return;
+        };
+        let (w, h) = (640, 400);
+        let mut e = encoder(&lib, 500_000, true);
+        let mut d = VideoDecoder::software(&lib).unwrap();
+        let mut yuv = I420::new(w, h);
+        let mut shown = None;
+        for k in 0..10 {
+            yuv.fill_from_bgra(&text_screen(w, h, 20 + k, 0).bgra, w);
+            if let Some(au) = e.encode_yuv(&yuv, None).unwrap() {
+                shown = d.decode(&au).unwrap().or(shown);
+            }
+        }
+        if !e.can_refine() {
+            println!("{}: no maximum QP setting", e.engine_name());
+            return;
+        }
+        let before = quality(&yuv, shown.as_ref().unwrap());
+        // Let the rate controller's one-second window pass.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        e.refine_next(24);
+        let Some(au) = e.encode_yuv(&yuv, Some((0, 0))).unwrap() else {
+            println!("{}: the pass was dropped", e.engine_name());
+            return;
+        };
+        assert!(!e.last_frame().key && e.last_frame().refine);
+        let after = quality(&yuv, &d.decode(&au).unwrap().unwrap());
+        println!(
+            "{}: luma PSNR {:.2} -> {:.2} dB with a {} byte pass (QP {:?})",
+            e.engine_name(),
+            before.0,
+            after.0,
+            au.len(),
+            e.last_frame().qp
+        );
+        assert!(after.0 > before.0, "{before:?} -> {after:?}");
     }
 }

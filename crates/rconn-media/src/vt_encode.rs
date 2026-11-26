@@ -147,6 +147,7 @@ unsafe extern "C" {
     static kVTCompressionPropertyKey_MaxH264SliceBytes: CFTypeRef;
     static kVTCompressionPropertyKey_YCbCrMatrix: CFTypeRef;
     static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder: CFTypeRef;
+    static kVTCompressionPropertyKey_MaxAllowedFrameQP: CFTypeRef;
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFTypeRef;
     static kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel: CFTypeRef;
     static kVTProfileLevel_H264_Baseline_AutoLevel: CFTypeRef;
@@ -180,6 +181,10 @@ unsafe extern "C" {
         key: CFTypeRef,
         alloc: CFTypeRef,
         out: *mut c_void,
+    ) -> OSStatus;
+    fn VTSessionCopySupportedPropertyDictionary(
+        session: CFTypeRef,
+        out: *mut CFTypeRef,
     ) -> OSStatus;
 }
 
@@ -389,6 +394,8 @@ pub struct VtEncoder {
     bitrate_bps: u32,
     name: String,
     hardware: bool,
+    /// The session has a maximum frame QP setting (refinement passes lower it).
+    max_qp: bool,
 }
 
 // SAFETY: the session and buffers are used only through `&mut self`; VideoToolbox
@@ -470,6 +477,7 @@ impl VtEncoder {
                 bitrate_bps: 0,
                 name: String::new(),
                 hardware: false,
+                max_qp: false,
             };
             enc.configure(settings)?;
             // The low-latency encoder does not answer "using hardware?"; the first tier
@@ -479,6 +487,7 @@ impl VtEncoder {
                 _ => enc.copy_bool(kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder),
             };
             enc.hardware = hardware == Some(true);
+            enc.max_qp = enc.supports(kVTCompressionPropertyKey_MaxAllowedFrameQP);
             enc.name = format!(
                 "VideoToolbox ({})",
                 [
@@ -574,6 +583,46 @@ impl VtEncoder {
         let value = Cf(value);
         // SAFETY: reading a static CF constant.
         (st == 0).then(|| value.0 == unsafe { kCFBooleanTrue })
+    }
+
+    /// Does the session list property `key` as supported?
+    fn supports(&self, key: CFTypeRef) -> bool {
+        let mut dict: CFTypeRef = ptr::null();
+        // SAFETY: valid session; the copied dictionary is released by `Cf`.
+        let st = unsafe { VTSessionCopySupportedPropertyDictionary(self.session.0, &mut dict) };
+        let dict = Cf(dict);
+        // SAFETY: a valid dictionary and key; the value is not retained by us.
+        st == 0 && !dict.0.is_null() && unsafe { !CFDictionaryGetValue(dict.0, key).is_null() }
+    }
+
+    /// Can a frame be coded under a quantizer ceiling ([`Self::set_max_qp`])?
+    pub fn can_refine(&self) -> bool {
+        self.max_qp
+    }
+
+    /// Code the next frames no coarser than quantizer `qp` (a refinement pass), or with
+    /// no ceiling again (`None`, the normal state). `false` if the session refused it.
+    pub fn set_max_qp(&mut self, qp: Option<u8>) -> bool {
+        if !self.max_qp {
+            return false;
+        }
+        // SAFETY: a static property key.
+        let key = unsafe { kVTCompressionPropertyKey_MaxAllowedFrameQP };
+        let st = match qp {
+            Some(qp) => {
+                let n = Cf::number_i32(i32::from(qp.min(51)));
+                self.set(key, n.0)
+            }
+            None => match self.set(key, ptr::null()) {
+                0 => 0,
+                // A session that doesn't take "unset": the H.264 maximum is no ceiling.
+                _ => self.set(key, Cf::number_i32(51).0),
+            },
+        };
+        if st != 0 {
+            tracing::debug!(status = st, ?qp, "VideoToolbox refused a maximum QP");
+        }
+        st == 0
     }
 
     /// "VideoToolbox (hardware, low latency)" and the like.

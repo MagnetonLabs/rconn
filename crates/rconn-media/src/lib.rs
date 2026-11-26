@@ -22,6 +22,7 @@ mod opus_shim;
 #[cfg(target_os = "linux")]
 pub mod portal;
 pub mod recovery;
+pub mod refine;
 pub mod sps;
 pub mod video;
 #[cfg(any(target_os = "macos", target_os = "ios"))]

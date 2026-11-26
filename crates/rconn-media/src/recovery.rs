@@ -21,6 +21,11 @@ pub struct FrameInfo {
     /// The frame repairs a loss: it predicts only from frame `base` (a long-term
     /// reference the viewer acknowledged) and what it holds from before that.
     pub recovers_from: Option<u32>,
+    /// The quantizer the frame's (first) slice was coded at, where it could be read.
+    pub qp: Option<u8>,
+    /// A refinement pass ([`crate::video::VideoEncoder::refine_next`]) over a still
+    /// picture.
+    pub refine: bool,
 }
 
 /// One frame as sent.

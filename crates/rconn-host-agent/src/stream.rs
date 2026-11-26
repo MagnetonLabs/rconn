@@ -6,11 +6,15 @@
 //!   areas the OS reports as changed are copied and converted;
 //! * frames are encoded at the full rate while the viewer is typing or moving the mouse,
 //!   or when a large area changes (scrolling, video); small background changes (spinners,
-//!   blinking carets) are batched to a few frames per second.
+//!   blinking carets) are batched to a few frames per second;
+//! * once the screen is still, refinement passes sharpen what the viewer has (text sent
+//!   coarsely while it changed, scrolled or moved), within the bandwidth estimate
+//!   ([`rconn_media::refine`]; `RCONN_REFINE=0` turns them off).
 
 use anyhow::Result;
 use rconn_media::capture::{Captured, Capturer, Surface};
 use rconn_media::copyrect::{Composer, Move};
+use rconn_media::refine::{self, Refiner};
 use rconn_media::video::{EncoderSettings, VideoEncoder, should_retarget};
 use rconn_media::yuv::I420;
 use rconn_peer::frames::{self, Feedback, FrameTag};
@@ -315,6 +319,8 @@ fn run_generation(
     let mut sent_any = false;
     let mut repeat_if_still = false;
     let mut stats = Stats::default();
+    // Refinement passes over a still screen (build to lossless).
+    let mut refiner = refine::enabled().then(|| Refiner::new(Instant::now()));
 
     while !ctx.stop.load(Ordering::Relaxed) {
         // Never take frames faster than max_fps: the OS keeps collecting changes meanwhile.
@@ -336,6 +342,13 @@ fn run_generation(
             })
             .into_iter()
             .chain(resends.first().copied())
+            // (Only passes the encoder can make: a due time it never acts on would spin.)
+            .chain(
+                refiner
+                    .as_ref()
+                    .filter(|_| !motion && enc.can_refine())
+                    .and_then(Refiner::due),
+            )
             .min();
         let timeout = due
             .map(|d| d.saturating_duration_since(Instant::now()))
@@ -370,6 +383,9 @@ fn run_generation(
                 produced = true;
                 warned = false;
                 last_change = Instant::now();
+                if let Some(r) = refiner.as_mut() {
+                    r.changed(last_change);
+                }
                 pending = Some(Pending::merge(pending.take(), c));
             }
             Ok(None) => {
@@ -453,10 +469,29 @@ fn run_generation(
         } else {
             BACKGROUND_INTERVAL.max(budget)
         };
-        let encode_now =
-            force || repair || sharpen || (pending.is_some() && now >= last_encode + interval);
+        // A refinement pass: only over a still, full-size picture, and never instead of a
+        // keyframe, a repair or a change.
+        let refine_qp = match refiner.as_mut() {
+            Some(r) if !force && !repair && !sharpen && !motion && pending.is_none() => {
+                enc.can_refine().then(|| r.next(now)).flatten()
+            }
+            _ => None,
+        };
+        let encode_now = force
+            || repair
+            || sharpen
+            || refine_qp.is_some()
+            || (pending.is_some() && now >= last_encode + interval);
         if !encode_now {
             continue;
+        }
+        if let Some(qp) = refine_qp {
+            enc.refine_next(qp);
+            if let Some(c) = composer.as_mut() {
+                // The canvas becomes the screen picture, shown whole: areas the viewer
+                // only has as copies (scrolled, moved) are sharpened too.
+                c.request_full();
+            }
         }
 
         if now >= retarget_at {
@@ -528,6 +563,21 @@ fn run_generation(
         }
         if let Some(au) = encoded {
             let info = enc.last_frame();
+            if let Some(r) = refiner.as_mut() {
+                let target = enc.settings().bitrate_bps;
+                r.sent(
+                    Instant::now(),
+                    au.len(),
+                    info.qp,
+                    info.refine,
+                    info.key,
+                    target,
+                );
+            }
+            if info.refine {
+                stats.refines += 1;
+                stats.refine_bytes += au.len();
+            }
             ctx.next_id
                 .store(info.id.wrapping_add(1), Ordering::Relaxed);
             stats.keys += u32::from(info.key);
@@ -579,6 +629,10 @@ fn run_generation(
             }
             if tx.blocking_send((au, Instant::now())).is_err() {
                 break; // the session ended
+            }
+        } else if refine_qp.is_some() {
+            if let Some(r) = refiner.as_mut() {
+                r.dropped(Instant::now()); // the encoder's rate control refused the pass
             }
         } else if let Some(p) = p {
             // The rate controller dropped the frame (VideoToolbox's low-latency mode does
@@ -641,6 +695,9 @@ struct Stats {
     repairs: u32,
     losses: u32,
     retargets: u32,
+    /// Refinement passes over a still screen, and their bytes.
+    refines: u32,
+    refine_bytes: usize,
     bytes: usize,
     capture: Duration,
     encode: Duration,
@@ -689,6 +746,8 @@ impl Stats {
             repairs = self.repairs,
             losses = self.losses,
             retargets = self.retargets,
+            refines = self.refines,
+            refine_kbps = format!("{:.0}", self.refine_bytes as f64 * 8.0 / secs / 1000.0),
             // 100 = one core. "thread" is capture + conversion + handing frames to the
             // encoder; the rest of "process" is the encoder's own threads and networking.
             cpu_process_pct = pct(process, self.cpu_at_start.0),
