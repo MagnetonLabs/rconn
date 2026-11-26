@@ -173,11 +173,11 @@ fn noise_file(path: &Path, len: u64) {
     let mut block = vec![0u8; MB as usize];
     let mut left = len;
     while left > 0 {
-        for chunk in block.chunks_exact_mut(8) {
+        for chunk in block.as_chunks_mut::<8>().0 {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            chunk.copy_from_slice(&x.to_le_bytes());
+            *chunk = x.to_le_bytes();
         }
         let n = left.min(MB) as usize;
         f.write_all(&block[..n]).unwrap();
