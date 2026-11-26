@@ -1,19 +1,31 @@
 ---
-/** Wide screens: a sticky column beside the text with this page's sections and the
- *  next steps. Hidden on narrow screens, where the text uses the full width. */
+/** "On this page" for text pages. Wide screens: a sticky rail on the right, level with
+ *  the title, that highlights the section being read. Narrow screens: a collapsed list
+ *  under the title. Rendered by the layout around the whole page. */
 interface Props {
   sections: { id: string; label: string }[];
+  variant: 'rail' | 'inline';
 }
-const { sections } = Astro.props;
+const { sections, variant } = Astro.props;
+const list = sections.map((s) => ({ ...s, href: `#${s.id}` }));
 ---
 
-<aside class="doc-aside" aria-label="On this page">
-  <p class="doc-aside-title">On this page</p>
-  <ol>
-    {sections.map((s) => <li><a href={`#${s.id}`}>{s.label}</a></li>)}
-  </ol>
-  <div class="doc-aside-box">
-    <a class="doc-aside-cta" href="/download">Download Rconn</a>
-    <a href="https://github.com/MagnetonLabs/rconn">Source code on GitHub</a>
-  </div>
-</aside>
+{variant === 'rail' ? (
+  <aside class="toc-rail" aria-label="On this page">
+    <p class="toc-title">On this page</p>
+    <ol class="toc-list">
+      {list.map((s) => <li><a href={s.href} data-toc-link={s.id}>{s.label}</a></li>)}
+    </ol>
+    <div class="toc-more">
+      <a class="toc-cta" href="/download">Download Rconn</a>
+      <a href="https://github.com/MagnetonLabs/rconn">Source code on GitHub</a>
+    </div>
+  </aside>
+) : (
+  <details class="toc-inline wrap">
+    <summary>On this page</summary>
+    <ol class="toc-list">
+      {list.map((s) => <li><a href={s.href}>{s.label}</a></li>)}
+    </ol>
+  </details>
+)}

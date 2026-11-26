@@ -1,9 +1,14 @@
 ---
 import Base from '../layouts/Base.astro';
-import DocAside from '../components/DocAside.astro';
 ---
 
 <Base
+  toc={[
+    { id: 'need-title', label: "You’ll need" },
+    { id: 'install', label: "Install" },
+    { id: 'point', label: "Point Rconn at it" },
+    { id: 'compose', label: "Prefer Docker Compose?" },
+  ]}
   title="Self-host"
   description="Run your own Rconn server: free, open source, one Docker container on a Linux machine with a public address."
 >
@@ -17,7 +22,7 @@ import DocAside from '../components/DocAside.astro';
   </div>
 
   <section class="band" aria-labelledby="need-title">
-    <div class="wrap doc"><div class="prose">
+    <div class="wrap"><div class="prose">
       <p class="draft-note" role="note">
         <strong>Preview.</strong> The install script and server image aren’t published at
         these addresses yet. The commands show how setup will work and may change before
@@ -76,14 +81,6 @@ volumes:
       <pre><code>docker compose run --rm signaling init --hostname rconn.example.com
 docker compose up -d</code></pre>
     </div>
-      <DocAside
-        sections={[
-        { id: 'need-title', label: "You’ll need" },
-        { id: 'install', label: "Install" },
-        { id: 'point', label: "Point Rconn at it" },
-        { id: 'compose', label: "Prefer Docker Compose?" },
-        ]}
-      />
     </div>
   </section>
 </Base>

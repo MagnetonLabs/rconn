@@ -1,11 +1,16 @@
 ---
 import Base from '../layouts/Base.astro';
-import DocAside from '../components/DocAside.astro';
 import PeerDiagram from '../components/PeerDiagram.astro';
 import { version } from '../lib/releases';
 ---
 
 <Base
+  toc={[
+    { id: 'server-title', label: "The server, in plain terms" },
+    { id: 'steps-title', label: "What happens when someone connects" },
+    { id: 'password', label: "Your password on your computer" },
+    { id: 'limits', label: "What this doesn’t protect against" },
+  ]}
   title="Security"
   description="How Rconn connects two devices: the server introduces them, your computer checks the password with SPAKE2, and the session is encrypted end to end with DTLS-SRTP. Including what this doesn't protect against."
 >
@@ -51,7 +56,7 @@ import { version } from '../lib/releases';
   </section>
 
   <section class="band" aria-labelledby="steps-title">
-    <div class="wrap doc"><div class="prose">
+    <div class="wrap"><div class="prose">
       <h2 id="steps-title">What happens when someone connects</h2>
       <ol>
         <li>Their device asks the server for your computer by its ID.</li>
@@ -122,14 +127,6 @@ import { version } from '../lib/releases';
         </li>
       </ul>
     </div>
-      <DocAside
-        sections={[
-        { id: 'server-title', label: "The server, in plain terms" },
-        { id: 'steps-title', label: "What happens when someone connects" },
-        { id: 'password', label: "Your password on your computer" },
-        { id: 'limits', label: "What this doesn’t protect against" },
-        ]}
-      />
     </div>
   </section>
 </Base>

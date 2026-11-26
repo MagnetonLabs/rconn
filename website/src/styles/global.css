@@ -249,26 +249,51 @@ pre {
   html { scroll-behavior: smooth; }
 }
 
-/* Text pages: on wide screens the text keeps its readable width and a sticky column
-   beside it lists the page's sections, instead of leaving the right half empty. */
-.doc-aside { display: none; }
+/* Text pages with "On this page". Wide screens: the page (title included) sits beside a
+   sticky rail on the right that starts level with the title. Narrow screens: one column
+   with a collapsed list under the title. */
+.toc-rail { display: none; }
+.toc-list { list-style: none; margin: 0; padding: 0; }
+.toc-list li + li { margin-top: 0.5rem; }
+.toc-inline { margin-bottom: 1.5rem; }
+/* Narrow screens: the collapsed list goes under the page title, not above it. */
+@media (max-width: 63.99rem) {
+  .doc-body { display: flex; flex-direction: column; }
+  .doc-body > .page-head { order: -1; padding-bottom: 1rem; }
+}
+.toc-inline summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 0.6rem 0;
+  border-block: 1px solid var(--rule);
+}
+.toc-inline .toc-list { padding: 0.75rem 0 0.25rem; }
+.toc-inline a, .toc-rail a { color: inherit; text-decoration: none; }
+.toc-inline a:hover, .toc-rail a:hover, .toc-rail a:focus-visible { color: var(--link); text-decoration: underline; }
 @media (min-width: 64rem) {
-  .doc {
+  .doc-page {
     display: grid;
-    grid-template-columns: minmax(0, var(--measure)) minmax(13rem, 17rem);
-    justify-content: space-between;
-    column-gap: clamp(2.5rem, 6vw, 6rem);
+    grid-template-columns: minmax(0, 1fr) 15rem;
+    column-gap: clamp(2rem, 4vw, 4rem);
+    max-width: calc(var(--wide) + 2 * var(--gutter));
+    margin-inline: auto;
+    padding-inline: var(--gutter);
   }
-  .doc-aside {
+  /* The page's own wrappers already sit inside the grid's padding. */
+  .doc-body > .wrap, .doc-body > section > .wrap { padding-inline: 0; max-width: none; }
+  .doc-body > .band { margin-inline: 0; }
+  .toc-inline { display: none; }
+  .toc-rail {
     display: block;
     position: sticky;
-    top: 6rem;
+    top: 5.5rem;
     align-self: start;
-    padding-left: 1.5rem;
+    margin-top: clamp(3rem, 8vw, 5rem); /* level with the page title */
+    padding-left: 1.25rem;
     border-left: 1px solid var(--rule);
-    font-size: var(--s-16);
   }
-  .doc-aside-title {
+  .toc-title {
     margin: 0 0 0.75rem;
     font-size: 0.8rem;
     font-weight: 600;
@@ -276,16 +301,23 @@ pre {
     text-transform: uppercase;
     color: var(--muted);
   }
-  .doc-aside ol { list-style: none; margin: 0; padding: 0; }
-  .doc-aside li + li { margin-top: 0.55rem; }
-  .doc-aside a { color: inherit; text-decoration: none; }
-  .doc-aside a:hover, .doc-aside a:focus-visible { color: var(--link); text-decoration: underline; }
-  .doc-aside-box {
+  .toc-rail .toc-list a {
+    display: block;
+    margin-left: calc(-1.25rem - 1px);
+    padding-left: calc(1.25rem - 1px);
+    border-left: 2px solid transparent;
+    color: var(--muted);
+  }
+  .toc-rail .toc-list a[aria-current] { color: var(--ink); font-weight: 600; border-left-color: var(--blue); }
+  .toc-more {
     display: grid;
     gap: 0.6rem;
-    margin-top: 2rem;
-    padding-top: 1.5rem;
+    margin-top: 1.75rem;
+    padding-top: 1.25rem;
     border-top: 1px solid var(--rule);
   }
-  .doc-aside .doc-aside-cta { color: var(--link); font-weight: 600; }
+  .toc-rail .toc-cta { color: var(--link); font-weight: 600; }
 }
+
+/* Jumping to a section leaves a little room above its heading. */
+.doc-body h2[id] { scroll-margin-top: 1.5rem; }
