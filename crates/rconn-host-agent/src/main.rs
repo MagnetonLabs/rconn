@@ -174,6 +174,15 @@ async fn main() -> Result<()> {
     );
 
     let host_kind = hostkind::detect();
+    // Wayland: the portal's restore token, so the person at the computer allows screen
+    // sharing and control once rather than every time the agent starts.
+    #[cfg(target_os = "linux")]
+    rconn_media::portal::set_restore_token_path(
+        cli.state_dir
+            .clone()
+            .unwrap_or_else(|| identity.clone())
+            .join("portal-restore-token"),
+    );
     request_permissions();
     raise_priority();
     let status = StatusPublisher::new(

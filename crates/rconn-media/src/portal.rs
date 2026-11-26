@@ -205,6 +205,9 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, loopback: mpsc::UnboundedSend
     let mut generation = 0u64;
     let mut idle_deadline: Option<tokio::time::Instant> = None;
     let mut declined_until: Option<tokio::time::Instant> = None;
+    // After sharing was stopped at the computer, resuming needs a fresh "allow" there:
+    // the next session ignores the restore token.
+    let mut ask_again = false;
     loop {
         let cmd = tokio::select! {
             cmd = rx.recv() => match cmd {
@@ -233,8 +236,11 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, loopback: mpsc::UnboundedSend
                         declined_until = None;
                     }
                     generation += 1;
-                    match open(generation, loopback.clone()).await {
-                        Ok(l) => live = Some(l),
+                    match open(generation, loopback.clone(), !ask_again).await {
+                        Ok(l) => {
+                            live = Some(l);
+                            ask_again = false;
+                        }
                         Err(e) => {
                             if matches!(e, PortalError::Declined(_)) {
                                 declined_until =
@@ -294,6 +300,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, loopback: mpsc::UnboundedSend
                     l.closed.store(true, Ordering::Relaxed);
                     l.watcher.abort();
                     declined_until = Some(tokio::time::Instant::now() + DECLINE_COOLDOWN);
+                    ask_again = true;
                 }
             }
         }
@@ -323,8 +330,12 @@ fn is_cancelled(e: &ashpd::Error) -> bool {
 }
 
 /// Create the RemoteDesktop session with one monitor and start it (consent dialog, or
-/// silent with a valid restore token).
-async fn open(generation: u64, loopback: mpsc::UnboundedSender<Cmd>) -> Result<Live, PortalError> {
+/// silent with a valid restore token when `use_token`).
+async fn open(
+    generation: u64,
+    loopback: mpsc::UnboundedSender<Cmd>,
+    use_token: bool,
+) -> Result<Live, PortalError> {
     let unavailable = |e: ashpd::Error| PortalError::Unavailable(e.to_string());
     let rd = RemoteDesktop::new().await.map_err(unavailable)?;
     let sc = Screencast::new().await.map_err(unavailable)?;
@@ -343,7 +354,7 @@ async fn open(generation: u64, loopback: mpsc::UnboundedSender<Cmd>) -> Result<L
         CursorMode::HIDDEN
     };
     let path = token_path();
-    let token = path.as_deref().and_then(load_token);
+    let token = path.as_deref().filter(|_| use_token).and_then(load_token);
     tracing::info!(
         generation,
         remote_desktop_version = rd.version(),
@@ -357,51 +368,13 @@ async fn open(generation: u64, loopback: mpsc::UnboundedSender<Cmd>) -> Result<L
         .create_session(Default::default())
         .await
         .map_err(|e| other("CreateSession", e))?;
-    let wanted = (DeviceType::KEYBOARD | DeviceType::POINTER) & devices;
-    let mut select = SelectDevicesOptions::default().set_devices(wanted);
-    // Persisting a remote-desktop session needs RemoteDesktop v2 (the persist options
-    // are on SelectDevices; ScreenCast's are refused for remote-desktop sessions).
-    if rd.version() >= 2 {
-        select = select
-            .set_persist_mode(PersistMode::ExplicitlyRevoked)
-            .set_restore_token(token.as_deref());
-    } else {
-        tracing::warn!(
-            version = rd.version(),
-            "this portal can't remember the choice (RemoteDesktop v2 needed): the person at \
-             the computer is asked every time"
-        );
-    }
-    rd.select_devices(&session, select)
-        .await
-        .and_then(|r| r.response())
-        .map_err(|e| other("SelectDevices", e))?;
-    sc.select_sources(
-        &session,
-        SelectSourcesOptions::default()
-            .set_cursor_mode(cursor)
-            .set_sources(SourceType::MONITOR)
-            .set_multiple(false),
-    )
-    .await
-    .and_then(|r| r.response())
-    .map_err(|e| other("SelectSources", e))?;
-    if token.is_none() {
-        tracing::info!(
-            "asking the person at this computer to allow screen sharing and remote control"
-        );
-    }
-    let started = rd
-        .start(&session, None, Default::default())
-        .await
-        .and_then(|r| r.response())
-        .map_err(|e| {
-            if is_cancelled(&e) {
-                PortalError::Declined(DECLINE_COOLDOWN.as_secs())
-            } else {
-                other("Start", e)
-            }
-        })?;
+    let started = match start(&rd, &sc, &session, devices, cursor, token.as_deref()).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = session.close().await;
+            return Err(e);
+        }
+    };
     if let (Some(p), Some(t)) = (&path, started.restore_token()) {
         match save_token(p, t) {
             Ok(()) => tracing::info!(path = %p.display(), "saved the portal restore token"),
@@ -453,6 +426,61 @@ async fn open(generation: u64, loopback: mpsc::UnboundedSender<Cmd>) -> Result<L
         can_pointer: granted.contains(DeviceType::POINTER),
         can_keyboard: granted.contains(DeviceType::KEYBOARD),
     })
+}
+
+/// Choose the devices and the monitor, then start (the dialog shows here).
+async fn start(
+    rd: &RemoteDesktop,
+    sc: &Screencast,
+    session: &Session<RemoteDesktop>,
+    devices: DeviceType,
+    cursor: CursorMode,
+    token: Option<&str>,
+) -> Result<ashpd::desktop::remote_desktop::SelectedDevices, PortalError> {
+    let wanted = (DeviceType::KEYBOARD | DeviceType::POINTER) & devices;
+    let mut select = SelectDevicesOptions::default().set_devices(wanted);
+    // Persisting a remote-desktop session needs RemoteDesktop v2 (the persist options
+    // are on SelectDevices; ScreenCast's are refused for remote-desktop sessions).
+    if rd.version() >= 2 {
+        select = select
+            .set_persist_mode(PersistMode::ExplicitlyRevoked)
+            .set_restore_token(token);
+    } else {
+        tracing::warn!(
+            version = rd.version(),
+            "this portal can't remember the choice (RemoteDesktop v2 needed): the person at \
+             the computer is asked every time"
+        );
+    }
+    rd.select_devices(session, select)
+        .await
+        .and_then(|r| r.response())
+        .map_err(|e| other("SelectDevices", e))?;
+    sc.select_sources(
+        session,
+        SelectSourcesOptions::default()
+            .set_cursor_mode(cursor)
+            .set_sources(SourceType::MONITOR)
+            .set_multiple(false),
+    )
+    .await
+    .and_then(|r| r.response())
+    .map_err(|e| other("SelectSources", e))?;
+    if token.is_none() {
+        tracing::info!(
+            "asking the person at this computer to allow screen sharing and remote control"
+        );
+    }
+    rd.start(session, None, Default::default())
+        .await
+        .and_then(|r| r.response())
+        .map_err(|e| {
+            if is_cancelled(&e) {
+                PortalError::Declined(DECLINE_COOLDOWN.as_secs())
+            } else {
+                other("Start", e)
+            }
+        })
 }
 
 fn key_state(pressed: bool) -> KeyState {

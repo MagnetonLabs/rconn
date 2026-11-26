@@ -7,14 +7,20 @@
 #     scripts/pipewire-capture-test.sh
 set -euo pipefail
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/rconn-xdg}"
-mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 DBUS_SESSION_BUS_ADDRESS="$(dbus-daemon --session --fork --print-address)"
 export DBUS_SESSION_BUS_ADDRESS
 pipewire >/tmp/pipewire.log 2>&1 &
 sleep 1
 wireplumber >/tmp/wireplumber.log 2>&1 &
 sleep 1
-gst-launch-1.0 -q videotestsrc pattern=ball is-live=true \
+# PATTERN=red: a solid red source, and the test checks the colour came through.
+case "${PATTERN:-ball}" in
+  red) pattern="pattern=solid-color foreground-color=0xffff0000"; export RCONN_PW_TEST_RED=1 ;;
+  *) pattern="pattern=ball" ;;
+esac
+# shellcheck disable=SC2086 # $pattern is several gst properties
+gst-launch-1.0 -q videotestsrc $pattern is-live=true \
   ! "video/x-raw,format=${FORMAT:-BGRx},width=${WIDTH:-638},height=${HEIGHT:-480},framerate=30/1" \
   ! pipewiresink mode=provide client-name=rconn-test-source \
     stream-properties="props,media.class=Video/Source,node.name=rconn-test-source" \

@@ -825,6 +825,17 @@ mod tests {
         let (w, h) = picture.as_ref().unwrap().dimensions();
         eprintln!("first picture {w}x{h}");
         assert!(w > 0 && h > 0);
+        // A solid red source (`PATTERN=red`): the channel order survived negotiation.
+        if std::env::var_os("RCONN_PW_TEST_RED").is_some() {
+            let l = cap.pw.shared.latest.lock().unwrap();
+            let i = (l.height / 2 * l.width + l.width / 2) * 4;
+            let bgr = &l.image[i..i + 3];
+            eprintln!("centre pixel (B, G, R) = {bgr:?}");
+            assert!(
+                bgr[0] < 40 && bgr[1] < 40 && bgr[2] > 215,
+                "{bgr:?} is not red"
+            );
+        }
         let mut more = 0;
         let until = Instant::now() + Duration::from_secs(2);
         while Instant::now() < until {

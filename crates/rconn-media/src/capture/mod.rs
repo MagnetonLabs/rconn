@@ -101,21 +101,10 @@ pub fn primary_display() -> Result<Box<dyn Capturer>, CaptureError> {
     }
     #[cfg(target_os = "linux")]
     {
-        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let socket = env("XDG_RUNTIME_DIR").is_some_and(|d| {
-            let name = env("WAYLAND_DISPLAY").unwrap_or_else(|| "wayland-0".into());
-            std::path::Path::new(&d).join(name).exists()
-        });
-        let backend = linux_backend(
-            env("RCONN_CAPTURE").as_deref(),
-            env("XDG_SESSION_TYPE").as_deref(),
-            env("WAYLAND_DISPLAY").is_some(),
-            socket,
-        );
-        tracing::info!(?backend, "Linux capture backend");
-        match backend {
-            LinuxBackend::Portal => Ok(Box::new(portal::PortalCapturer::new()?)),
-            LinuxBackend::X11 => Ok(Box::new(x11::X11Capturer::new()?)),
+        if uses_portal() {
+            Ok(Box::new(portal::PortalCapturer::new()?))
+        } else {
+            Ok(Box::new(x11::X11Capturer::new()?))
         }
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -124,6 +113,25 @@ pub fn primary_display() -> Result<Box<dyn Capturer>, CaptureError> {
             "no capture backend for this OS yet".into(),
         ))
     }
+}
+
+/// Linux: is this a Wayland desktop, where capture and input go through the desktop
+/// portal (rather than X11)? Input injection asks the same question.
+#[cfg(target_os = "linux")]
+pub fn uses_portal() -> bool {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let socket = env("XDG_RUNTIME_DIR").is_some_and(|d| {
+        let name = env("WAYLAND_DISPLAY").unwrap_or_else(|| "wayland-0".into());
+        std::path::Path::new(&d).join(name).exists()
+    });
+    let backend = linux_backend(
+        env("RCONN_CAPTURE").as_deref(),
+        env("XDG_SESSION_TYPE").as_deref(),
+        env("WAYLAND_DISPLAY").is_some(),
+        socket,
+    );
+    tracing::debug!(?backend, "Linux desktop backend");
+    backend == LinuxBackend::Portal
 }
 
 #[cfg(target_os = "linux")]

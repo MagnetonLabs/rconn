@@ -3,11 +3,15 @@
 //! Injection runs on one dedicated OS thread per session. On Windows that thread attaches
 //! to the input desktop, so input reaches the lock screen and UAC prompts too (the agent
 //! runs as SYSTEM in the console session). On macOS it posts CGEvents at the HID tap,
-//! which needs the Accessibility permission. On Linux (X11) it sends XTest events. When the session ends, every key and button
-//! still held is released, so a dropped connection can't leave Ctrl stuck down.
+//! which needs the Accessibility permission. On Linux it sends XTest events on X11, and
+//! on Wayland goes through the desktop portal's remote-desktop session (shared with screen
+//! capture, one consent dialog). When the session ends, every key and button still held
+//! is released, so a dropped connection can't leave Ctrl stuck down.
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "linux")]
+mod portal;
 #[cfg(windows)]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -85,11 +89,17 @@ impl Drop for InputSink {
 }
 
 fn run(rx: mpsc::Receiver<InputEvent>) {
+    let started = std::time::Instant::now();
     let Some(mut inj) = platform_injector() else {
         tracing::warn!("no input injection on this OS yet; input events are ignored");
         while rx.recv().is_ok() {}
         return;
     };
+    // Waiting for a consent dialog (Wayland): what the viewer did meanwhile is stale.
+    if started.elapsed() > std::time::Duration::from_secs(1) {
+        let stale = rx.try_iter().count();
+        tracing::info!(stale, "input ready; dropped input sent while waiting");
+    }
     // Start every session with Caps Lock off: the viewer can't know the host's lock state,
     // and a leftover Caps Lock makes everything type in capitals.
     if inj.caps_lock_on() {
@@ -133,6 +143,9 @@ fn platform_injector() -> Option<Box<dyn Injector>> {
     }
     #[cfg(target_os = "linux")]
     {
+        if rconn_media::capture::uses_portal() {
+            return Some(Box::new(portal::PortalInjector::new()));
+        }
         match x11::XTestInjector::new() {
             Ok(inj) => Some(Box::new(inj)),
             Err(e) => {
