@@ -135,8 +135,9 @@ pub fn draw(ui: &mut egui::Ui, m: &mut Model) -> Actions {
             row(ui, "File transfer", locks[9], |ui| {
                 ui.checkbox(
                     &mut form.file_transfer,
-                    "Viewers may copy files to and from this computer (your home folder; received files go to Downloads/Rconn)",
+                    "Let the viewer copy files both ways",
                 )
+                .on_hover_text("Your home folder is shared; received files go to Downloads/Rconn.")
             });
             row(ui, "Max video bitrate", locks[5], |ui| {
                 ui.add(
