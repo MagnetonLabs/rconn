@@ -63,9 +63,9 @@ fi
 
 # Upgrade: the host runs the new version now.
 systemctl --user try-restart rconn-host.service 2>/dev/null || true
-echo "Rconn installed in $lib. Opening it: this computer gets its ID in a few seconds."
 if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+  echo "Rconn installed in $lib. Opening it: this computer gets its ID in a few seconds."
   nohup "$lib/rconn" >/dev/null 2>&1 &
 else
-  echo "Open Rconn from your apps to get this computer's ID."
+  echo "Rconn installed in $lib. Open Rconn from your apps to get this computer's ID."
 fi
