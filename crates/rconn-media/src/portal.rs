@@ -389,15 +389,24 @@ async fn open(
             return Err(e);
         }
     };
-    if let (Some(p), Some(t)) = (&path, started.restore_token()) {
-        match save_token(p, t) {
+    let granted = started.devices();
+    let can_control = granted.contains(DeviceType::POINTER | DeviceType::KEYBOARD);
+    // Remember the choice only when it includes remote control. A view-only answer
+    // (Share without "Allow Remote Interaction") would otherwise be restored silently for
+    // every later session, leaving viewers unable to click; forgetting it asks again.
+    match (&path, started.restore_token()) {
+        (Some(p), Some(t)) if can_control => match save_token(p, t) {
             Ok(()) => tracing::info!(path = %p.display(), "saved the portal restore token"),
             Err(e) => {
                 tracing::warn!(error = %e, path = %p.display(), "could not save the portal restore token")
             }
+        },
+        (Some(p), _) if !can_control => {
+            let _ = std::fs::remove_file(p);
+            tracing::info!("view-only sharing isn't remembered; the next session asks again");
         }
+        _ => {}
     }
-    let granted = started.devices();
     let Some(first) = started.streams().first() else {
         let _ = session.close().await;
         return Err(other("Start", "the portal returned no screen stream"));
@@ -405,7 +414,7 @@ async fn open(
     let stream = StreamInfo {
         node_id: first.pipe_wire_node_id(),
         size: first.size(),
-        can_control: granted.contains(DeviceType::POINTER | DeviceType::KEYBOARD),
+        can_control,
     };
     tracing::info!(
         generation,
@@ -414,7 +423,7 @@ async fn open(
         ?granted,
         "desktop portal session started"
     );
-    if !granted.contains(DeviceType::POINTER | DeviceType::KEYBOARD) {
+    if !can_control {
         tracing::warn!(
             ?granted,
             "remote control was not fully allowed: only the screen is shared"
