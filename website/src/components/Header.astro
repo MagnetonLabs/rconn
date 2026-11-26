@@ -1,0 +1,22 @@
+---
+const path = Astro.url.pathname.replace(/\/$/, '') || '/';
+const links = [
+  { href: '/download', label: 'Download' },
+  { href: '/security', label: 'Security' },
+  { href: '/self-host', label: 'Self-host' },
+];
+---
+
+<header class="site-head">
+  <div class="wrap">
+    <a class="brand" href="/" aria-label="Rconn home">
+      <img src="/favicon.svg" alt="" width="28" height="28" />
+      Rconn
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      {links.map((l) => (
+        <a href={l.href} aria-current={path === l.href ? 'page' : undefined}>{l.label}</a>
+      ))}
+    </nav>
+  </div>
+</header>

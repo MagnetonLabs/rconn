@@ -1,0 +1,192 @@
+---
+import Base from '../layouts/Base.astro';
+import { files, url, size, version } from '../lib/releases';
+
+const of = (os: string) => files.filter((f) => f.os === os);
+const platforms = [
+  { id: 'macos', title: 'macOS', files: of('macos') },
+  { id: 'windows', title: 'Windows', files: of('windows') },
+  { id: 'linux', title: 'Linux', files: of('linux') },
+];
+---
+
+<Base
+  title="Download"
+  description={`Download Rconn ${version} for macOS, Windows and Linux. Free, no account needed.`}
+>
+  <div class="wrap page-head">
+    <h1>Download Rconn</h1>
+    <p class="lede">
+      Version {version}. Install it on the computer you want to reach, and on the one you’ll
+      connect from. It’s the same app for both.
+    </p>
+    <nav class="jump" aria-label="Platforms">
+      {platforms.map((p) => <a href={`#${p.id}`}>{p.title}</a>)}
+      <a href="#ios">iPhone and iPad</a>
+    </nav>
+  </div>
+
+  {platforms.map((p) => (
+    <section class="band platform" id={p.id} aria-labelledby={`${p.id}-title`}>
+      <div class="wrap platform-grid">
+        <h2 id={`${p.id}-title`}>{p.title}</h2>
+        <div class="platform-body">
+          <ul class="files">
+            {p.files.map((f) => (
+              <li class="file">
+                <div class="file-head">
+                  <div>
+                    <h3>{f.archLabel}</h3>
+                    <p class="file-meta">{f.requires}</p>
+                  </div>
+                  <a class="btn" href={url(f)}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11m-5-5 5 5 5-5M5 20h14" /></svg>
+                    Download<span class="visually-hidden"> for {f.name} {f.archLabel}</span>
+                  </a>
+                </div>
+                <dl class="file-facts">
+                  <div class="fname"><dt>File</dt><dd><code>{f.file}</code></dd></div>
+                  <div><dt>Size</dt><dd>{size(f)}</dd></div>
+                  <div><dt>Version</dt><dd>{version}</dd></div>
+                  <div class="hash">
+                    <dt>SHA-256</dt>
+                    <dd>{f.sha256 ? <code>{f.sha256}</code> : <span class="pending">Published with the release</span>}</dd>
+                  </div>
+                </dl>
+              </li>
+            ))}
+          </ul>
+
+          <div class="notes prose">
+            {p.id === 'macos' && (
+              <>
+                <h3>Installing</h3>
+                <ol>
+                  <li>Open <code>{p.files[0].file}</code> and drag Rconn into Applications.</li>
+                  <li>
+                    Open Rconn. This early release isn’t notarized by Apple yet, so macOS may
+                    refuse the first time. Open <strong>System Settings › Privacy &amp; Security</strong>,
+                    scroll down and click <strong>Open Anyway</strong>, then confirm.
+                  </li>
+                  <li>
+                    To let others connect to this Mac, allow <strong>Screen Recording</strong> and
+                    <strong>Accessibility</strong> for Rconn when macOS asks.
+                  </li>
+                </ol>
+              </>
+            )}
+            {p.id === 'windows' && (
+              <>
+                <h3>Which one?</h3>
+                <p>
+                  Most PCs need x64. Choose ARM64 for Arm-based PCs, such as those with
+                  Snapdragon chips. To check, open <strong>Settings › System › About</strong> and
+                  look at <strong>System type</strong>.
+                </p>
+                <h3>Installing</h3>
+                <ol>
+                  <li>Run the installer and approve the administrator prompt.</li>
+                  <li>
+                    If Microsoft Defender SmartScreen says <em>Windows protected your PC</em>,
+                    click <strong>More info</strong>, then <strong>Run anyway</strong>. This early
+                    release isn’t code-signed yet.
+                  </li>
+                </ol>
+              </>
+            )}
+            {p.id === 'linux' && (
+              <>
+                <h3>Installing on Ubuntu</h3>
+                <p>Check your architecture with <code>dpkg --print-architecture</code>, then install the matching package:</p>
+                <pre><code>{p.files.map((f) => `sudo apt install ./${f.file}`).join('\n# or\n')}</code></pre>
+                <p>
+                  On Wayland, Ubuntu asks you to allow screen sharing the first time someone
+                  connects. Rconn remembers your answer. On X11 there’s no prompt.
+                </p>
+              </>
+            )}
+            <h3>Checking the file</h3>
+            <p>Compare the printed hash with the SHA-256 above.</p>
+            <pre><code>{p.id === 'macos'
+              ? `shasum -a 256 ${p.files[0].file}`
+              : p.id === 'windows'
+                ? `Get-FileHash .\\${p.files[0].file}`
+                : `sha256sum ${p.files[0].file}`}</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  ))}
+
+  <section class="band platform" id="ios" aria-labelledby="ios-title">
+    <div class="wrap platform-grid">
+      <h2 id="ios-title">iPhone and iPad</h2>
+      <div class="platform-body prose">
+        <p>
+          <strong>Coming soon to the App Store.</strong> The app connects your iPhone or
+          iPad to a computer running Rconn. It doesn’t share the phone’s own screen. Touch
+          works like a trackpad, and the on-screen keyboard has modifier keys.
+        </p>
+      </div>
+    </div>
+  </section>
+</Base>
+
+<style>
+  .jump {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 1.75rem;
+  }
+  .jump a {
+    padding: 0.45rem 0.9rem;
+    border-radius: 999px;
+    box-shadow: inset 0 0 0 1.5px var(--rule);
+    color: var(--ink);
+    text-decoration: none;
+    font-size: var(--s-16);
+    font-weight: 600;
+  }
+  .jump a:hover { background: var(--tint); }
+
+  .platform { scroll-margin-top: 1rem; }
+  .page-head + .platform { border-top: 1px solid var(--rule); }
+  .platform-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
+  @media (min-width: 60rem) {
+    .platform-grid { grid-template-columns: 14rem minmax(0, 1fr); gap: 3rem; }
+  }
+  .platform-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2.5rem; min-width: 0; }
+
+  .files { list-style: none; margin: 0; padding: 0; display: grid; gap: 1.25rem; }
+  .file {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 14px;
+    padding: clamp(1.1rem, 3vw, 1.5rem);
+  }
+  .file-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem 1.5rem;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .file-meta { color: var(--muted); font-size: var(--s-16); margin-top: 0.2rem; }
+  .file-facts {
+    margin: 1.25rem 0 0;
+    padding-top: 1rem;
+    border-top: 1px solid var(--rule);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9rem, auto));
+    gap: 0.75rem 2rem;
+    font-size: var(--s-16);
+  }
+  .file-facts dt { color: var(--muted); font-size: var(--s-14); }
+  .file-facts dd { margin: 0.1rem 0 0; overflow-wrap: anywhere; }
+  .file-facts .hash, .file-facts .fname { grid-column: 1 / -1; }
+  @media (min-width: 40rem) { .file-facts .fname { grid-column: auto; } }
+  .pending { color: var(--muted); font-style: italic; }
+
+  .notes h3:first-child { margin-top: 0; }
+</style>

@@ -1,0 +1,93 @@
+---
+import { forScript, version } from '../lib/releases';
+
+/* Without JavaScript (or on an unknown system) the button goes to /download.
+   The script below swaps in the direct file for the visitor's system. */
+const others = [
+  { os: 'macos', href: '/download#macos', label: 'macOS' },
+  { os: 'windows', href: '/download#windows', label: 'Windows' },
+  { os: 'linux', href: '/download#linux', label: 'Linux' },
+  { os: 'ios', href: '/download#ios', label: 'iPhone and iPad (soon)' },
+];
+---
+
+<div class="cta" data-dl={forScript()}>
+  <a class="btn" href="/download" data-dl-btn>
+    <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11m-5-5 5 5 5-5M5 20h14" /></svg>
+    <span data-dl-label>Download Rconn</span>
+  </a>
+  <p class="cta-meta" data-dl-meta>Version {version} for macOS, Windows and Linux.</p>
+  <p class="cta-others">
+    <span data-dl-others-label>Available for</span>
+    {others.map((o) => (
+      <span data-os={o.os}><a href={o.href}>{o.label}</a></span>
+    ))}
+  </p>
+</div>
+
+<script>
+  type Entry = { href: string; name: string; arch: string; size: string; version: string };
+
+  const root = document.querySelector<HTMLElement>('[data-dl]');
+  if (root) {
+    const files: Record<string, Entry> = JSON.parse(root.dataset.dl!);
+    const btn = root.querySelector<HTMLAnchorElement>('[data-dl-btn]')!;
+    const label = root.querySelector('[data-dl-label]')!;
+    const meta = root.querySelector('[data-dl-meta]')!;
+    const othersLabel = root.querySelector('[data-dl-others-label]')!;
+
+    const ua = navigator.userAgent;
+    const uaData = (navigator as any).userAgentData;
+    const platform: string = uaData?.platform || navigator.platform || '';
+    const touchMac = /Mac/.test(platform) && navigator.maxTouchPoints > 1;
+
+    const os = /iPhone|iPad|iPod/.test(ua) || touchMac
+      ? 'ios'
+      : /Android/.test(ua)
+        ? 'android'
+        : /Win/.test(platform) || /Windows/.test(ua)
+          ? 'windows'
+          : /Mac/.test(platform) || /Mac OS X/.test(ua)
+            ? 'macos'
+            : /Linux|X11/.test(platform + ua)
+              ? 'linux'
+              : '';
+
+    const show = (id: string) => {
+      const f = files[id];
+      btn.href = f.href;
+      label.textContent = `Download for ${f.name}`;
+      meta.textContent = `Version ${f.version}, ${f.size}, ${f.arch}.`;
+      othersLabel.textContent = 'Also for';
+      root.querySelector(`[data-os="${os}"]`)?.remove();
+    };
+
+    if (os === 'macos') show('macos');
+    else if (os === 'linux') show(/aarch64|arm64/i.test(ua + platform) ? 'linux-arm64' : 'linux-amd64');
+    else if (os === 'windows') {
+      show('windows-x64');
+      // Browsers report Windows on Arm as x64 in the user agent; ask the client hints instead.
+      uaData?.getHighEntropyValues?.(['architecture']).then((h: { architecture?: string }) => {
+        if (h.architecture === 'arm') show('windows-arm64');
+      });
+    } else if (os === 'ios') {
+      label.textContent = 'See desktop downloads';
+      meta.textContent = 'Rconn for iPhone and iPad is coming to the App Store. Install it on the computer you want to reach.';
+    } else if (os === 'android') {
+      label.textContent = 'See desktop downloads';
+      meta.textContent = 'There is no Android app yet. Install Rconn on the computer you want to reach.';
+    }
+  }
+</script>
+
+<style>
+  .cta { display: grid; gap: 0.75rem; justify-items: start; }
+  .cta-meta { font-size: var(--s-16); color: var(--muted); }
+  .cta-others {
+    font-size: var(--s-16);
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1rem;
+  }
+</style>

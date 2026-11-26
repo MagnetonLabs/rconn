@@ -1,0 +1,78 @@
+---
+/* Two drawings of the same thing: wide for desktop, tall for phones, so the labels stay
+   readable without shrinking. Both carry the same text alternative. */
+const alt =
+  'Diagram: the Rconn server introduces your computer and the other device. Screen, input, clipboard and sound then go directly between the two devices, encrypted end to end.';
+---
+
+<figure class="peer">
+  <svg class="wide" viewBox="0 0 760 300" role="img" aria-label={alt}>
+    <rect class="box" x="270" y="8" width="220" height="70" rx="10" />
+    <text class="t" x="380" y="38">Rconn server</text>
+    <text class="m" x="380" y="61">introduces the two devices</text>
+
+    <path class="dash" d="M318 78 L128 168" />
+    <path class="dash" d="M442 78 L632 168" />
+
+    <rect class="box" x="16" y="168" width="224" height="116" rx="10" />
+    <text class="t" x="128" y="204">Your computer</text>
+    <text class="m" x="128" y="228">checks the password</text>
+    <text class="m" x="128" y="250">ID 067 425 387</text>
+
+    <rect class="box" x="520" y="168" width="224" height="116" rx="10" />
+    <text class="t" x="632" y="204">Their device</text>
+    <text class="m" x="632" y="228">enters ID and password</text>
+
+    <path class="secure" d="M240 226 H520" />
+    <circle class="lockbg" cx="380" cy="226" r="17" />
+    <path class="lock" d="M373 225v-4a7 7 0 0 1 14 0v4M371 225h18v11h-18z" />
+    <text class="s" x="380" y="196">screen, input, clipboard, sound</text>
+    <text class="s" x="380" y="266">encrypted end to end</text>
+  </svg>
+
+  <svg class="tall" viewBox="0 0 340 470" role="img" aria-label={alt}>
+    <rect class="box" x="4" y="4" width="200" height="80" rx="10" />
+    <text class="t" x="104" y="36">Your computer</text>
+    <text class="m" x="104" y="60">checks the password</text>
+
+    <rect class="box" x="4" y="382" width="200" height="80" rx="10" />
+    <text class="t" x="104" y="414">Their device</text>
+    <text class="m" x="104" y="438">enters ID and password</text>
+
+    <path class="secure" d="M60 84 V382" />
+    <circle class="lockbg" cx="60" cy="233" r="17" />
+    <path class="lock" d="M53 232v-4a7 7 0 0 1 14 0v4M51 232h18v11h-18z" />
+    <text class="s start" x="86" y="214">encrypted</text>
+    <text class="s start" x="86" y="234">end to end</text>
+    <text class="m start" x="86" y="258">screen, input,</text>
+    <text class="m start" x="86" y="278">clipboard, sound</text>
+
+    <rect class="box" x="214" y="190" width="122" height="86" rx="10" />
+    <text class="t" x="275" y="222">Server</text>
+    <text class="m" x="275" y="244">introduces</text>
+    <text class="m" x="275" y="262">the devices</text>
+    <path class="dash" d="M275 190 V104 Q275 84 255 84 H204" />
+    <path class="dash" d="M275 276 V362 Q275 382 255 382 H204" />
+  </svg>
+</figure>
+
+<style>
+  .peer { margin: 0; }
+  svg { width: 100%; height: auto; overflow: visible; font-family: var(--font); }
+  .wide { display: none; max-width: 760px; margin-inline: auto; }
+  .tall { max-width: 340px; }
+  @media (min-width: 46rem) {
+    .wide { display: block; }
+    .tall { display: none; }
+  }
+  .box { fill: var(--surface); stroke: var(--rule); stroke-width: 1.5; }
+  text { text-anchor: middle; }
+  .start { text-anchor: start; }
+  .t { fill: var(--ink); font-size: 17px; font-weight: 700; }
+  .m { fill: var(--muted); font-size: 14px; }
+  .s { fill: var(--secure); font-size: 15px; font-weight: 650; }
+  .dash { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 5 6; }
+  .secure { stroke: var(--secure); stroke-width: 5; stroke-linecap: round; }
+  .lockbg { fill: var(--paper); stroke: var(--secure); stroke-width: 2.5; }
+  .lock { fill: none; stroke: var(--secure); stroke-width: 2.2; stroke-linejoin: round; }
+</style>

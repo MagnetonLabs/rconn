@@ -1,0 +1,320 @@
+---
+import Base from '../layouts/Base.astro';
+import ComputerId from '../components/ComputerId.astro';
+import DownloadCta from '../components/DownloadCta.astro';
+import PeerDiagram from '../components/PeerDiagram.astro';
+
+const features = [
+  {
+    name: 'Hardware video',
+    text: 'H.264 encoded on the graphics chip on Windows and decoded with VideoToolbox on the Mac, with a software fallback when there is no hardware encoder.',
+  },
+  {
+    name: 'Fits your window',
+    text: 'The remote screen switches to the display mode closest to your window, and goes back to its own when you disconnect.',
+  },
+  {
+    name: 'Clipboard',
+    text: 'Copy text on one computer and paste it on the other.',
+  },
+  {
+    name: 'Sound',
+    text: 'Hear what plays on the remote computer.',
+  },
+  {
+    name: 'Windows, Mac and Linux',
+    text: 'Windows on x64 and ARM64, Macs with Apple silicon or Intel, and Ubuntu 24.04 or later on X11 or Wayland.',
+  },
+  {
+    name: 'iPhone and iPad',
+    text: 'Connect from your phone or tablet, with trackpad-style touch and a keyboard with modifier keys. Coming to the App Store.',
+  },
+];
+
+const faq = [
+  {
+    q: 'Is Rconn free?',
+    a: 'Yes. Rconn is free to use, and the server software is free and open source if you want to run your own.',
+  },
+  {
+    q: 'Do I need an account?',
+    a: 'No. Install Rconn, set an access password, and share your computer’s ID with the person you want to let in.',
+  },
+  {
+    q: 'Can someone connect without my password?',
+    a: 'No. Your computer checks the password itself, and nothing from your screen is sent, and no input is accepted, until it matches. After five wrong tries it stops accepting attempts for a minute.',
+  },
+  {
+    q: 'What can the Rconn server see?',
+    a: 'Which computer IDs are online, which devices ask to connect to each other and when, and the network addresses it needs to introduce them. It never receives your password. The <a href="/security">security page</a> explains what the server can and cannot do.',
+  },
+  {
+    q: 'Why does my computer warn me when I open the installer?',
+    a: 'This early release is not yet notarized by Apple or code-signed for Windows SmartScreen, so your system asks before running it. The <a href="/download">download page</a> shows how to open it and how to check the file against its SHA-256 hash.',
+  },
+  {
+    q: 'Does it work on Wayland?',
+    a: 'Yes. The first time someone connects, Ubuntu asks you to allow screen sharing. Rconn remembers your answer for later sessions.',
+  },
+  {
+    q: 'Is there an Android app?',
+    a: 'Not yet.',
+  },
+];
+---
+
+<Base
+  title="Rconn: remote desktop by ID and password"
+  description="Rconn is a free remote-desktop app. Your computer gets an ID; someone you trust connects with it and your password. Peer to peer, encrypted end to end, no account."
+>
+  <section class="hero wrap" aria-labelledby="hero-title">
+    <h1 id="hero-title">Remote desktop by&nbsp;number.</h1>
+    <div class="hero-id">
+      <ComputerId />
+      <p class="hero-id-note">
+        This is what a computer’s ID looks like. With it and the access password you set,
+        someone you trust can see and control your screen.
+      </p>
+    </div>
+    <div class="hero-foot">
+      <p class="lede">
+        No account, no sign-up. The picture and the keystrokes go straight between the two
+        devices, encrypted end to end.
+      </p>
+      <DownloadCta />
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="how-title">
+    <div class="wrap">
+      <h2 id="how-title">Three steps</h2>
+      <ol class="steps">
+        <li>
+          <h3>Install Rconn</h3>
+          <p>Your computer gets its own ID, shown in the app.</p>
+        </li>
+        <li>
+          <h3>Set an access password</h3>
+          <p>
+            Choose one of at least eight characters in Settings. Rconn keeps only a one-way
+            check of it, never the password itself.
+          </p>
+        </li>
+        <li>
+          <h3>Share the ID and password</h3>
+          <p>
+            Give both to the person helping you, or use them yourself from another computer.
+            They type them into Rconn and your screen appears.
+          </p>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="sec-title">
+    <div class="wrap sec">
+      <div class="sec-text">
+        <h2 id="sec-title">The server introduces. It doesn’t watch.</h2>
+        <ul class="facts">
+          <li>
+            <strong>Your computer checks the password.</strong> The check uses SPAKE2, so the
+            password is never sent, and the server can’t test guesses against it.
+          </li>
+          <li>
+            <strong>Screen and input go device to device,</strong> encrypted with DTLS-SRTP,
+            the encryption built into WebRTC.
+          </li>
+          <li>
+            <strong>If a direct path is blocked,</strong> the server can relay the stream. It
+            stays encrypted, and the relay can’t read it.
+          </li>
+        </ul>
+        <p><a href="/security">How Rconn handles security, including its limits</a></p>
+      </div>
+      <PeerDiagram />
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="feat-title">
+    <div class="wrap">
+      <h2 id="feat-title">Built to feel local</h2>
+      <dl class="features">
+        {features.map((f) => (
+          <div>
+            <dt>{f.name}</dt>
+            <dd>{f.text}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  </section>
+
+  <section class="band selfhost" aria-labelledby="self-title">
+    <div class="wrap selfhost-inner">
+      <div>
+        <h2 id="self-title">Run your own server</h2>
+        <p>
+          The Rconn server is free and open source. Run it in Docker on one Linux machine and
+          your devices meet there instead of on ours.
+        </p>
+      </div>
+      <div class="selfhost-cmd">
+        <pre><code>curl -fsSL https://rconn.app/install.sh \
+  | sudo RCONN_HOSTNAME=rconn.example.com bash</code></pre>
+        <p><a href="/self-host">Self-hosting guide</a></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="faq-title">
+    <div class="wrap faq-wrap">
+      <h2 id="faq-title">Questions</h2>
+      <div class="faq">
+        {faq.map((item) => (
+          <details>
+            <summary>{item.q}</summary>
+            <p set:html={item.a} />
+          </details>
+        ))}
+      </div>
+    </div>
+  </section>
+</Base>
+
+<style>
+  /* ---------- Hero ---------- */
+  .hero {
+    padding-block: clamp(2.5rem, 7vw, 5rem) clamp(3.5rem, 8vw, 6rem);
+    display: grid;
+    gap: clamp(1.5rem, 4vw, 2.5rem);
+  }
+  .hero h1 { max-width: 14ch; }
+  .hero-id {
+    display: grid;
+    gap: 1rem;
+    padding-block: clamp(1rem, 3vw, 1.75rem);
+    border-block: 1px solid var(--rule);
+  }
+  .hero-id-note {
+    max-width: 34rem;
+    font-size: var(--s-16);
+    color: var(--muted);
+  }
+  .hero-foot {
+    display: grid;
+    gap: 1.75rem;
+    align-items: start;
+  }
+  .hero-foot .lede { color: var(--ink); }
+  @media (min-width: 56rem) {
+    .hero-foot { grid-template-columns: 1fr 1fr; gap: 3rem; }
+  }
+
+  /* ---------- Steps (a real sequence, so numbered) ---------- */
+  .steps {
+    list-style: none;
+    margin: 2.25rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 2rem;
+    counter-reset: step;
+  }
+  @media (min-width: 52rem) {
+    .steps { grid-template-columns: repeat(3, 1fr); gap: 2.5rem; }
+  }
+  .steps li {
+    counter-increment: step;
+    display: grid;
+    grid-template-columns: 2.75rem 1fr;
+    column-gap: 0.75rem;
+    row-gap: 0.4rem;
+    align-content: start;
+  }
+  .steps li::before {
+    content: counter(step);
+    grid-row: span 2;
+    font-weight: 800;
+    font-size: var(--s-48);
+    line-height: 0.9;
+    color: var(--blue);
+    font-variant-numeric: tabular-nums;
+  }
+  @media (min-width: 52rem) {
+    .steps li { grid-template-columns: 1fr; }
+    .steps li::before { grid-row: auto; margin-bottom: 0.6rem; }
+  }
+  .steps p { color: var(--muted); }
+
+  /* ---------- Security ---------- */
+  .sec { display: grid; gap: clamp(2.5rem, 5vw, 3.5rem); }
+  .sec-text { display: grid; gap: 1.5rem; }
+  .sec-text h2 { max-width: 16ch; }
+  @media (min-width: 56rem) {
+    .sec-text { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); column-gap: 3rem; }
+    .sec-text > p { grid-column: 2; }
+  }
+  .facts {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    gap: 1rem;
+  }
+  .facts li { padding-left: 1rem; border-left: 3px solid var(--secure); }
+
+  /* ---------- Features ---------- */
+  .features {
+    margin: 2.25rem 0 0;
+    display: grid;
+    gap: 0;
+    border-top: 1px solid var(--rule);
+  }
+  @media (min-width: 48rem) {
+    .features { grid-template-columns: 1fr 1fr; column-gap: 3rem; }
+  }
+  .features > div {
+    padding-block: 1.25rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .features dt { font-weight: 700; font-size: var(--s-21); letter-spacing: -0.01em; }
+  .features dd { margin: 0.3rem 0 0; color: var(--muted); }
+
+  /* ---------- Self-host ---------- */
+  .selfhost { background: var(--tint); }
+  .selfhost-inner { display: grid; gap: 1.75rem; align-items: center; }
+  .selfhost-inner h2 { margin-bottom: 0.9rem; }
+  .selfhost-inner p { max-width: 32rem; }
+  .selfhost-cmd { display: grid; gap: 1rem; min-width: 0; }
+  @media (min-width: 56rem) {
+    .selfhost-inner { grid-template-columns: 1fr 1fr; gap: 3rem; }
+  }
+
+  /* ---------- FAQ ---------- */
+  .faq-wrap { display: grid; gap: 2rem; }
+  @media (min-width: 56rem) {
+    .faq-wrap { grid-template-columns: 1fr 2fr; gap: 3rem; }
+  }
+  .faq { border-top: 1px solid var(--rule); }
+  .faq details { border-bottom: 1px solid var(--rule); }
+  .faq summary {
+    cursor: pointer;
+    padding: 1.1rem 2rem 1.1rem 0;
+    font-weight: 650;
+    font-size: var(--s-18);
+    list-style: none;
+    position: relative;
+  }
+  .faq summary::-webkit-details-marker { display: none; }
+  .faq summary::after {
+    content: '+';
+    position: absolute;
+    right: 0.25rem;
+    top: 50%;
+    translate: 0 -50%;
+    font-size: var(--s-24);
+    font-weight: 400;
+    color: var(--muted);
+  }
+  .faq details[open] summary::after { content: '−'; }
+  .faq details p { padding-bottom: 1.25rem; color: var(--muted); max-width: var(--measure); }
+</style>

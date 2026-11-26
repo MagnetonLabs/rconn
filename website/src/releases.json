@@ -1,0 +1,61 @@
+{
+  "version": "0.1.0",
+  "baseUrl": "https://downloads.rconn.app/",
+  "files": [
+    {
+      "id": "macos",
+      "os": "macos",
+      "name": "macOS",
+      "arch": "universal",
+      "archLabel": "Apple silicon and Intel",
+      "file": "Rconn-0.1.0.dmg",
+      "sizeBytes": 45000000,
+      "sha256": "",
+      "requires": "macOS 13 Ventura or later"
+    },
+    {
+      "id": "windows-x64",
+      "os": "windows",
+      "name": "Windows",
+      "arch": "x64",
+      "archLabel": "x64 (Intel and AMD)",
+      "file": "rconn-host-setup-x64-0.1.0.exe",
+      "sizeBytes": 29000000,
+      "sha256": "",
+      "requires": "64-bit Windows 10 or 11"
+    },
+    {
+      "id": "windows-arm64",
+      "os": "windows",
+      "name": "Windows",
+      "arch": "arm64",
+      "archLabel": "ARM64 (Snapdragon and other Arm PCs)",
+      "file": "rconn-host-setup-arm64-0.1.0.exe",
+      "sizeBytes": 27000000,
+      "sha256": "",
+      "requires": "Windows 11 on Arm"
+    },
+    {
+      "id": "linux-amd64",
+      "os": "linux",
+      "name": "Linux",
+      "arch": "amd64",
+      "archLabel": "x86-64 (.deb)",
+      "file": "rconn_0.1.0_amd64.deb",
+      "sizeBytes": 16000000,
+      "sha256": "",
+      "requires": "Ubuntu 24.04 or later, X11 or Wayland"
+    },
+    {
+      "id": "linux-arm64",
+      "os": "linux",
+      "name": "Linux",
+      "arch": "arm64",
+      "archLabel": "ARM64 (.deb)",
+      "file": "rconn_0.1.0_arm64.deb",
+      "sizeBytes": 16000000,
+      "sha256": "",
+      "requires": "Ubuntu 24.04 or later, X11 or Wayland"
+    }
+  ]
+}

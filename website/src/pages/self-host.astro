@@ -1,0 +1,89 @@
+---
+import Base from '../layouts/Base.astro';
+---
+
+<Base
+  title="Self-host"
+  description="Run your own Rconn server: free, open source, one Docker container on a Linux machine with a public address."
+>
+  <div class="wrap page-head">
+    <h1>Run your own server</h1>
+    <p class="lede">
+      The Rconn server is free and open source. It introduces your devices to each other and
+      relays traffic when they can’t connect directly. Run it yourself and your devices meet
+      on a machine you control.
+    </p>
+  </div>
+
+  <section class="band" aria-labelledby="need-title">
+    <div class="wrap"><div class="prose">
+      <p class="draft-note" role="note">
+        <strong>Preview.</strong> The install script and server image aren’t published at
+        these addresses yet. The commands show how setup will work and may change before
+        release.
+      </p>
+
+      <h2 id="need-title">You’ll need</h2>
+      <ul>
+        <li>A Linux machine with a public IP address: Ubuntu, Debian, Amazon Linux or RHEL.</li>
+        <li>A DNS name pointing at it, such as <code>rconn.example.com</code>.</li>
+        <li>These ports open: TCP 443, UDP 3478 and UDP 49160–49260.</li>
+      </ul>
+
+      <h2>Install</h2>
+      <p>On the server, run:</p>
+      <pre><code>curl -fsSL https://rconn.app/install.sh \
+  | sudo RCONN_HOSTNAME=rconn.example.com bash</code></pre>
+      <p>
+        The script installs Docker if needed, creates the server’s identity, and starts the
+        server with its built-in relay. When it finishes it prints:
+      </p>
+      <ul>
+        <li>the <strong>server URL</strong>, like <code>wss://rconn.example.com:443/v1/ws</code></li>
+        <li>the <strong>server pin</strong>, a fingerprint starting with <code>sha256:</code></li>
+        <li>an admin login, shown once</li>
+      </ul>
+
+      <h2>Point Rconn at it</h2>
+      <p>
+        In Rconn, open the <strong>Server</strong> section and enter the server URL and the
+        server pin. The pin lets each device check it’s talking to your server and not an
+        impostor.
+      </p>
+
+      <h2>Prefer Docker Compose?</h2>
+      <p>The installer writes a file like this to <code>/opt/rconn/compose.yaml</code>:</p>
+      <pre><code>services:
+  signaling:
+    image: ghcr.io/rconn/signaling:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      RCONN_BIND: 0.0.0.0:443
+      RCONN_SERVER_ID: wss://rconn.example.com:443/v1/ws
+      RCONN_TURN_PUBLIC_IP: 203.0.113.10
+    volumes:
+      - rconn-data:/data
+    command: ["serve"]
+volumes:
+  rconn-data:</code></pre>
+      <p>
+        It uses host networking because the relay needs its UDP ports on the machine’s own
+        address. Before the first start, create the server’s identity, which prints the server
+        pin:
+      </p>
+      <pre><code>docker compose run --rm signaling init --hostname rconn.example.com
+docker compose up -d</code></pre>
+    </div></div>
+  </section>
+</Base>
+
+<style>
+  .draft-note {
+    padding: 1rem 1.15rem;
+    border-radius: var(--radius);
+    background: var(--tint);
+    margin-bottom: 2rem;
+  }
+  .prose h2:first-of-type { margin-top: 0; }
+</style>

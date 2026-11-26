@@ -1,0 +1,118 @@
+---
+import Base from '../layouts/Base.astro';
+import PeerDiagram from '../components/PeerDiagram.astro';
+import { version } from '../lib/releases';
+---
+
+<Base
+  title="Security"
+  description="How Rconn connects two devices: the server introduces them, your computer checks the password with SPAKE2, and the session is encrypted end to end with DTLS-SRTP. Including what this doesn't protect against."
+>
+  <div class="wrap page-head">
+    <h1>Who can see what</h1>
+    <p class="lede">
+      Rconn’s server puts two devices in touch. After that, the screen, keystrokes, clipboard
+      and sound go between the devices, encrypted, and the password is checked by your
+      computer, not by us.
+    </p>
+  </div>
+
+  <section class="band" aria-labelledby="server-title">
+    <div class="wrap">
+      <PeerDiagram />
+      <h2 id="server-title" class="split-title">The server, in plain terms</h2>
+      <div class="split">
+        <div>
+          <h3>It can</h3>
+          <ul>
+            <li>See which computer IDs exist and which are online.</li>
+            <li>See that a device asked to connect to a computer, and when.</li>
+            <li>See the network (IP) addresses it uses to introduce the two devices.</li>
+            <li>Relay the encrypted stream when the devices can’t reach each other directly.</li>
+            <li>Limit how many connection attempts a computer receives.</li>
+          </ul>
+        </div>
+        <div>
+          <h3>It can’t</h3>
+          <ul>
+            <li>Learn your access password. It never receives it.</li>
+            <li>Test password guesses offline. Every guess has to be a live attempt on your computer.</li>
+            <li>Read the screen, keystrokes, clipboard or sound of a session, including when it relays one.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="steps-title">
+    <div class="wrap"><div class="prose">
+      <h2 id="steps-title">What happens when someone connects</h2>
+      <ol>
+        <li>Their device asks the server for your computer by its ID.</li>
+        <li>
+          The server introduces the two devices so they can find a network path. They set up
+          an encrypted connection with DTLS, the encryption used by WebRTC. Video and sound
+          travel as SRTP over it. When no direct path exists, the server relays the
+          already-encrypted data.
+        </li>
+        <li>
+          Over that connection, the two devices run a password check called SPAKE2. Each side
+          proves it knows the password without sending it. Someone who records the exchange
+          learns nothing they can use to guess the password offline.
+        </li>
+        <li>
+          Only when the check passes does your computer start sending its screen and accepting
+          input. Until then nothing is shown, played or accepted.
+        </li>
+      </ol>
+
+      <h2>Your password on your computer</h2>
+      <ul>
+        <li>
+          Rconn stores a one-way check of the password (Argon2id), not the password itself,
+          readable only by the computer’s administrators.
+        </li>
+        <li>Passwords need at least eight characters.</li>
+        <li>After five wrong tries, your computer refuses every attempt for a minute.</li>
+        <li>A password session reaches only that one computer.</li>
+      </ul>
+
+      <h2>What this doesn’t protect against</h2>
+      <ul>
+        <li>
+          <strong>People you give the password to.</strong> Anyone with your ID and password
+          can see and control your computer. Only share them with people you trust, and change
+          the password afterwards. Be wary of anyone who calls you and asks you to install
+          remote-access software.
+        </li>
+        <li>
+          <strong>A server that turns hostile.</strong> The devices exchange their encryption
+          keys through the server, and today’s password check doesn’t confirm those keys. A
+          server modified to attack you could place itself in the middle of a session. If that
+          risk matters to you, <a href="/self-host">run your own server</a>.
+        </li>
+        <li>
+          <strong>Information about connections.</strong> The server knows which devices
+          connect to each other, when, and from which addresses, even though it can’t see
+          what happens in the session.
+        </li>
+        <li>
+          <strong>Early software.</strong> Rconn {version} hasn’t had an independent security
+          audit.
+        </li>
+      </ul>
+    </div></div>
+  </section>
+</Base>
+
+<style>
+  .split-title { margin-top: clamp(2.5rem, 6vw, 4rem); margin-bottom: 1.5rem; }
+  .split { display: grid; gap: 2rem; }
+  @media (min-width: 48rem) {
+    .split { grid-template-columns: 1fr 1fr; gap: 3rem; }
+  }
+  .split h3 { margin-bottom: 0.75rem; }
+  .split ul { margin: 0; padding-left: 1.2em; }
+  .split li + li { margin-top: 0.5em; }
+  .prose h2:first-child { margin-top: 0; }
+</style>
