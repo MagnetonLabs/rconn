@@ -24,13 +24,13 @@ const ROUND_TRIP_FRAMES: usize = 2;
 /// A light desktop with text-like strokes; a line grows by one "character" a frame.
 fn screen(w: usize, h: usize, k: usize) -> Frame {
     let mut bgra = vec![240u8; w * h * 4];
-    for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+    for (i, px) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let (x, y) = (i % w, i / w);
         let line = y / 16;
         let col = x / 8;
         let typed = line != 10 || col < k % 70;
         if y % 16 > 3 && (x * 3 + y * 5 + line) % 7 < 3 && (col + line) % 9 != 0 && typed {
-            px.copy_from_slice(&[40, 40, 40, 255]);
+            *px = [40, 40, 40, 255];
         }
     }
     Frame {

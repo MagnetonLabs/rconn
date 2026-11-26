@@ -112,7 +112,7 @@ fn odd_dimensions_are_cropped_not_rejected() {
 }
 
 #[test]
-fn keyframe_on_request_and_after_bitrate_change() {
+fn keyframe_on_request_but_not_after_bitrate_change() {
     let lib = local_binary_path().unwrap();
     let mut enc = VideoEncoder::new(&lib, EncoderSettings::default()).unwrap();
     let is_idr = |au: &[u8]| {
@@ -129,12 +129,9 @@ fn keyframe_on_request_and_after_bitrate_change() {
         &enc.encode(&synthetic(320, 240, 2)).unwrap().unwrap()
     ));
     enc.set_bitrate(1_000_000);
-    // openh264 is rebuilt for a new bitrate (a keyframe); VideoToolbox and Media
-    // Foundation change it live.
-    let rebuilt = enc.engine_name() == "openh264";
-    assert_eq!(
-        is_idr(&enc.encode(&synthetic(320, 240, 3)).unwrap().unwrap()),
-        rebuilt,
+    // Every engine changes the bitrate live: no keyframe for it.
+    assert!(
+        !is_idr(&enc.encode(&synthetic(320, 240, 3)).unwrap().unwrap()),
         "{}",
         enc.engine_name()
     );

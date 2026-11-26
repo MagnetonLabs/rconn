@@ -1195,10 +1195,10 @@ mod ltr_tests {
             let mut bytes = [0usize; 3];
             let t = Instant::now();
             for (k, f) in frames.iter().enumerate() {
-                if let Some(au) = e.encode(f).unwrap() {
-                    if k > 0 {
-                        bytes[k / 30] += au.len();
-                    }
+                if let Some(au) = e.encode(f).unwrap()
+                    && k > 0
+                {
+                    bytes[k / 30] += au.len();
                 }
             }
             println!(
