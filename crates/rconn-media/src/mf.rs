@@ -68,7 +68,12 @@ pub struct MfH264Encoder {
     /// The last output sample's `MFSampleExtension_LongTermReferenceFrameInfo`, if the
     /// encoder sets it.
     ltr_info: Option<u32>,
+    /// The encoder took a maximum QP: refinement passes lower it for one frame.
+    max_qp: bool,
 }
+
+/// Quantizer ceiling of ordinary frames (as on the openh264 path): never blocky text.
+pub const MAX_QP: u8 = 32;
 
 /// Long-term reference slots asked for: one confirmed by the viewer, one being marked.
 const LTR_SLOTS: u8 = 2;
@@ -216,6 +221,13 @@ impl MfH264Encoder {
                 }
             };
         let info = unsafe { mft.GetOutputStreamInfo(0) }.map_err(err)?;
+        // A maximum QP the encoder takes (Windows 8+ encoders may change it while
+        // encoding; vendors' are not obliged to, and then say so here or ignore it).
+        let max_qp = codec.as_ref().is_some_and(|c| unsafe {
+            c.IsSupported(&CODECAPI_AVEncVideoMaxQP).is_ok()
+                && c.SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(u32::from(MAX_QP)))
+                    .is_ok()
+        });
         Ok(Self {
             activate,
             mft,
@@ -232,6 +244,7 @@ impl MfH264Encoder {
             gpu: None,
             ltr_slots,
             ltr_info: None,
+            max_qp,
         })
     }
 
@@ -295,7 +308,8 @@ impl MfH264Encoder {
                 let _ =
                     codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32));
                 // Same quality floor as the openh264 path: never blocky text.
-                let _ = codec.SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(32u32));
+                let _ =
+                    codec.SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(u32::from(MAX_QP)));
             }
             // Long-term references for repairing losses without a keyframe (Windows 8.1+;
             // optional for vendors' encoders, so asked for and checked, never assumed).
@@ -404,6 +418,23 @@ impl MfH264Encoder {
             let marked = (v >> 16) as u16;
             ((marked != 0xffff).then_some(marked as u8), v as u16)
         })
+    }
+
+    /// Can a frame be coded under a lower quantizer ceiling ([`Self::set_max_qp`])?
+    pub fn can_refine(&self) -> bool {
+        self.max_qp
+    }
+
+    /// Code the next frames no coarser than quantizer `qp` (a refinement pass), or back to
+    /// [`MAX_QP`]. `false` if the encoder refused it.
+    pub fn set_max_qp(&mut self, qp: u8) -> bool {
+        match &self.codec {
+            Some(c) if self.max_qp => {
+                unsafe { c.SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(u32::from(qp))) }
+                    .is_ok()
+            }
+            _ => false,
+        }
     }
 
     /// Change the target bitrate on the fly (no restart, no keyframe).

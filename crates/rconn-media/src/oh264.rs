@@ -1,5 +1,6 @@
 //! openh264 options the `openh264` crate does not wrap: live rate changes, long-term
-//! reference (LTR) feedback, several slices. Each is a `SetOption` call on an
+//! reference (LTR) feedback, several slices, fixed-quantizer frames. Each is a `SetOption`
+//! call on an
 //! initialized encoder.
 //!
 //! Unsafe is confined to this module: `SetOption` with a pointer to a correctly typed,
@@ -9,9 +10,10 @@
 use openh264::encoder::Encoder;
 use openh264_sys2::{
     ENCODER_LTR_MARKING_FEEDBACK, ENCODER_LTR_RECOVERY_REQUEST, ENCODER_OPTION_BITRATE,
-    ENCODER_OPTION_MAX_BITRATE, ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, LTR_MARKING_SUCCESS,
-    LTR_RECOVERY_REQUEST, SBitrateInfo, SEncParamExt, SLTRMarkingFeedback, SLTRRecoverRequest,
-    SM_FIXEDSLCNUM_SLICE, SPATIAL_LAYER_0, SPATIAL_LAYER_ALL,
+    ENCODER_OPTION_MAX_BITRATE, ENCODER_OPTION_RC_MODE, ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+    LTR_MARKING_SUCCESS, LTR_RECOVERY_REQUEST, RC_BITRATE_MODE, RC_MODES, RC_OFF_MODE,
+    SBitrateInfo, SEncParamExt, SLTRMarkingFeedback, SLTRRecoverRequest, SM_FIXEDSLCNUM_SLICE,
+    SPATIAL_LAYER_0, SPATIAL_LAYER_ALL,
 };
 use std::os::raw::c_int;
 
@@ -101,6 +103,52 @@ pub fn set_slices(enc: &mut Encoder, n: u32) -> bool {
         slices.uiSliceNum = n;
         enc.raw_api()
             .set_option(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, (&raw mut p).cast())
+            == 0
+    }
+}
+
+/// Encode the following frames at quantizer `qp` throughout, without rate control (and
+/// without its frame skipping): a refinement pass over a still picture. The layer's QP
+/// is a "little setting" openh264 changes in place (no restart, no keyframe), and
+/// switching the rate-control mode swaps its functions but keeps its state, so
+/// [`rate_controlled`] resumes where the controller left off.
+pub fn fixed_qp(enc: &mut Encoder, qp: u8) -> bool {
+    // SAFETY: `SEncParamExt` is what this option reads and writes; zeroed, then filled
+    // by the encoder with its current parameters, so only the QP differs when set back.
+    unsafe {
+        let mut p: SEncParamExt = std::mem::zeroed();
+        if enc
+            .raw_api()
+            .get_option(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, (&raw mut p).cast())
+            != 0
+        {
+            return false;
+        }
+        if p.sSpatialLayers[0].iDLayerQp != c_int::from(qp) {
+            p.sSpatialLayers[0].iDLayerQp = c_int::from(qp);
+            if enc
+                .raw_api()
+                .set_option(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, (&raw mut p).cast())
+                != 0
+            {
+                return false;
+            }
+        }
+    }
+    set_rc_mode(enc, RC_OFF_MODE)
+}
+
+/// Back to bitrate rate control after [`fixed_qp`].
+pub fn rate_controlled(enc: &mut Encoder) -> bool {
+    set_rc_mode(enc, RC_BITRATE_MODE)
+}
+
+fn set_rc_mode(enc: &mut Encoder, mode: RC_MODES) -> bool {
+    let mut m: c_int = mode;
+    // SAFETY: as in `set_rate` (the option takes an int).
+    unsafe {
+        enc.raw_api()
+            .set_option(ENCODER_OPTION_RC_MODE, (&raw mut m).cast())
             == 0
     }
 }

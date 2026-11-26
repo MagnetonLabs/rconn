@@ -78,6 +78,9 @@ pub struct Sps {
 /// What a slice header needs from its picture parameter set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pps {
+    entropy_coding_mode: bool,
+    /// `26 + pic_init_qp_minus26`: the QP slices start from.
+    pic_init_qp: i32,
     bottom_field_pic_order_in_frame_present: bool,
     redundant_pic_cnt_present: bool,
     weighted_pred: bool,
@@ -136,7 +139,7 @@ pub fn parse_pps(nal: &[u8]) -> Option<Pps> {
     let mut r = Bits::new(nal);
     r.ue()?; // pic_parameter_set_id
     r.ue()?; // seq_parameter_set_id
-    r.bit()?; // entropy_coding_mode_flag
+    let entropy_coding_mode = r.bit()? == 1;
     let bottom_field_pic_order_in_frame_present = r.bit()? == 1;
     if r.ue()? != 0 {
         return None; // slice groups
@@ -145,13 +148,15 @@ pub fn parse_pps(nal: &[u8]) -> Option<Pps> {
     r.ue()?; // num_ref_idx_l1_default_active_minus1
     let weighted_pred = r.bit()? == 1;
     r.bits(2)?; // weighted_bipred_idc
-    r.se()?; // pic_init_qp_minus26
+    let pic_init_qp = 26 + r.se()?;
     r.se()?; // pic_init_qs_minus26
     r.se()?; // chroma_qp_index_offset
     r.bit()?; // deblocking_filter_control_present_flag
     r.bit()?; // constrained_intra_pred_flag
     let redundant_pic_cnt_present = r.bit()? == 1;
     Some(Pps {
+        entropy_coding_mode,
+        pic_init_qp,
         bottom_field_pic_order_in_frame_present,
         redundant_pic_cnt_present,
         weighted_pred,
@@ -172,6 +177,9 @@ pub struct SliceInfo {
     /// The picture predicts from a long-term reference (reference list modification by
     /// long-term picture number).
     pub refs_long_term: bool,
+    /// The slice's quantizer (`slice_qp_delta` applied); encoders may vary it per
+    /// macroblock from there.
+    pub qp: Option<u8>,
 }
 
 /// Parse the header of a slice NAL unit (type 1 or 5).
@@ -270,12 +278,21 @@ pub fn parse_slice(nal: &[u8], sps: &Sps, pps: &Pps) -> Option<SliceInfo> {
             }
         }
     }
+    if pps.entropy_coding_mode && slice_type != 2 && slice_type != 4 {
+        r.ue()?; // cabac_init_idc
+    }
+    let qp = r
+        .se()
+        .map(|d| pps.pic_init_qp + d)
+        .filter(|q| (0..=51).contains(q))
+        .map(|q| q as u8);
     Some(SliceInfo {
         idr,
         frame_num,
         idr_pic_id,
         marks_long_term,
         refs_long_term,
+        qp,
     })
 }
 
