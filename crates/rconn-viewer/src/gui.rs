@@ -1326,7 +1326,7 @@ impl ViewerApp {
             "📁 Files".to_owned()
         };
         if ui
-            .selectable_label(self.files.open, label)
+            .add(egui::Button::new(label).selected(self.files.open))
             .on_hover_text(
                 "Copy files to and from the remote computer (or drop files on the window)",
             )
@@ -1335,11 +1335,23 @@ impl ViewerApp {
             self.files.open = !self.files.open;
         }
         let muted = self.muted.load(std::sync::atomic::Ordering::Relaxed);
+        // Green while playing; red and crossed-out speaker while muted.
+        let sound = if muted {
+            egui::Button::new(
+                egui::RichText::new("🔇 Sound off").color(Color32::from_rgb(255, 170, 160)),
+            )
+            .fill(Color32::from_rgb(110, 36, 32))
+        } else {
+            egui::Button::new(
+                egui::RichText::new("🔊 Sound on").color(Color32::from_rgb(120, 200, 140)),
+            )
+        };
         if ui
-            .button(if muted {
-                "🔇 Sound off"
+            .add(sound)
+            .on_hover_text(if muted {
+                "The remote computer's sound is muted: click to hear it"
             } else {
-                "🔊 Sound on"
+                "Playing the remote computer's sound: click to mute"
             })
             .clicked()
         {
