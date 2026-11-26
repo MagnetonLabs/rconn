@@ -17,6 +17,9 @@ const others = [
     <span data-dl-label>Download Rconn</span>
   </a>
   <p class="cta-meta" data-dl-meta>Version {version} for macOS, Windows and Linux.</p>
+  <p class="cta-alt" data-dl-alt hidden>
+    No admin rights? <a href="/download" data-dl-alt-link>Just for me</a>
+  </p>
   <p class="cta-others">
     <span data-dl-others-label>Available for</span>
     {others.map((o) => (
@@ -26,7 +29,7 @@ const others = [
 </div>
 
 <script>
-  type Entry = { href: string; name: string; arch: string; size: string; version: string };
+  type Entry = { href: string; name: string; arch: string; size: string; version: string; scope: string };
 
   const root = document.querySelector<HTMLElement>('[data-dl]');
   if (root) {
@@ -35,6 +38,8 @@ const others = [
     const label = root.querySelector('[data-dl-label]')!;
     const meta = root.querySelector('[data-dl-meta]')!;
     const othersLabel = root.querySelector('[data-dl-others-label]')!;
+    const alt = root.querySelector<HTMLElement>('[data-dl-alt]')!;
+    const altLink = root.querySelector<HTMLAnchorElement>('[data-dl-alt-link]')!;
 
     const ua = navigator.userAgent;
     const uaData = (navigator as any).userAgentData;
@@ -53,11 +58,19 @@ const others = [
               ? 'linux'
               : '';
 
+    // The button offers the installer for everyone (it also works at the sign-in screen);
+    // where a no-administrator version exists, a small link offers that one.
     const show = (id: string) => {
       const f = files[id];
       btn.href = f.href;
       label.textContent = `Download for ${f.name}`;
-      meta.textContent = `Version ${f.version}, ${f.size}, ${f.arch}.`;
+      meta.textContent = `Version ${[f.version, f.size, f.arch].filter(Boolean).join(', ')}.`;
+      const user = files[`${id}-user`];
+      alt.hidden = !user;
+      if (user) {
+        altLink.href = user.href;
+        altLink.setAttribute('aria-label', `Just for me: ${f.name} installer that needs no administrator`);
+      }
       othersLabel.textContent = 'Also for';
       root.querySelector(`[data-os="${os}"]`)?.remove();
     };
@@ -83,6 +96,7 @@ const others = [
 <style>
   .cta { display: grid; gap: 0.75rem; justify-items: start; }
   .cta-meta { font-size: var(--s-16); color: var(--muted); }
+  .cta-alt { font-size: var(--s-14); color: var(--muted); margin-top: -0.4rem; }
   .cta-others {
     font-size: var(--s-16);
     color: var(--muted);
