@@ -30,6 +30,8 @@
   --gutter: clamp(1rem, 4vw, 2.5rem);
   --wide: 72rem;
   --measure: 38rem;
+  --doc: 46rem;           /* text column on pages with "On this page" */
+  --head-top: clamp(2rem, 5vw, 3.5rem); /* space above a page title */
   --radius: 10px;
 
   color-scheme: light dark;
@@ -142,7 +144,7 @@ pre {
   padding-inline: var(--gutter);
 }
 
-.band { padding-block: clamp(3.5rem, 9vw, 6.5rem); }
+.band { padding-block: clamp(2.5rem, 6vw, 4.5rem); }
 .band + .band { border-top: 1px solid var(--rule); }
 
 .prose { max-width: var(--measure); }
@@ -152,10 +154,10 @@ pre {
 .prose li + li { margin-top: 0.4em; }
 .prose pre { margin-block: 1rem; }
 
-.lede { font-size: clamp(var(--s-18), 2.2vw, var(--s-21)); color: var(--muted); max-width: 36rem; }
+.lede { font-size: clamp(var(--s-18), 2.2vw, var(--s-21)); color: var(--muted); max-width: 42rem; }
 
-.page-head { padding-block: clamp(3rem, 8vw, 5rem) clamp(1.5rem, 4vw, 2.5rem); }
-.page-head h1 { margin-bottom: 1rem; max-width: 20ch; }
+.page-head { padding-block: var(--head-top) clamp(1rem, 2.5vw, 1.5rem); }
+.page-head h1 { margin-bottom: 0.75rem; max-width: 20ch; }
 .page-head + .band:not(.platform) { padding-top: clamp(0.5rem, 2vw, 1.5rem); }
 
 /* ---------- Header / footer ---------- */
@@ -261,6 +263,9 @@ pre {
   .doc-body { display: flex; flex-direction: column; }
   .doc-body > .page-head { order: -1; padding-bottom: 1rem; }
 }
+/* Text on these pages fills its column; code and diagrams take the full column too. */
+.doc-body .prose { max-width: var(--doc); }
+.doc-body .page-head .lede { max-width: var(--doc); }
 .toc-inline summary {
   cursor: pointer;
   font-weight: 600;
@@ -274,8 +279,9 @@ pre {
 @media (min-width: 64rem) {
   .doc-page {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 15rem;
-    column-gap: clamp(2rem, 4vw, 4rem);
+    /* The rail sits right beside the text column, not at the far edge of the page. */
+    grid-template-columns: minmax(0, var(--doc)) 15rem;
+    column-gap: 3.5rem;
     max-width: calc(var(--wide) + 2 * var(--gutter));
     margin-inline: auto;
     padding-inline: var(--gutter);
@@ -289,7 +295,7 @@ pre {
     position: sticky;
     top: 5.5rem;
     align-self: start;
-    margin-top: clamp(3rem, 8vw, 5rem); /* level with the page title */
+    margin-top: var(--head-top); /* level with the page title */
     padding-left: 1.25rem;
     border-left: 1px solid var(--rule);
   }

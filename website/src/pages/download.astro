@@ -1,6 +1,6 @@
 ---
 import Base from '../layouts/Base.astro';
-import { files, url, size, version } from '../lib/releases';
+import { files, url, size, version, type ReleaseFile } from '../lib/releases';
 
 const of = (os: string) => files.filter((f) => f.os === os);
 const platforms = [
@@ -8,6 +8,38 @@ const platforms = [
   { id: 'windows', title: 'Windows', files: of('windows') },
   { id: 'linux', title: 'Linux', files: of('linux') },
 ];
+
+/* What each kind of file is for, in the words the card shows. */
+const scopeText = (f: ReleaseFile) => {
+  if (f.scope === 'system') {
+    return {
+      title: 'For everyone',
+      tag: 'Needs administrator',
+      note:
+        f.os === 'linux'
+          ? 'Installs with sudo for every account on this computer.'
+          : 'Also works at the sign-in screen and on administrator prompts.',
+    };
+  }
+  if (f.scope === 'user') {
+    return {
+      title: 'Just for me',
+      tag: 'No administrator',
+      note:
+        f.os === 'linux'
+          ? 'Unpack it and run ./install.sh, no sudo. Works while you’re signed in.'
+          : 'Works while you’re signed in.',
+    };
+  }
+  return {
+    title: f.archLabel,
+    tag: '',
+    note: 'Drag it to Applications, or to Applications in your home folder if you’re not an administrator.',
+  };
+};
+
+const pick = (p: (typeof platforms)[number], scope: string) => p.files.filter((f) => f.scope === scope);
+const anyHash = (p: (typeof platforms)[number]) => p.files.some((f) => f.sha256);
 ---
 
 <Base
@@ -28,86 +60,120 @@ const platforms = [
 
   {platforms.map((p) => (
     <section class="band platform" id={p.id} aria-labelledby={`${p.id}-title`}>
-      <div class="wrap platform-grid">
+      <div class="wrap">
         <h2 id={`${p.id}-title`}>{p.title}</h2>
-        <div class="platform-body">
+        <div class:list={['platform-body', { single: p.files.length === 1 }]}>
           <ul class="files">
-            {p.files.map((f) => (
-              <li class="file">
-                <div class="file-head">
-                  <div>
-                    <h3>{f.archLabel}</h3>
-                    <p class="file-meta">{f.requires}</p>
+            {p.files.map((f) => {
+              const s = scopeText(f);
+              return (
+                <li class="file">
+                  <div class="file-head">
+                    <div>
+                      {f.scope !== 'any' && <p class="file-arch">{f.archLabel}</p>}
+                      <h3>
+                        {s.title}
+                        {s.tag && <span class="tag">{s.tag}</span>}
+                      </h3>
+                      <p class="file-note">{s.note}</p>
+                      <p class="file-meta">{f.requires}</p>
+                    </div>
+                    <a class="btn" href={url(f)}>
+                      <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11m-5-5 5 5 5-5M5 20h14" /></svg>
+                      Download<span class="visually-hidden"> for {f.name} {f.archLabel}, {s.title}</span>
+                    </a>
                   </div>
-                  <a class="btn" href={url(f)}>
-                    <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11m-5-5 5 5 5-5M5 20h14" /></svg>
-                    Download<span class="visually-hidden"> for {f.name} {f.archLabel}</span>
-                  </a>
-                </div>
-                <dl class="file-facts">
-                  <div class="fname"><dt>File</dt><dd><code>{f.file}</code></dd></div>
-                  <div><dt>Size</dt><dd>{size(f)}</dd></div>
-                  <div><dt>Version</dt><dd>{version}</dd></div>
-                  <div class="hash">
-                    <dt>SHA-256</dt>
-                    <dd>{f.sha256 ? <code>{f.sha256}</code> : <span class="pending">Published with the release</span>}</dd>
-                  </div>
-                </dl>
-              </li>
-            ))}
+                  <dl class="file-facts">
+                    <div class="fname"><dt>File</dt><dd><code>{f.file}</code></dd></div>
+                    {size(f) && <div><dt>Size</dt><dd>{size(f)}</dd></div>}
+                    <div><dt>Version</dt><dd>{version}</dd></div>
+                    {f.sha256 && (
+                      <div class="hash"><dt>SHA-256</dt><dd><code>{f.sha256}</code></dd></div>
+                    )}
+                  </dl>
+                </li>
+              );
+            })}
           </ul>
 
-          <div class="notes prose">
+          <div class="notes">
             {p.id === 'macos' && (
-              <>
+              <div class="prose">
                 <h3>Installing</h3>
                 <ol>
-                  <li>Open <code>{p.files[0].file}</code> and drag Rconn into Applications.</li>
+                  <li>
+                    Open <code>{p.files[0].file}</code> and drag Rconn into Applications. Not an
+                    administrator? Drag it into the Applications folder in your home folder instead.
+                  </li>
                   <li>Open Rconn. The app is signed and notarized by Apple, so it opens normally.</li>
                   <li>
                     To let others connect to this Mac, allow <strong>Screen Recording</strong> and
                     <strong>Accessibility</strong> for Rconn when macOS asks.
                   </li>
                 </ol>
-              </>
+              </div>
             )}
             {p.id === 'windows' && (
               <>
-                <h3>Which one?</h3>
-                <p>
-                  Most PCs need x64. Choose ARM64 for Arm-based PCs, such as those with
-                  Snapdragon chips. To check, open <strong>Settings › System › About</strong> and
-                  look at <strong>System type</strong>.
-                </p>
-                <h3>Installing</h3>
-                <ol>
-                  <li>Run the installer and approve the administrator prompt.</li>
-                  <li>
-                    If Microsoft Defender SmartScreen says <em>Windows protected your PC</em>,
-                    click <strong>More info</strong>, then <strong>Run anyway</strong>. This early
-                    release isn’t code-signed yet.
-                  </li>
-                </ol>
+                <div class="prose">
+                  <h3>Which one?</h3>
+                  <p>
+                    <strong>For everyone</strong> needs an administrator to install. Rconn then
+                    also works at the sign-in screen and on administrator prompts.
+                    <strong>Just for me</strong> installs without administrator rights and works
+                    while you’re signed in.
+                  </p>
+                  <p>
+                    Most PCs need x64. Choose ARM64 for Arm-based PCs, such as those with
+                    Snapdragon chips. To check, open <strong>Settings › System › About</strong> and
+                    look at <strong>System type</strong>.
+                  </p>
+                </div>
+                <div class="prose">
+                  <h3>Installing</h3>
+                  <ol>
+                    <li>
+                      Run the installer. <strong>For everyone</strong> asks for administrator
+                      approval; <strong>Just for me</strong> doesn’t.
+                    </li>
+                    <li>
+                      If Microsoft Defender SmartScreen says <em>Windows protected your PC</em>,
+                      click <strong>More info</strong>, then <strong>Run anyway</strong>. This early
+                      release isn’t code-signed yet.
+                    </li>
+                  </ol>
+                </div>
               </>
             )}
             {p.id === 'linux' && (
               <>
-                <h3>Installing on Ubuntu</h3>
-                <p>Check your architecture with <code>dpkg --print-architecture</code>, then install the matching package:</p>
-                <pre><code>{p.files.map((f) => `sudo apt install ./${f.file}`).join('\n# or\n')}</code></pre>
-                <p>
-                  On Wayland, Ubuntu asks you to allow screen sharing the first time someone
-                  connects. Rconn remembers your answer. On X11 there’s no prompt.
-                </p>
+                <div class="prose">
+                  <h3>For everyone</h3>
+                  <p>Check your architecture with <code>dpkg --print-architecture</code>, then install the matching package:</p>
+                  <pre><code>{pick(p, 'system').map((f) => `sudo apt install ./${f.file}`).join('\n# or\n')}</code></pre>
+                </div>
+                <div class="prose">
+                  <h3>Just for me</h3>
+                  <p>No sudo needed. Unpack the archive, then run <code>./install.sh</code> from the folder it unpacks to:</p>
+                  <pre><code>{pick(p, 'user').map((f) => `tar -xzf ${f.file}`).join('\n# or\n')}</code></pre>
+                  <p>
+                    On Wayland, Ubuntu asks you to allow screen sharing the first time someone
+                    connects. Rconn remembers your answer. On X11 there’s no prompt.
+                  </p>
+                </div>
               </>
             )}
-            <h3>Checking the file</h3>
-            <p>Compare the printed hash with the SHA-256 above.</p>
-            <pre><code>{p.id === 'macos'
-              ? `shasum -a 256 ${p.files[0].file}`
-              : p.id === 'windows'
-                ? `Get-FileHash .\\${p.files[0].file}`
-                : `sha256sum ${p.files[0].file}`}</code></pre>
+            {anyHash(p) && (
+              <div class="prose">
+                <h3>Checking the file</h3>
+                <p>Compare the printed hash with the SHA-256 above.</p>
+                <pre><code>{p.id === 'macos'
+                  ? `shasum -a 256 ${p.files[0].file}`
+                  : p.id === 'windows'
+                    ? `Get-FileHash .\\${p.files[0].file}`
+                    : `sha256sum ${p.files[0].file}`}</code></pre>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -115,7 +181,7 @@ const platforms = [
   ))}
 
   <section class="band platform" id="ios" aria-labelledby="ios-title">
-    <div class="wrap platform-grid">
+    <div class="wrap">
       <h2 id="ios-title">iPhone and iPad</h2>
       <div class="platform-body prose">
         <p>
@@ -133,7 +199,7 @@ const platforms = [
     display: flex;
     flex-wrap: wrap;
     gap: 0.5rem;
-    margin-top: 1.75rem;
+    margin-top: 1.25rem;
   }
   .jump a {
     padding: 0.45rem 0.9rem;
@@ -148,41 +214,81 @@ const platforms = [
 
   .platform { scroll-margin-top: 1rem; }
   .page-head + .platform { border-top: 1px solid var(--rule); }
-  .platform-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
-  @media (min-width: 60rem) {
-    .platform-grid { grid-template-columns: 14rem minmax(0, 1fr); gap: 3rem; }
-  }
-  .platform-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2.5rem; min-width: 0; }
+  .platform h2 { margin-bottom: 1.25rem; }
+  .platform-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2rem; min-width: 0; }
 
-  .files { list-style: none; margin: 0; padding: 0; display: grid; gap: 1.25rem; }
+  /* Wide screens: file cards two to a row (for Windows and Linux, one row per
+     architecture: for everyone, just for me). A platform with one file puts its notes
+     beside the card. */
+  .files {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1rem;
+  }
+  @media (min-width: 60rem) {
+    .files { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; }
+    .single { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem 3rem; }
+    .single .files { grid-template-columns: minmax(0, 1fr); }
+  }
   .file {
+    display: flex;
+    flex-direction: column;
     background: var(--surface);
     border: 1px solid var(--rule);
     border-radius: 14px;
-    padding: clamp(1.1rem, 3vw, 1.5rem);
+    padding: clamp(1.1rem, 2.5vw, 1.4rem);
   }
   .file-head {
     display: flex;
     flex-wrap: wrap;
     gap: 1rem 1.5rem;
     justify-content: space-between;
-    align-items: center;
+    align-items: flex-start;
+    flex: 1;
   }
-  .file-meta { color: var(--muted); font-size: var(--s-16); margin-top: 0.2rem; }
+  .file-head > div { flex: 1 1 15rem; }
+  .file-arch {
+    font-size: var(--s-14);
+    font-weight: 600;
+    color: var(--muted);
+    margin-bottom: 0.2rem;
+  }
+  .file h3 { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.6rem; }
+  .tag {
+    font-size: var(--s-14);
+    font-weight: 600;
+    letter-spacing: 0;
+    padding: 0.1rem 0.55rem;
+    border-radius: 999px;
+    background: var(--tint);
+    color: var(--ink);
+  }
+  .file-note { margin-top: 0.4rem; font-size: var(--s-16); }
+  .file-meta { color: var(--muted); font-size: var(--s-14); margin-top: 0.3rem; }
   .file-facts {
-    margin: 1.25rem 0 0;
-    padding-top: 1rem;
+    margin: 1rem 0 0;
+    padding-top: 0.85rem;
     border-top: 1px solid var(--rule);
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(9rem, auto));
-    gap: 0.75rem 2rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem 2rem;
     font-size: var(--s-16);
   }
   .file-facts dt { color: var(--muted); font-size: var(--s-14); }
   .file-facts dd { margin: 0.1rem 0 0; overflow-wrap: anywhere; }
-  .file-facts .hash, .file-facts .fname { grid-column: 1 / -1; }
-  @media (min-width: 40rem) { .file-facts .fname { grid-column: auto; } }
-  .pending { color: var(--muted); font-style: italic; }
+  .file-facts .hash { flex-basis: 100%; }
 
-  .notes h3:first-child { margin-top: 0; }
+  /* Notes: side by side on wide screens instead of one long column. */
+  .notes {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+    gap: 1.5rem 3rem;
+    align-items: start;
+  }
+  .single .notes { grid-template-columns: minmax(0, 1fr); }
+  .notes .prose { max-width: none; }
+  .notes h3 { margin-top: 0; }
 </style>
