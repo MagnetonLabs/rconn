@@ -109,6 +109,10 @@ enum Engine {
     /// and the GPU's encoder where a vendor registers one.
     #[cfg(windows)]
     MediaFoundation(crate::mf::MfH264Encoder),
+    /// Apple's encoder (the hardware one where there is one), in low-latency mode; it
+    /// can also take the capturer's GPU surfaces without a copy.
+    #[cfg(target_os = "macos")]
+    VideoToolbox(Box<crate::vt_encode::VtEncoder>),
 }
 
 pub struct VideoEncoder {
@@ -129,9 +133,27 @@ pub struct VideoEncoder {
     scale: f32,
     last_was_key: bool,
     force_key: bool,
+    /// macOS: openh264 rather than VideoToolbox, as asked for (`RCONN_ENCODER=openh264`,
+    /// [`VideoEncoder::software`]) or because VideoToolbox failed.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    software_only: bool,
+    /// VideoToolbox failures in a row.
+    #[cfg(target_os = "macos")]
+    vt_failures: u32,
 }
 
 impl VideoEncoder {
+    /// Cisco's openh264 rather than VideoToolbox (comparisons, tests).
+    #[cfg(target_os = "macos")]
+    pub fn software(
+        openh264_path: &std::path::Path,
+        settings: EncoderSettings,
+    ) -> Result<Self, CodecError> {
+        let mut enc = Self::new(openh264_path, settings)?;
+        enc.software_only = true;
+        Ok(enc)
+    }
+
     /// `openh264_path` is Cisco's shared library (see [`crate::cisco`]).
     pub fn new(
         openh264_path: &std::path::Path,
@@ -152,10 +174,26 @@ impl VideoEncoder {
             scale: 1.0,
             last_was_key: false,
             force_key: false,
+            software_only: std::env::var("RCONN_ENCODER").is_ok_and(|v| v == "openh264"),
+            #[cfg(target_os = "macos")]
+            vt_failures: 0,
         })
     }
 
     fn build(&mut self, width: usize, height: usize) -> Result<Engine, CodecError> {
+        #[cfg(target_os = "macos")]
+        if !self.software_only {
+            match crate::vt_encode::VtEncoder::new(width, height, &self.settings) {
+                Ok(vt) => {
+                    self.engine_name = vt.name().to_owned();
+                    return Ok(Engine::VideoToolbox(Box::new(vt)));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "VideoToolbox encoder unavailable; using openh264");
+                    self.software_only = true;
+                }
+            }
+        }
         #[cfg(windows)]
         match crate::mf::MfH264Encoder::new(
             width as u32,
@@ -233,6 +271,8 @@ impl VideoEncoder {
         match &mut self.encoder {
             #[cfg(windows)]
             Some(Engine::MediaFoundation(mf)) => mf.set_bitrate(bps), // live, no keyframe
+            #[cfg(target_os = "macos")]
+            Some(Engine::VideoToolbox(vt)) => vt.set_bitrate(bps), // live, no keyframe
             _ => self.encoder = None, // openh264: rebuilt lazily; the first frame out is an IDR
         }
     }
@@ -273,29 +313,7 @@ impl VideoEncoder {
         changed_rows: Option<(usize, usize)>,
     ) -> Result<Option<Vec<u8>>, CodecError> {
         let (w, h) = yuv.dimensions();
-        if self.dims != Some((w, h)) || self.encoder.is_none() {
-            // Switching between two sizes (full / half while things move) reuses the
-            // encoder kept for the other size; its next frame must be a keyframe.
-            let previous = self.encoder.take().zip(self.dims);
-            let old_headers = std::mem::take(&mut self.headers);
-            let engine = match self.spare.take() {
-                Some((dims, engine, headers)) if dims == (w, h) => {
-                    self.force_key = true;
-                    self.headers = headers;
-                    engine
-                }
-                _ => self.build(w, h)?,
-            };
-            self.spare = previous.map(|(e, d)| (d, e, old_headers));
-            self.encoder = Some(engine);
-            self.dims = Some((w, h));
-            self.nv12.clear(); // forces a full NV12 rewrite
-            // A kept encoder may still have an older bitrate.
-            #[cfg(windows)]
-            if let Some(Engine::MediaFoundation(mf)) = &mut self.encoder {
-                mf.set_bitrate(self.settings.bitrate_bps);
-            }
-        }
+        self.ensure_engine(w, h)?;
         let force_key = std::mem::take(&mut self.force_key);
         let out = match self.encoder.as_mut().expect("built above") {
             Engine::OpenH264(encoder) => {
@@ -321,8 +339,131 @@ impl VideoEncoder {
                 self.last_was_key = has_idr(&out);
                 out
             }
+            #[cfg(target_os = "macos")]
+            Engine::VideoToolbox(vt) => match vt.encode_i420(yuv, changed_rows, force_key) {
+                Ok(au) => self.vt_output(au),
+                Err(e) => {
+                    // A new session (or openh264) gets the whole picture again.
+                    self.vt_failed(&e, force_key);
+                    return self.encode_yuv(yuv, None);
+                }
+            },
         };
-        let _ = changed_rows; // only the NV12 path can use it
+        let _ = changed_rows; // only the NV12 paths can use it
+        Ok(self.finish(out, force_key))
+    }
+
+    /// Can this encoder take the capturer's GPU surfaces as they are (VideoToolbox)?
+    pub fn wants_surfaces(&self) -> bool {
+        cfg!(target_os = "macos") && !self.software_only
+    }
+
+    /// Encode a captured GPU surface. VideoToolbox reads it where it is (no copy); a
+    /// software encoder gets a CPU conversion of it.
+    pub fn encode_surface(
+        &mut self,
+        surface: &crate::capture::Surface,
+    ) -> Result<Option<Vec<u8>>, CodecError> {
+        let (w, h) = surface.dimensions();
+        let (w, h) = (w & !1, h & !1);
+        if w == 0 || h == 0 {
+            return Ok(None);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if !self.software_only {
+                self.ensure_engine(w, h)?;
+            }
+            if let Some(Engine::VideoToolbox(vt)) = self.encoder.as_mut() {
+                let force_key = std::mem::take(&mut self.force_key);
+                return match vt.encode_surface(surface, force_key) {
+                    Ok(au) => {
+                        let out = self.vt_output(au);
+                        Ok(self.finish(out, force_key))
+                    }
+                    Err(e) => {
+                        self.vt_failed(&e, force_key);
+                        self.encode_surface(surface)
+                    }
+                };
+            }
+            let mut yuv = self.yuv.take();
+            if !surface.to_i420(&mut yuv) {
+                return Err(CodecError::VideoToolbox(
+                    "could not read the captured surface".into(),
+                ));
+            }
+            let yuv = yuv.expect("allocated by to_i420");
+            let out = self.encode_yuv(&yuv, None);
+            self.yuv = Some(yuv);
+            out
+        }
+        #[cfg(not(target_os = "macos"))]
+        match *surface {}
+    }
+
+    /// Make sure the engine encodes `w` x `h` pictures.
+    fn ensure_engine(&mut self, w: usize, h: usize) -> Result<(), CodecError> {
+        if self.dims != Some((w, h)) || self.encoder.is_none() {
+            // Switching between two sizes (full / half while things move) reuses the
+            // encoder kept for the other size; its next frame must be a keyframe.
+            let previous = self.encoder.take().zip(self.dims);
+            let old_headers = std::mem::take(&mut self.headers);
+            let engine = match self.spare.take() {
+                Some((dims, engine, headers)) if dims == (w, h) => {
+                    self.force_key = true;
+                    self.headers = headers;
+                    engine
+                }
+                _ => self.build(w, h)?,
+            };
+            self.spare = previous.map(|(e, d)| (d, e, old_headers));
+            self.encoder = Some(engine);
+            self.dims = Some((w, h));
+            self.nv12.clear(); // forces a full NV12 rewrite
+            // A kept encoder may still have an older bitrate.
+            #[cfg(windows)]
+            if let Some(Engine::MediaFoundation(mf)) = &mut self.encoder {
+                mf.set_bitrate(self.settings.bitrate_bps);
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(Engine::VideoToolbox(vt)) = &mut self.encoder {
+                vt.set_bitrate(self.settings.bitrate_bps);
+                vt.forget_picture(); // a kept session's copy predates the rows reported
+            }
+        }
+        Ok(())
+    }
+
+    /// A VideoToolbox frame out: `None` (dropped) becomes an empty unit.
+    #[cfg(target_os = "macos")]
+    fn vt_output(&mut self, au: Option<(Vec<u8>, bool)>) -> Vec<u8> {
+        self.vt_failures = 0;
+        let (out, key) = au.unwrap_or_default();
+        self.last_was_key = key;
+        out
+    }
+
+    /// VideoToolbox failed to encode (its session dies on sleep/wake or a GPU change):
+    /// drop the session so the next frame makes a new one. After a few failures in a row,
+    /// openh264 takes over for good.
+    #[cfg(target_os = "macos")]
+    fn vt_failed(&mut self, error: &str, force_key: bool) {
+        self.vt_failures += 1;
+        self.encoder = None;
+        self.spare = None;
+        self.force_key |= force_key;
+        if self.vt_failures >= 3 {
+            tracing::warn!(error, "VideoToolbox keeps failing; using openh264");
+            self.software_only = true;
+        } else {
+            tracing::warn!(error, "VideoToolbox encode failed; starting a new session");
+        }
+    }
+
+    /// Bookkeeping after a frame: a keyframe still owed, and stream headers in front of
+    /// keyframes. `None` for an empty unit (a skipped frame).
+    fn finish(&mut self, out: Vec<u8>, force_key: bool) -> Option<Vec<u8>> {
         // A keyframe asked for (a viewer lost its picture) is owed until one comes out: the
         // rate controller may skip the frame it was asked of, and a viewer without a
         // picture has nothing to show until it gets one.
@@ -341,7 +482,16 @@ impl VideoEncoder {
             }
         }
         let out = with_headers(out, &mut self.headers);
-        Ok(if out.is_empty() { None } else { Some(out) })
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// The VideoToolbox session in use, if any.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn vt_for_test(&mut self) -> Option<&mut crate::vt_encode::VtEncoder> {
+        match self.encoder.as_mut() {
+            Some(Engine::VideoToolbox(vt)) => Some(vt),
+            _ => None,
+        }
     }
 
     /// Was the last encoded frame a keyframe? (Keyframes are always slow and large.)
@@ -390,7 +540,7 @@ pub(crate) fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// The sequence parameter set (SPS) in `annex_b`, if any (without its start code).
-fn sequence_header(annex_b: &[u8]) -> Option<&[u8]> {
+pub(crate) fn sequence_header(annex_b: &[u8]) -> Option<&[u8]> {
     nal_units(annex_b).find(|nal| nal[0] & 0x1f == 7)
 }
 

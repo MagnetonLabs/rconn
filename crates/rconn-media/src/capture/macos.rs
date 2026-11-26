@@ -7,31 +7,42 @@
 //!
 //! SCStream delivers frames on its own dispatch queue to [`StreamOutput`], which copies
 //! each complete frame into a one-slot mailbox; [`MacCapturer::next_frame`] waits on it.
+//! In surface mode ([`Capturer::use_surfaces`], for the VideoToolbox encoder) nothing is
+//! copied: ScreenCaptureKit converts to NV12 and scales on the GPU, and the mailbox holds
+//! its IOSurface-backed pixel buffer, which the encoder reads directly.
 //! The process needs the Screen Recording permission (TCC); without it ScreenCaptureKit
 //! returns an error, reported as [`CaptureError::Backend`].
 #![allow(unsafe_code)]
 
-use super::{CaptureError, Capturer};
+use super::{CaptureError, Captured, Capturer};
 use crate::video::Frame;
+use crate::yuv::I420;
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-use objc2_core_foundation::{CFDictionary, CFNumber};
-use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGDisplayMode, CGMainDisplayID};
+use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained};
+use objc2_core_graphics::{
+    CGDisplayCopyDisplayMode, CGDisplayMode, CGMainDisplayID,
+    kCGDisplayStreamYCbCrMatrix_ITU_R_601_4,
+};
 use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{
-    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
+    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+    CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
     CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferIsPlanar,
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
-    kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+    kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVReturnSuccess,
 };
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamDelegate, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
 };
+#[cfg(test)]
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
@@ -42,10 +53,11 @@ const SCK_TIMEOUT: Duration = Duration::from_secs(10);
 const PERMISSION_HINT: &str = "grant Screen Recording permission in System Settings > \
      Privacy & Security > Screen & System Audio Recording, then restart the agent";
 
-/// Latest captured frame, or the error that stopped the stream.
+/// Latest captured frame (or surface), or the error that stopped the stream.
 #[derive(Default)]
 struct Slot {
     frame: Option<Frame>,
+    surface: Option<Surface>,
     stopped: Option<String>,
 }
 
@@ -53,6 +65,123 @@ struct Slot {
 struct Shared {
     slot: Mutex<Slot>,
     ready: Condvar,
+    /// Hand over ScreenCaptureKit's pixel buffers instead of copies.
+    surfaces: AtomicBool,
+}
+
+/// A captured picture still on the GPU: ScreenCaptureKit's IOSurface-backed pixel buffer
+/// (NV12 or BGRA), handed to a hardware encoder without a copy.
+pub struct Surface {
+    pb: CFRetained<CVPixelBuffer>,
+    width: usize,
+    height: usize,
+    pub captured_at: Instant,
+}
+
+// SAFETY: a CVPixelBuffer may be retained, released and read from any thread; nothing
+// writes to it once ScreenCaptureKit has delivered it.
+unsafe impl Send for Surface {}
+
+impl Surface {
+    /// The sample's pixel buffer, if it is one of the formats we read.
+    fn from_sample(sample: &CMSampleBuffer) -> Option<Surface> {
+        // SAFETY: `image_buffer` returns a retained pixel buffer; we read its properties.
+        unsafe {
+            let pb = sample.image_buffer()?;
+            let format = CVPixelBufferGetPixelFormatType(&pb);
+            if format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                && format != kCVPixelFormatType_32BGRA
+            {
+                return None;
+            }
+            let (width, height) = (CVPixelBufferGetWidth(&pb), CVPixelBufferGetHeight(&pb));
+            (width >= 2 && height >= 2).then(|| Surface {
+                pb,
+                width,
+                height,
+                captured_at: Instant::now(),
+            })
+        }
+    }
+
+    /// Wrap a pixel buffer (NV12 video range or BGRA), retaining it. For tests.
+    ///
+    /// # Safety
+    /// `pb` must be a valid `CVPixelBufferRef`.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_pixel_buffer(pb: NonNull<std::ffi::c_void>) -> Surface {
+        // SAFETY: the caller hands us a valid pixel buffer; we take our own reference.
+        let pb = unsafe { CFRetained::retain(pb.cast::<CVPixelBuffer>()) };
+        let (width, height) = (CVPixelBufferGetWidth(&pb), CVPixelBufferGetHeight(&pb));
+        Surface {
+            pb,
+            width,
+            height,
+            captured_at: Instant::now(),
+        }
+    }
+
+    /// The pixel size; H.264 uses the even part of it.
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    /// The `CVPixelBufferRef`, valid while `self` is.
+    pub(crate) fn as_ptr(&self) -> *const std::ffi::c_void {
+        CFRetained::as_ptr(&self.pb).as_ptr().cast_const().cast()
+    }
+
+    /// Convert on the CPU (for a software encoder) into `out`, (re)allocated at the even
+    /// size. `false` if the buffer could not be read.
+    pub(crate) fn to_i420(&self, out: &mut Option<I420>) -> bool {
+        let (w, h) = (self.width & !1, self.height & !1);
+        let pic = match out {
+            Some(p) if p.dimensions() == (w, h) => p,
+            _ => out.insert(I420::new(w, h)),
+        };
+        let pb = &*self.pb;
+        // SAFETY: the buffer is locked read-only while we read each plane within
+        // `bytes_per_row * height`.
+        unsafe {
+            if CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly)
+                != kCVReturnSuccess
+            {
+                return false;
+            }
+            let ok = if CVPixelBufferIsPlanar(pb) {
+                let (y, uv) = (
+                    CVPixelBufferGetBaseAddressOfPlane(pb, 0).cast::<u8>(),
+                    CVPixelBufferGetBaseAddressOfPlane(pb, 1).cast::<u8>(),
+                );
+                let (ys, uvs) = (
+                    CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
+                    CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
+                );
+                let ok = !y.is_null() && !uv.is_null() && ys >= w && uvs >= w;
+                if ok {
+                    pic.fill_from_nv12(
+                        (
+                            std::slice::from_raw_parts(y, ys * self.height),
+                            std::slice::from_raw_parts(uv, uvs * self.height.div_ceil(2)),
+                        ),
+                        (ys, uvs),
+                    );
+                }
+                ok
+            } else {
+                let base = CVPixelBufferGetBaseAddress(pb).cast::<u8>();
+                let stride = CVPixelBufferGetBytesPerRow(pb);
+                let ok = !base.is_null() && stride >= w * 4 && stride.is_multiple_of(4);
+                if ok {
+                    let src = std::slice::from_raw_parts(base, stride * self.height);
+                    pic.fill_from_bgra(src, stride / 4);
+                }
+                ok
+            };
+            CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags::ReadOnly);
+            ok
+        }
+    }
 }
 
 impl Shared {
@@ -84,6 +213,13 @@ define_class!(
                 return;
             }
             let shared = self.ivars();
+            if shared.surfaces.load(Ordering::Relaxed) {
+                if let Some(surface) = Surface::from_sample(sample) {
+                    shared.lock().surface = Some(surface);
+                    shared.ready.notify_all();
+                }
+                return;
+            }
             // Reuse the buffer of a frame the consumer never took.
             let reuse = shared.lock().frame.take().map(|f| f.bgra);
             if let Some(frame) = copy_frame(sample, reuse.unwrap_or_default()) {
@@ -270,6 +406,19 @@ fn pixel_size(display: &SCDisplay) -> (usize, usize) {
     }
 }
 
+/// The size `Frame::fit_within(max)` gives (halving), made even: what the CPU path sends.
+fn fit(size: (usize, usize), max: (usize, usize)) -> (usize, usize) {
+    let (mut w, mut h) = size;
+    while (w > max.0 || h > max.1) && w >= 4 && h >= 4 {
+        (w, h) = (w / 2, h / 2);
+    }
+    (w & !1, h & !1)
+}
+
+/// Surface mode keeps this many buffers in ScreenCaptureKit's queue: the encoder holds the
+/// latest picture (for keyframe repeats) and the mailbox one more.
+const SURFACE_QUEUE_DEPTH: isize = 6;
+
 /// How often to look for a display mode change (the host fitting the screen to the
 /// viewer, or someone changing the resolution here).
 const MODE_CHECK: Duration = Duration::from_millis(250);
@@ -283,6 +432,8 @@ pub struct MacCapturer {
     display: u32,
     size: (usize, usize),
     checked: Instant,
+    /// Surface mode: the largest size to stream at (ScreenCaptureKit scales).
+    surface_max: Option<(usize, usize)>,
 }
 
 // SCStream may be driven from any thread (its callbacks arrive on our dispatch queue);
@@ -353,6 +504,24 @@ impl MacCapturer {
             display: unsafe { display.displayID() },
             size: (width, height),
             checked: Instant::now(),
+            surface_max: None,
+        })
+    }
+
+    /// The size ScreenCaptureKit should deliver for a screen of `size` pixels.
+    fn output_size(&self, size: (usize, usize)) -> (usize, usize) {
+        match self.surface_max {
+            Some(max) => fit(size, max),
+            None => size,
+        }
+    }
+
+    fn update_configuration(&self) -> Result<(), String> {
+        // SAFETY: an update of our running stream with a handler of the declared block
+        // signature.
+        wait_completion(|h| unsafe {
+            self.stream
+                .updateConfiguration_completionHandler(&self.config, Some(h))
         })
     }
 
@@ -371,17 +540,14 @@ impl MacCapturer {
             height = size.1,
             "display size changed; capturing at the new size"
         );
-        // SAFETY: setters on our configuration, then an update of our running stream with
-        // a handler of the declared block signature.
+        let out = self.output_size(size);
+        // SAFETY: setters on our configuration.
         unsafe {
-            self.config.setWidth(size.0);
-            self.config.setHeight(size.1);
+            self.config.setWidth(out.0);
+            self.config.setHeight(out.1);
         }
-        wait_completion(|h| unsafe {
-            self.stream
-                .updateConfiguration_completionHandler(&self.config, Some(h))
-        })
-        .map_err(|e| CaptureError::Backend(format!("SCStream updateConfiguration: {e}")))?;
+        self.update_configuration()
+            .map_err(|e| CaptureError::Backend(format!("SCStream updateConfiguration: {e}")))?;
         self.size = size;
         Ok(())
     }
@@ -398,6 +564,79 @@ impl Capturer for MacCapturer {
             }
             if let Some(frame) = slot.frame.take() {
                 return Ok(Some(frame));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            slot = match self.shared.ready.wait_timeout(slot, deadline - now) {
+                Ok((g, _)) => g,
+                Err(e) => e.into_inner().0,
+            };
+        }
+    }
+
+    fn use_surfaces(&mut self, max: (usize, usize)) -> bool {
+        if self.surface_max.is_some() {
+            return true;
+        }
+        self.surface_max = Some(max);
+        let out = self.output_size(self.size);
+        // SAFETY: setters on our configuration. The matrix constant is static.
+        unsafe {
+            self.config
+                .setPixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+            // BT.601, as the CPU conversion and both viewer decoders use.
+            self.config
+                .setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_601_4);
+            self.config.setQueueDepth(SURFACE_QUEUE_DEPTH);
+            self.config.setWidth(out.0);
+            self.config.setHeight(out.1);
+        }
+        match self.update_configuration() {
+            Ok(()) => {
+                self.shared.surfaces.store(true, Ordering::Relaxed);
+                self.shared.lock().frame = None;
+                tracing::info!(
+                    width = out.0,
+                    height = out.1,
+                    "ScreenCaptureKit hands NV12 surfaces to the encoder"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "ScreenCaptureKit surface mode unavailable");
+                self.surface_max = None;
+                // SAFETY: setters on our configuration, back to the copying mode.
+                unsafe {
+                    self.config.setPixelFormat(kCVPixelFormatType_32BGRA);
+                    self.config.setWidth(self.size.0);
+                    self.config.setHeight(self.size.1);
+                }
+                let _ = self.update_configuration();
+                false
+            }
+        }
+    }
+
+    fn next_surface(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<(Surface, Captured)>, CaptureError> {
+        self.follow_mode_change()?;
+        let deadline = Instant::now() + timeout;
+        let mut slot = self.shared.lock();
+        loop {
+            if let Some(e) = &slot.stopped {
+                return Err(CaptureError::Backend(format!("{e}; {PERMISSION_HINT}")));
+            }
+            if let Some(s) = slot.surface.take() {
+                let captured = Captured {
+                    rows: (0, s.height & !1),
+                    changed: 1.0,
+                    captured_at: s.captured_at,
+                };
+                return Ok(Some((s, captured)));
             }
             let now = Instant::now();
             if now >= deadline {
