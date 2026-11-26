@@ -9,6 +9,8 @@ final class SessionModel: ObservableObject, Identifiable, SessionListener, @unch
     let server: String
     /// Called on the main thread when the computer sends its name.
     var onHostName: ((String) -> Void)?
+    /// Called on the main thread when the session ends, with the reason.
+    var onClosedReason: ((String) -> Void)?
     let renderer = VideoRenderer()
     @Published var status = "connecting…"
     @Published var closedReason: String?
@@ -66,6 +68,7 @@ final class SessionModel: ObservableObject, Identifiable, SessionListener, @unch
         DispatchQueue.main.async {
             self.closedReason = reason
             self.session = nil
+            self.onClosedReason?(reason)
         }
     }
 }

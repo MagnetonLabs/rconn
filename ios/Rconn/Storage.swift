@@ -36,7 +36,45 @@ enum Keychain {
     }
 }
 
-/// A computer connected to before (never its password).
+/// Access passwords the user chose to remember, one per server and computer ID; this
+/// device only, never in backups.
+enum SavedPasswords {
+    private static let service = "app.rconn.ios.access-password"
+
+    private static func base(_ server: String, _ computerID: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "\(server)|\(computerID.filter(\.isNumber))",
+        ]
+    }
+
+    static func password(server: String, computerID: String) -> String? {
+        var query = base(server, computerID)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    @discardableResult
+    static func set(_ password: String, server: String, computerID: String) -> Bool {
+        forget(server: server, computerID: computerID)
+        var add = base(server, computerID)
+        add[kSecValueData as String] = Data(password.utf8)
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func forget(server: String, computerID: String) {
+        SecItemDelete(base(server, computerID) as CFDictionary)
+    }
+}
+
+/// A computer connected to before (its password only in `SavedPasswords`, if remembered).
 struct RecentComputer: Codable, Hashable, Identifiable {
     var id: String { "\(server)|\(computerID)" }
     var server: String
@@ -46,6 +84,8 @@ struct RecentComputer: Codable, Hashable, Identifiable {
     var name: String? = nil
     /// `name` was typed here (Rename): the computer's own name doesn't replace it.
     var renamed: Bool? = nil
+    /// Its access password is in `SavedPasswords`: a tap connects.
+    var passwordSaved: Bool? = nil
 }
 
 enum Recents {
@@ -65,14 +105,29 @@ enum Recents {
         if let old = list.first(where: { $0.id == entry.id }) {
             entry.name = old.name
             entry.renamed = old.renamed
+            entry.passwordSaved = old.passwordSaved
         }
         list.removeAll { $0.id == entry.id }
         list.insert(entry, at: 0)
+        for dropped in list.dropFirst(limit) where dropped.passwordSaved == true {
+            SavedPasswords.forget(server: dropped.server, computerID: dropped.computerID)
+        }
         save(Array(list.prefix(limit)))
     }
 
     static func remove(_ c: RecentComputer) {
+        SavedPasswords.forget(server: c.server, computerID: c.computerID)
         save(load().filter { $0.id != c.id })
+    }
+
+    /// Note whether a computer's password is remembered.
+    static func setPasswordSaved(server: String, computerID: String, _ saved: Bool) {
+        save(load().map { r in
+            guard r.server == server, r.computerID == computerID else { return r }
+            var r = r
+            r.passwordSaved = saved
+            return r
+        })
     }
 
     /// Name a computer here; empty goes back to the computer's own name (next session).
