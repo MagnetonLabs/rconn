@@ -159,6 +159,60 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Is the host set up to start at login here? (The settings file outlives turning incoming
+/// connections off, so it doesn't say.)
+pub fn installed() -> bool {
+    service_path().exists()
+}
+
+/// Make sure the host's folder (0700) and settings file (0600, empty if new) exist, so
+/// single settings can be written into it (e.g. the access password before the ID came).
+pub fn ensure_settings_file(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let file = dir.join("host.toml");
+    if !file.exists() {
+        write_private(&file, "")?;
+    }
+    Ok(())
+}
+
+/// Point the settings file at `server`, keeping everything else in it (the access password
+/// above all). An unreadable file is replaced.
+pub fn write_server_settings(
+    dir: &Path,
+    server: &str,
+    fingerprint: Option<&str>,
+) -> Result<(), String> {
+    use rconn_core::settings::{SettingsLayers, Writer, write_setting};
+    let file = dir.join("host.toml");
+    ensure_settings_file(dir).map_err(|e| e.to_string())?;
+    let layers = SettingsLayers {
+        system_file: Some(file.clone()),
+        ..Default::default()
+    };
+    let kept = [
+        ("server.url", server),
+        ("server.fingerprint", fingerprint.unwrap_or("")),
+    ]
+    .iter()
+    .try_for_each(|(k, v)| write_setting(layers.clone(), k, v, Writer::Admin, false));
+    if let Err(e) = kept {
+        tracing::warn!(error = %e, "host.toml unreadable; writing a new one");
+        let toml = match fingerprint {
+            Some(fp) => format!("[server]\nurl = {server:?}\nfingerprint = {fp:?}\n"),
+            None => format!("[server]\nurl = {server:?}\n"),
+        };
+        return write_private(&file, &toml).map_err(|e| e.to_string());
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())
+}
+
 /// Write the settings file and the start-at-login definition, then (re)start the agent.
 pub fn install(
     agent: &Path,
@@ -169,11 +223,7 @@ pub fn install(
     if !agent.exists() {
         return Err(format!("host agent not found at {}", agent.display()));
     }
-    let toml = match fingerprint {
-        Some(fp) => format!("[server]\nurl = {server:?}\nfingerprint = {fp:?}\n"),
-        None => format!("[server]\nurl = {server:?}\n"),
-    };
-    write_private(&dir.join("host.toml"), &toml).map_err(|e| e.to_string())?;
+    write_server_settings(dir, server, fingerprint)?;
     let service_file = service_path();
     if let Some(parent) = service_file.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -207,8 +257,8 @@ pub fn install(
     }
 }
 
-/// Stop the agent and remove its start-at-login definition (the identity is kept for
-/// re-enabling).
+/// Stop the agent and remove its start-at-login definition. The identity and the settings
+/// (with the access password) are kept for turning incoming connections on again.
 pub fn uninstall(dir: &Path) {
     if cfg!(target_os = "macos") {
         let _ = Command::new("launchctl")
@@ -218,8 +268,12 @@ pub fn uninstall(dir: &Path) {
         let _ = run("systemctl", &["--user", "disable", "--now", UNIT]);
     }
     let _ = std::fs::remove_file(service_path());
+    forget_status(dir);
+}
+
+/// Drop what only means something while the agent runs (its status file).
+pub fn forget_status(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("status.json"));
-    let _ = std::fs::remove_file(dir.join("host.toml"));
 }
 
 /// macOS: open the System Settings pane for a permission named in `HostStatus`.
@@ -240,6 +294,72 @@ pub fn open_permission_settings(name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn settings(dir: &Path) -> rconn_core::settings::HostSettings {
+        rconn_core::settings::LoadedSettings::load(rconn_core::settings::SettingsLayers {
+            system_file: Some(dir.join("host.toml")),
+            ..Default::default()
+        })
+        .unwrap()
+        .settings()
+        .clone()
+    }
+
+    fn set_password(dir: &Path, verifier: &str) {
+        ensure_settings_file(dir).unwrap();
+        rconn_core::settings::write_setting(
+            rconn_core::settings::SettingsLayers {
+                system_file: Some(dir.join("host.toml")),
+                ..Default::default()
+            },
+            "access_password",
+            verifier,
+            rconn_core::settings::Writer::Admin,
+            false,
+        )
+        .unwrap();
+    }
+
+    /// Turning incoming connections on (again) rewrites the server, not the password.
+    #[test]
+    fn installing_keeps_a_saved_access_password() {
+        let d = tempfile::tempdir().unwrap();
+        set_password(d.path(), "v1$abc$def");
+        write_server_settings(d.path(), "wss://a/v1/ws", Some("sha256:ab")).unwrap();
+        let s = settings(d.path());
+        assert_eq!(s.access_password, "v1$abc$def");
+        let server = s.server.unwrap();
+        assert_eq!(server.url, "wss://a/v1/ws");
+        assert_eq!(server.fingerprint.as_deref(), Some("sha256:ab"));
+        // Another server, no pin: the old pin goes, the password stays.
+        write_server_settings(d.path(), "wss://b/v1/ws", None).unwrap();
+        let s = settings(d.path());
+        assert_eq!(s.access_password, "v1$abc$def");
+        assert_eq!(s.server.unwrap().fingerprint, None);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(d.path().join("host.toml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the verifier stays private");
+        // A file that doesn't parse is replaced rather than blocking the host.
+        std::fs::write(d.path().join("host.toml"), "not = [toml").unwrap();
+        write_server_settings(d.path(), "wss://c/v1/ws", None).unwrap();
+        assert_eq!(settings(d.path()).server.unwrap().url, "wss://c/v1/ws");
+    }
+
+    /// Turning incoming connections off keeps the settings (and so the password).
+    #[test]
+    fn turning_off_keeps_the_settings_file() {
+        let d = tempfile::tempdir().unwrap();
+        set_password(d.path(), "v1$abc$def");
+        std::fs::write(d.path().join("status.json"), "{}").unwrap();
+        forget_status(d.path());
+        assert!(!d.path().join("status.json").exists());
+        assert_eq!(settings(d.path()).access_password, "v1$abc$def");
+        // "Installed" is the start-at-login file, not host.toml.
+        assert_eq!(installed(), service_path().exists());
+    }
 
     #[test]
     fn plist_runs_the_agent_with_its_identity_and_escapes_values() {

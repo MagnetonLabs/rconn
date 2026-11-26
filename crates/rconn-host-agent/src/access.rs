@@ -1,23 +1,34 @@
-//! Access-password sessions: someone connecting with this computer's ID and its access
-//! password, without an account. Nothing is shown, played or accepted until the password
-//! checks out (see `rconn_core::guest` for the exchange itself).
+//! Guest sessions: someone connecting with this computer's ID, without an account. With an
+//! access password set they prove it (see `rconn_core::guest`); with none, the person at
+//! the computer accepts or declines (and, if the setting allows, also when one is set).
+//! Nothing is shown, played or accepted until then.
 
-use rconn_core::guest::HostCheck;
-use rconn_core::ids::{OperatorId, SessionId};
+use crate::prompt::Answer;
+use rconn_core::guest::{Binding, HostCheck};
+use rconn_core::ids::OperatorId;
 use rconn_core::owner::HostOwner;
-use rconn_core::protocol::{GuestMessage, GuestRefusal};
+use rconn_core::protocol::{DATA_CHANNEL_LABEL, GuestMessage, GuestRefusal, MAX_VIEWER_NAME};
 use rconn_peer::identity::LocalOwner;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-/// Wrong passwords allowed per [`LOCKOUT`] before every attempt is refused until it passes.
+/// Wrong passwords (and declined requests) allowed per [`LOCKOUT`] before every attempt is
+/// refused until it passes.
 const MAX_FAILURES: usize = 5;
 const LOCKOUT: Duration = Duration::from_secs(60);
+/// How long the person at the computer has to answer; no answer declines.
+pub const ASK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Prompts shown per [`ASK_WINDOW`], at most (one at a time besides).
+const MAX_ASKS: usize = 3;
+const ASK_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Waiting,
+    /// The person at the computer is being asked.
+    Asking,
     Open,
     Refused,
 }
@@ -29,7 +40,7 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// Sessions from signed-in operators start open; guest sessions wait for the password.
+    /// Sessions from signed-in operators start open; guest sessions wait for the check.
     pub fn new(guest: bool) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(if guest { State::Waiting } else { State::Open }),
@@ -46,15 +57,28 @@ impl Gate {
         self.changed.notify_waiters();
     }
 
+    /// Move `from` -> `to`; false (and no change) if the gate is elsewhere by now.
+    fn advance(&self, from: State, to: State) -> bool {
+        let mut s = self.state.lock().expect("gate");
+        if *s != from {
+            return false;
+        }
+        *s = to;
+        drop(s);
+        self.changed.notify_waiters();
+        true
+    }
+
     pub fn is_open(&self) -> bool {
         self.get() == State::Open
     }
 
-    pub fn needs_password(&self) -> bool {
+    /// The guest check hasn't started yet.
+    pub fn needs_check(&self) -> bool {
         self.get() == State::Waiting
     }
 
-    /// Wait (up to `limit`) for the password check. `true` once the session may start.
+    /// Wait (up to `limit`) for the guest check. `true` once the session may start.
     pub async fn wait(&self, limit: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + limit;
         loop {
@@ -62,7 +86,7 @@ impl Gate {
             match self.get() {
                 State::Open => return true,
                 State::Refused => return false,
-                State::Waiting => {}
+                State::Waiting | State::Asking => {}
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
                 self.set(State::Refused);
@@ -72,9 +96,9 @@ impl Gate {
     }
 }
 
-/// Must this session prove the access password before anything else? Always for guests,
-/// and for a host owned by nobody whatever the server says: only the owner may skip it.
-/// (A host enrolled into an org has no owner file; the server checked the operator's org.)
+/// Must this session pass the guest check before anything else? Always for guests, and
+/// for a host owned by nobody whatever the server says: only the owner may skip it. (A host
+/// enrolled into an org has no owner file; the server checked the operator's org.)
 pub fn needs_password(policy_guest: bool, owner: LocalOwner, operator: OperatorId) -> bool {
     let owner_admits = match owner {
         LocalOwner::Org | LocalOwner::Recorded(Some(HostOwner::Org { .. })) => true,
@@ -84,8 +108,33 @@ pub fn needs_password(policy_guest: bool, owner: LocalOwner, operator: OperatorI
     policy_guest || !owner_admits
 }
 
-/// Recent wrong passwords, for every session on this computer.
+/// How this computer lets guests in (from its settings).
+#[derive(Clone, Default)]
+pub struct Policy {
+    /// The access password's verifier; empty: none set, the person at the computer decides.
+    pub verifier: String,
+    /// With a password set, someone without it may still ask the person at the computer.
+    pub ask_with_password: bool,
+}
+
+/// Where a guest's check stands after the host's first message.
+pub enum Pending {
+    None,
+    /// Waiting for the password proof; `may_ask`: or for a request to ask instead.
+    Password {
+        check: Box<HostCheck>,
+        may_ask: bool,
+    },
+    /// No password here: waiting for the viewer's request to ask.
+    Ask,
+}
+
+/// Recent wrong passwords and declined requests, for every session on this computer.
 static FAILURES: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+/// When recent prompts were shown.
+static ASKS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+/// A prompt is showing (only one at a time).
+static ASKING: AtomicBool = AtomicBool::new(false);
 
 /// Seconds until attempts are accepted again, while locked out.
 fn locked_for() -> Option<u32> {
@@ -101,22 +150,42 @@ fn record_failure() {
     FAILURES.lock().expect("failures").push(Instant::now());
 }
 
-/// The host's first message to a guest: a challenge, or why there won't be one.
-pub fn open(gate: &Gate, verifier: &str, session: SessionId) -> (Option<HostCheck>, GuestMessage) {
-    let refuse = |why: GuestRefusal| {
-        tracing::warn!(%session, ?why, "access-password session refused");
-        gate.set(State::Refused);
-        (None, GuestMessage::Refused(why))
-    };
+fn refuse(gate: &Gate, why: GuestRefusal) -> GuestMessage {
+    tracing::warn!(?why, "guest session refused");
+    gate.set(State::Refused);
+    GuestMessage::Refused(why)
+}
+
+/// The host's first message to a guest whose data channel has `label`: a password
+/// challenge, "the person here decides", or why neither.
+pub fn open(
+    gate: &Gate,
+    policy: &Policy,
+    binding: &Binding,
+    label: &str,
+) -> (Pending, GuestMessage) {
     if let Some(retry_after_secs) = locked_for() {
-        return refuse(GuestRefusal::TooManyAttempts { retry_after_secs });
+        return (
+            Pending::None,
+            refuse(gate, GuestRefusal::TooManyAttempts { retry_after_secs }),
+        );
     }
-    if verifier.trim().is_empty() {
-        return refuse(GuestRefusal::NotEnabled);
+    if label != DATA_CHANNEL_LABEL {
+        // An older viewer: its password proof isn't bound to the connection (a server in
+        // the middle could relay it) and it can't ask. "No access password" is the refusal
+        // it understands that is least wrong; it needs an update either way.
+        tracing::warn!(label, "viewer too old for guest sessions; refusing");
+        return (Pending::None, refuse(gate, GuestRefusal::NotEnabled));
     }
-    match HostCheck::start(verifier, session) {
+    if policy.verifier.trim().is_empty() {
+        return (Pending::Ask, GuestMessage::ApprovalNeeded);
+    }
+    match HostCheck::start(&policy.verifier, binding.clone()) {
         Ok((check, ch)) => (
-            Some(check),
+            Pending::Password {
+                check: Box::new(check),
+                may_ask: policy.ask_with_password,
+            },
             GuestMessage::Challenge {
                 salt: ch.salt,
                 msg: ch.msg,
@@ -124,7 +193,7 @@ pub fn open(gate: &Gate, verifier: &str, session: SessionId) -> (Option<HostChec
         ),
         Err(e) => {
             tracing::warn!(error = %e, "stored access password unusable");
-            refuse(GuestRefusal::NotEnabled)
+            (Pending::None, refuse(gate, GuestRefusal::PasswordRequired))
         }
     }
 }
@@ -148,40 +217,237 @@ pub fn answer(gate: &Gate, check: HostCheck, msg: &[u8], confirm: &[u8]) -> Gues
     }
 }
 
+/// Permission to show one prompt; the next may start once this is dropped.
+pub struct AskTicket {
+    /// Who is asking, cleaned up for display.
+    pub viewer: String,
+}
+
+impl Drop for AskTicket {
+    fn drop(&mut self) {
+        ASKING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The viewer's name made safe to show: no control characters, trimmed, capped.
+pub fn clean_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cut: String = cleaned.chars().take(MAX_VIEWER_NAME).collect();
+    if cut.is_empty() {
+        "Someone".into()
+    } else {
+        cut
+    }
+}
+
+/// The guest asked for the person at the computer. `Ok`: show the prompt (and tell the
+/// viewer [`GuestMessage::AskingUser`]); `Err`: the refusal to send instead.
+pub fn ask(gate: &Gate, pending: Pending, name: &str) -> Result<AskTicket, GuestMessage> {
+    match pending {
+        Pending::Ask | Pending::Password { may_ask: true, .. } => {}
+        Pending::Password { may_ask: false, .. } => {
+            return Err(refuse(gate, GuestRefusal::PasswordRequired));
+        }
+        Pending::None => return Err(refuse(gate, GuestRefusal::PasswordRequired)),
+    }
+    if let Some(retry_after_secs) = locked_for() {
+        return Err(refuse(
+            gate,
+            GuestRefusal::TooManyAttempts { retry_after_secs },
+        ));
+    }
+    {
+        let mut asks = ASKS.lock().expect("asks");
+        asks.retain(|t| t.elapsed() < ASK_WINDOW);
+        if asks.len() >= MAX_ASKS {
+            let oldest = asks.iter().min().copied().unwrap_or_else(Instant::now);
+            let retry_after_secs =
+                ASK_WINDOW.saturating_sub(oldest.elapsed()).as_secs().max(1) as u32;
+            drop(asks);
+            return Err(refuse(
+                gate,
+                GuestRefusal::TooManyAttempts { retry_after_secs },
+            ));
+        }
+        if ASKING.swap(true, Ordering::SeqCst) {
+            drop(asks);
+            return Err(refuse(gate, GuestRefusal::Busy));
+        }
+        asks.push(Instant::now());
+    }
+    if !gate.advance(State::Waiting, State::Asking) {
+        ASKING.store(false, Ordering::SeqCst);
+        return Err(GuestMessage::Refused(GuestRefusal::NoAnswer));
+    }
+    let viewer = clean_name(name);
+    tracing::info!(%viewer, "asking the person at the computer");
+    Ok(AskTicket { viewer })
+}
+
+/// What the person at the computer answered: opens or refuses the gate. A session that
+/// ended (or timed out) meanwhile stays closed whatever the answer.
+pub fn decided(gate: &Gate, ticket: AskTicket, answer: Answer) -> GuestMessage {
+    let reply = match answer {
+        Answer::Accept if gate.advance(State::Asking, State::Open) => {
+            tracing::info!(viewer = %ticket.viewer, "accepted at the computer; session starting");
+            GuestMessage::Approved
+        }
+        Answer::Accept => GuestMessage::Refused(GuestRefusal::NoAnswer),
+        Answer::Decline => {
+            record_failure();
+            refuse(gate, GuestRefusal::Declined)
+        }
+        Answer::TimedOut => refuse(gate, GuestRefusal::NoAnswer),
+        Answer::CannotAsk(why) => {
+            tracing::warn!(%why, "couldn't ask the person at the computer");
+            refuse(gate, GuestRefusal::CannotAsk)
+        }
+    };
+    drop(ticket);
+    reply
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rconn_core::guest::{ViewerAnswer, make_verifier};
+    use rconn_core::ids::SessionId;
+    use rconn_core::protocol::LEGACY_DATA_CHANNEL_LABEL;
+
+    fn binding() -> Binding {
+        Binding {
+            session: SessionId::new(),
+            viewer_dtls: "sha-256 aa".into(),
+            host_dtls: "sha-256 bb".into(),
+        }
+    }
+
+    fn policy(verifier: &str, ask_with_password: bool) -> Policy {
+        Policy {
+            verifier: verifier.into(),
+            ask_with_password,
+        }
+    }
 
     fn try_password(verifier: &str, typed: &str) -> (Arc<Gate>, GuestMessage) {
         let gate = Gate::new(true);
-        let session = SessionId::new();
-        let (check, first) = open(&gate, verifier, session);
-        let GuestMessage::Challenge { salt, msg } = first else {
+        let b = binding();
+        let (pending, first) = open(&gate, &policy(verifier, false), &b, DATA_CHANNEL_LABEL);
+        let (Pending::Password { check, .. }, GuestMessage::Challenge { salt, msg }) =
+            (pending, first.clone())
+        else {
             return (gate, first);
         };
-        let a = ViewerAnswer::new(typed, &salt, &msg, session).unwrap();
-        let reply = answer(&gate, check.unwrap(), &a.msg, &a.confirm);
+        let a = ViewerAnswer::new(typed, &salt, &msg, b).unwrap();
+        let reply = answer(&gate, *check, &a.msg, &a.confirm);
         (gate, reply)
     }
 
-    // One test: the lockout is shared by every session in the process.
+    fn clear_limits() {
+        FAILURES.lock().unwrap().clear();
+        ASKS.lock().unwrap().clear();
+    }
+
+    /// Ask, then answer with `a`.
+    fn ask_and(policy: &Policy, a: Answer) -> (Arc<Gate>, GuestMessage) {
+        let gate = Gate::new(true);
+        let (pending, _) = open(&gate, policy, &binding(), DATA_CHANNEL_LABEL);
+        match ask(&gate, pending, "Ana\non\u{7}LAPTOP") {
+            Ok(ticket) => {
+                assert_eq!(ticket.viewer, "Ana on LAPTOP");
+                let reply = decided(&gate, ticket, a);
+                (gate, reply)
+            }
+            Err(reply) => (gate, reply),
+        }
+    }
+
+    // One test: the lockout and the prompt limits are shared by every session in the
+    // process, so these run in order.
     #[tokio::test]
-    async fn password_opens_the_gate_and_repeated_failures_lock_out() {
+    async fn passwords_prompts_and_their_limits() {
+        clear_limits();
         assert!(
             Gate::new(false).is_open(),
-            "signed-in operators need no password"
+            "signed-in operators need no check"
         );
 
+        // A password opens the gate.
         let v = make_verifier("correct horse").unwrap();
         let (gate, reply) = try_password(&v, "correct horse");
         assert!(matches!(reply, GuestMessage::Accepted { .. }));
         assert!(gate.wait(Duration::from_millis(10)).await);
 
-        let (_, reply) = try_password("", "anything");
-        assert_eq!(reply, GuestMessage::Refused(GuestRefusal::NotEnabled));
+        // Older viewers are refused (their proof isn't bound to the connection).
+        let gate = Gate::new(true);
+        let (_, first) = open(
+            &gate,
+            &policy(&v, false),
+            &binding(),
+            LEGACY_DATA_CHANNEL_LABEL,
+        );
+        assert_eq!(first, GuestMessage::Refused(GuestRefusal::NotEnabled));
+        assert!(!gate.wait(Duration::from_millis(10)).await);
 
-        for _ in 0..MAX_FAILURES {
+        // No password: the person at the computer decides.
+        let none = policy("", false);
+        let gate = Gate::new(true);
+        let (_, first) = open(&gate, &none, &binding(), DATA_CHANNEL_LABEL);
+        assert_eq!(first, GuestMessage::ApprovalNeeded);
+        assert!(!gate.is_open(), "nothing before the answer");
+        let (gate, reply) = ask_and(&none, Answer::Accept);
+        assert_eq!(reply, GuestMessage::Approved);
+        assert!(gate.wait(Duration::from_millis(10)).await);
+        let (gate, reply) = ask_and(&none, Answer::TimedOut);
+        assert_eq!(reply, GuestMessage::Refused(GuestRefusal::NoAnswer));
+        assert!(!gate.wait(Duration::from_millis(10)).await);
+        let (_, reply) = ask_and(&none, Answer::TimedOut);
+        assert_eq!(reply, GuestMessage::Refused(GuestRefusal::NoAnswer));
+        // Three prompts a minute at most.
+        let (_, reply) = ask_and(&none, Answer::Accept);
+        assert!(
+            matches!(
+                reply,
+                GuestMessage::Refused(GuestRefusal::TooManyAttempts { .. })
+            ),
+            "{reply:?}"
+        );
+        clear_limits();
+
+        // A password set: asking only if the setting allows it.
+        let (_, reply) = ask_and(&policy(&v, false), Answer::Accept);
+        assert_eq!(reply, GuestMessage::Refused(GuestRefusal::PasswordRequired));
+        let (gate, reply) = ask_and(&policy(&v, true), Answer::Accept);
+        assert_eq!(reply, GuestMessage::Approved);
+        assert!(gate.is_open());
+
+        // One prompt at a time.
+        let gate = Gate::new(true);
+        let (pending, _) = open(&gate, &none, &binding(), DATA_CHANNEL_LABEL);
+        let ticket = ask(&gate, pending, "first").ok().unwrap();
+        let (_, reply) = ask_and(&none, Answer::Accept);
+        assert_eq!(reply, GuestMessage::Refused(GuestRefusal::Busy));
+        // A session that timed out meanwhile stays closed even if accepted late.
+        assert!(!gate.wait(Duration::from_millis(10)).await);
+        assert_eq!(
+            decided(&gate, ticket, Answer::Accept),
+            GuestMessage::Refused(GuestRefusal::NoAnswer)
+        );
+        assert!(!gate.is_open());
+        clear_limits();
+
+        // Declines count toward the lockout, like wrong passwords.
+        for _ in 0..2 {
+            let (_, reply) = ask_and(&none, Answer::Decline);
+            assert_eq!(reply, GuestMessage::Refused(GuestRefusal::Declined));
+        }
+        for _ in 0..MAX_FAILURES - 2 {
             let (gate, reply) = try_password(&v, "wrong guess");
             assert_eq!(reply, GuestMessage::Refused(GuestRefusal::WrongPassword));
             assert!(!gate.wait(Duration::from_millis(10)).await);
@@ -195,10 +461,11 @@ mod tests {
             ),
             "{reply:?}"
         );
+        clear_limits();
     }
 
     #[test]
-    fn a_host_owned_by_nobody_always_needs_the_password() {
+    fn a_host_owned_by_nobody_always_needs_the_check() {
         let (op, other) = (OperatorId::new(), OperatorId::new());
         // The server claims a signed-in operator; a host owned by nobody refuses that.
         assert!(needs_password(false, LocalOwner::Recorded(None), op));
@@ -206,16 +473,20 @@ mod tests {
         // Org hosts: the server vouches for the operator's org.
         assert!(!needs_password(false, LocalOwner::Org, op));
         assert!(needs_password(true, LocalOwner::Org, op));
-        // A claimed host: only its account skips the password.
+        // A claimed host: only its account skips the check.
         let mine = LocalOwner::Recorded(Some(HostOwner::Operator { operator_id: op }));
         assert!(!needs_password(false, mine, op));
         assert!(needs_password(false, mine, other));
-        // And with no password set, a password session is refused outright.
-        let gate = Gate::new(true);
-        let (check, first) = open(&gate, "", SessionId::new());
-        assert!(check.is_none());
-        assert_eq!(first, GuestMessage::Refused(GuestRefusal::NotEnabled));
-        assert!(!gate.is_open());
+    }
+
+    #[test]
+    fn names_are_cleaned_for_display() {
+        assert_eq!(clean_name("  "), "Someone");
+        assert_eq!(clean_name("a\r\nb\tc"), "a b c");
+        assert_eq!(
+            clean_name(&"x".repeat(200)).chars().count(),
+            MAX_VIEWER_NAME
+        );
     }
 
     #[tokio::test]

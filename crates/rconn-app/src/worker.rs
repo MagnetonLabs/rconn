@@ -172,14 +172,16 @@ impl Worker {
     /// Re-read this computer's status (and, every few ticks, its settings).
     fn refresh_local(&self, settings_too: bool) {
         let status = HostStatus::read(&self.paths.status_file);
-        // macOS/Linux: installed once the app wrote host.toml; Windows: the admin-only
-        // folder exists (its contents aren't visible to ordinary users).
-        let installed = if cfg!(unix) {
-            self.paths.host_data.join("host.toml").exists()
-        } else {
-            self.paths.host_data.exists()
-        };
-        let settings = (settings_too && installed)
+        // macOS/Linux: installed while the start-at-login definition exists (host.toml
+        // stays when incoming connections are turned off); Windows: the admin-only folder
+        // exists (its contents aren't visible to ordinary users).
+        #[cfg(unix)]
+        let installed = crate::userhost::installed();
+        #[cfg(not(unix))]
+        let installed = self.paths.host_data.exists();
+        // The settings are worth showing even while off (the access password is kept).
+        let readable = installed || (cfg!(unix) && self.paths.host_data.join("host.toml").exists());
+        let settings = (settings_too && readable)
             .then(|| rconn_host_settings::model::Model::load(&self.paths.host_data));
         let signed_in = self.token().is_some();
         self.home(|h| {
@@ -191,6 +193,10 @@ impl Worker {
             }
             h.signed_in = signed_in;
             if !installed {
+                // A status file left behind by a stopped agent isn't "on".
+                h.this = None;
+            }
+            if !readable {
                 h.host_settings = None;
             } else if let Some(fresh) = settings {
                 // Don't throw away edits in progress.
@@ -434,11 +440,16 @@ impl Worker {
                     }
                     self.home(|h| h.host_setup = None);
                     self.refresh_local(true);
+                    let password = self.home(|h| {
+                        let this = h.this.clone();
+                        crate::home::access_password_on(h, this.as_ref())
+                    });
                     self.notice(
-                        if cfg!(target_os = "macos") {
-                            "This Mac has an ID. Allow the macOS permissions when asked, then set an access password."
-                        } else {
-                            "This computer has an ID. Set an access password so others can connect."
+                        match (cfg!(target_os = "macos"), password) {
+                            (true, true) => "This Mac has an ID. Allow the macOS permissions when asked.",
+                            (true, false) => "This Mac has an ID. Allow the macOS permissions when asked; until you set an access password, you accept each connection here.",
+                            (false, true) => "This computer has an ID; connections need its access password.",
+                            (false, false) => "This computer has an ID. Until you set an access password, you accept each connection here.",
                         },
                         false,
                     );
@@ -475,6 +486,9 @@ impl Worker {
                 };
                 rconn_host_settings::platform::run_elevated_wait(&service, args)
             } else {
+                // Possibly before the ID arrived: the folder may not exist yet.
+                #[cfg(unix)]
+                crate::userhost::ensure_settings_file(&host_data).map_err(|e| e.to_string())?;
                 rconn_core::settings::write_setting(
                     rconn_core::settings::SettingsLayers {
                         system_file: Some(host_data.join("host.toml")),
@@ -496,10 +510,17 @@ impl Worker {
                     if on {
                         "Access password set: connect with this computer's ID and the password"
                     } else {
-                        "Access password turned off"
+                        "Access password removed: each connection now needs your OK here"
                     },
                     false,
                 );
+                self.refresh_local(true);
+                // Saving a password is what makes this computer take connections: turn them
+                // on if they were off (or the ID never arrived). Not while that is underway.
+                #[cfg(unix)]
+                if on && !crate::userhost::installed() && self.home(|h| h.host_setup.is_none()) {
+                    self.enable_host().await;
+                }
             }
             Ok(Err(e)) => self.notice(format!("Couldn't save the access password: {e}"), true),
             Err(e) => self.notice(format!("Couldn't save the access password: {e}"), true),

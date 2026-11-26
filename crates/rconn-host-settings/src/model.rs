@@ -17,6 +17,8 @@ pub struct Form {
     pub log_level: String,
     /// The stored verifier ("" = off). Never the password itself.
     pub access_password: String,
+    /// With a password set, also let people without it ask the person at the computer.
+    pub ask_with_password: bool,
     /// A new password being typed (not saved; turned into a verifier by "Set").
     pub new_access_password: String,
 }
@@ -45,6 +47,7 @@ impl Form {
             max_bitrate_kbps: s.max_bitrate_kbps,
             log_level: s.log_level.clone(),
             access_password: s.access_password.clone(),
+            ask_with_password: s.ask_with_password,
             new_access_password: String::new(),
         }
     }
@@ -70,6 +73,7 @@ impl Form {
             ("max_bitrate_kbps", self.max_bitrate_kbps.to_string()),
             ("log_level", self.log_level.clone()),
             ("access_password", self.access_password.clone()),
+            ("ask_with_password", self.ask_with_password.to_string()),
         ]
     }
 }

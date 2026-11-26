@@ -190,12 +190,15 @@ fn this_computer(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     );
     ui.add_space(6.0);
     let Some(s) = h.this.clone() else {
-        if let Some(step) = &h.host_setup {
+        if let Some(step) = h.host_setup.clone() {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(step.as_str());
             });
+            // No need to wait for the ID to choose the password.
+            ui.add_space(12.0);
+            access_password_block(ui, h, None, out);
             return;
         }
         if !h.can_host_here {
@@ -223,14 +226,22 @@ fn this_computer(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
         if let Some(e) = &h.host_error {
             ui.add_space(8.0);
             ui.label(RichText::new(e.as_str()).color(BAD).small());
+            // Getting the ID failed (offline?): the password can still be set meanwhile,
+            // and saving it tries again.
+            ui.add_space(12.0);
+            access_password_block(ui, h, None, out);
         }
         return;
     };
     ui.label("Your ID");
     ui.label(
-        RichText::new("Give it, with the access password, to whoever should connect.")
-            .small()
-            .color(Color32::GRAY),
+        RichText::new(if access_password_on(h, Some(&s)) {
+            "Give it, with the access password, to whoever should connect."
+        } else {
+            "Give it to whoever should connect; you accept each connection here."
+        })
+        .small()
+        .color(Color32::GRAY),
     );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -245,7 +256,7 @@ fn this_computer(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     });
     ui.label(RichText::new(&s.label).color(Color32::GRAY));
     ui.add_space(10.0);
-    access_password_block(ui, h, &s, out);
+    access_password_block(ui, h, Some(&s), out);
     ui.add_space(10.0);
     let fresh = s.is_fresh(h.now);
     let (dot, text) = if !fresh {
@@ -321,7 +332,7 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             let pw = ui.add(
                 egui::TextEdit::singleline(&mut h.access_password)
                     .password(true)
-                    .hint_text("Its access password")
+                    .hint_text("Its access password (none: ask the person there)")
                     .font(FontId::proportional(18.0))
                     .desired_width(f32::INFINITY),
             );
@@ -331,9 +342,10 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             enter |= pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                let guest = !h.access_password.is_empty();
-                let ready =
-                    (h.signed_in || guest) && !h.connect_to.trim().is_empty() && h.busy.is_none();
+                // Signed in, a bare ID is looked up in the fleet; otherwise it connects as a
+                // guest: with the password, or by asking the person at the computer.
+                let guest = !h.access_password.is_empty() || !h.signed_in;
+                let ready = !h.connect_to.trim().is_empty() && h.busy.is_none();
                 let button = egui::Button::new(
                     RichText::new("  Connect  ")
                         .size(18.0)
@@ -353,10 +365,14 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
                         Request::ConnectTyped(id)
                     });
                 }
-                if !h.signed_in && !guest {
+                if !h.signed_in {
                     ui.label(
-                        RichText::new("No account needed: the ID and its access password.")
-                            .color(Color32::GRAY),
+                        RichText::new(if h.access_password.is_empty() {
+                            "No account needed. Without a password, the person there accepts."
+                        } else {
+                            "No account needed: the ID and its access password."
+                        })
+                        .color(Color32::GRAY),
                     );
                 }
             });
@@ -478,7 +494,7 @@ fn recent(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
         return empty(
             ui,
             "🕘",
-            "Computers you connect to appear here. Enter an ID and its password above.",
+            "Computers you connect to appear here. Enter an ID above to connect.",
         );
     }
     let online: Option<Vec<HostId>> = h
@@ -592,6 +608,15 @@ fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             .show(ui, |ui| sign_in_form(ui, h, out));
     }
 
+    if h.this.is_some() || h.can_host_here {
+        section(ui, "🔑  This computer's access password");
+        let this = h.this.clone();
+        ui.scope(|ui| {
+            ui.set_max_width(420.0);
+            access_password_block(ui, h, this.as_ref(), out);
+        });
+    }
+
     section(ui, "🖥  This computer (host)");
     match &mut h.host_settings {
         None => {
@@ -661,20 +686,27 @@ fn sign_in_form(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
 }
 
 /// Is an access password set? (Just saved: trusted for a minute, until the host's status
-/// file reports it.)
-pub fn access_password_on(h: &Home, this: &HostStatus) -> bool {
-    match h.host_password_saved {
-        Some((on, at)) if h.now.saturating_sub(at) < 60 => on,
-        _ => this.access_password,
+/// file reports it. No status yet, e.g. while the ID is being fetched: the settings file.)
+pub fn access_password_on(h: &Home, this: Option<&HostStatus>) -> bool {
+    match (h.host_password_saved, this) {
+        (Some((on, at)), _) if h.now.saturating_sub(at) < 60 => on,
+        (_, Some(s)) => s.access_password,
+        (Some((on, _)), None) => on,
+        (None, None) => h
+            .host_settings
+            .as_ref()
+            .and_then(|m| m.saved.as_ref())
+            .is_some_and(|f| !f.access_password.is_empty()),
     }
 }
 
-/// "Access password": with this computer's ID it is all anyone needs to connect, and
-/// without one nobody can (the ID alone never lets anyone in).
+/// "Access password": with this computer's ID it is all anyone needs to connect. Without
+/// one, the ID alone never lets anyone in: the person at this computer accepts or declines
+/// each connection.
 fn access_password_block(
     ui: &mut egui::Ui,
     h: &mut Home,
-    this: &HostStatus,
+    this: Option<&HostStatus>,
     out: &mut Vec<Request>,
 ) {
     let on = access_password_on(h, this);
@@ -697,13 +729,40 @@ fn access_password_block(
                     h.changing_password = true;
                 }
             });
+            let ask_too = h
+                .host_settings
+                .as_ref()
+                .and_then(|m| m.saved.as_ref())
+                .is_some_and(|f| f.ask_with_password);
+            ui.label(
+                RichText::new(if ask_too {
+                    "Connections need it, or your OK here."
+                } else {
+                    "Connections need it."
+                })
+                .small()
+                .color(Color32::GRAY),
+            );
         } else {
             ui.label(
                 RichText::new("Set an access password")
                     .strong()
                     .color(ACCENT),
             );
-            ui.label(RichText::new("Nobody can connect to this computer until you do.").small());
+            ui.label(
+                RichText::new(
+                    "Until you do, every connection needs your OK: you accept or decline it \
+                     here, at this computer.",
+                )
+                .small(),
+            );
+        }
+        if this.is_none() && h.host_setup.is_none() && h.can_host_here {
+            ui.label(
+                RichText::new("Saving it also turns incoming connections on.")
+                    .small()
+                    .color(Color32::GRAY),
+            );
         }
         if !editing {
             return;
@@ -736,7 +795,7 @@ fn access_password_block(
                 }
                 if ui
                     .add_enabled(h.busy.is_none(), egui::Button::new("Remove"))
-                    .on_hover_text("Nobody can connect with the ID alone then")
+                    .on_hover_text("Then every connection needs your OK here")
                     .clicked()
                 {
                     h.changing_password = false;

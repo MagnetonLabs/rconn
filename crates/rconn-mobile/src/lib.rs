@@ -34,6 +34,8 @@ uniffi::setup_scaffolding!();
 
 /// How long to wait for the first picture before giving up.
 pub const FIRST_PICTURE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Extra time while the person at the computer decides (the host gives them 30 s).
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(40);
 /// Keyframe requests are throttled: each one costs the host a full-size encode.
 pub const KEYFRAME_THROTTLE: Duration = Duration::from_millis(300);
 
@@ -238,7 +240,8 @@ async fn run(
     let (sig, host) = SignalingClient::connect_guest(server, trust, computer_id).await?;
     listener.on_status("connecting to the computer…".into());
     let mut session = open_viewer_session(sig, host, PeerOptions::default()).await?;
-    let mut exchange = Exchange::new(password, session.session_id);
+    let asking = password.is_empty();
+    let mut exchange = Exchange::new(password, &session).named("an iPhone or iPad");
     let dc = session.data.clone();
     let mut events = std::mem::replace(&mut session.peer.events, mpsc::unbounded_channel().1);
     let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
@@ -254,11 +257,22 @@ async fn run(
             ev = dc.poll() => match ev {
                 Some(DataChannelEvent::OnOpen) => {
                     open = true;
-                    listener.on_status("checking the access password…".into());
+                    listener.on_status(if asking {
+                        "asking the computer…".into()
+                    } else {
+                        "checking the access password…".into()
+                    });
                 }
                 Some(DataChannelEvent::OnMessage(m)) => match DataMessage::decode(&m.data) {
                     Ok(DataMessage::Guest(g)) => match exchange.handle(g).await {
                         Step::Send(reply) => send_on(&dc, reply).await,
+                        Step::Waiting(text) => {
+                            listener.on_status(text);
+                            // The person at the computer has up to a minute (host side).
+                            first_picture.as_mut().reset(
+                                tokio::time::Instant::now() + APPROVAL_TIMEOUT + FIRST_PICTURE_TIMEOUT,
+                            );
+                        }
                         Step::Accepted => {
                             accepted = true;
                             if !got_picture.load(Ordering::Relaxed) {

@@ -22,7 +22,8 @@ pub fn has_identity(dir: &Path) -> bool {
 pub enum LocalOwner {
     /// No owner file: enrolled into an org (token or `enroll-host`); the server decides.
     Org,
-    /// Recorded at enrollment (`None`: nobody, every session needs the access password).
+    /// Recorded at enrollment (`None`: nobody, every session needs the access password or
+    /// the OK of the person at the computer).
     Recorded(Option<HostOwner>),
 }
 

@@ -1,5 +1,6 @@
 //! rconn desktop app: window, worker, tray.
 
+pub mod ask;
 pub mod home;
 pub mod icon;
 pub mod profile;

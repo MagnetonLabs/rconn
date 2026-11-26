@@ -498,11 +498,11 @@ async fn session(
     let mut exchange = args
         .guest
         .as_ref()
-        .map(|g| rconn_peer::guest::Exchange::new(g.password.clone(), session.session_id));
-    shared.lock().expect("ui state").status = if exchange.is_some() {
-        "checking the access password…".into()
-    } else {
-        "connected, waiting for the picture…".into()
+        .map(|g| rconn_peer::guest::Exchange::new(g.password.clone(), &session));
+    shared.lock().expect("ui state").status = match &args.guest {
+        Some(g) if g.password.is_empty() => "asking the computer…".into(),
+        Some(_) => "checking the access password…".into(),
+        None => "connected, waiting for the picture…".into(),
     };
     repaint();
     // The computer refused the access password: the session ends with its reason.
@@ -551,9 +551,15 @@ async fn session(
                             if let Some(ex) = exchange.as_mut() {
                                 match ex.handle(m).await {
                                     rconn_peer::guest::Step::Send(reply) => send(dc.clone(), reply).await,
+                                    rconn_peer::guest::Step::Waiting(text) => {
+                                        status_shared.lock().expect("ui state").status = text;
+                                        if let Some(c) = status_ctx.lock().expect("ctx").as_ref() {
+                                            c.request_repaint();
+                                        }
+                                    }
                                     rconn_peer::guest::Step::Accepted => {
                                         status_shared.lock().expect("ui state").status =
-                                            "access password accepted, waiting for the picture…".into();
+                                            "accepted, waiting for the picture…".into();
                                         if let Some(c) = status_ctx.lock().expect("ctx").as_ref() {
                                             c.request_repaint();
                                         }
@@ -621,9 +627,11 @@ async fn session(
             }
         }
     });
+    // Guests may wait for the person at the computer (up to a minute on the host's side).
+    let wait = if args.guest.is_some() { 75 } else { 20 };
     let track = tokio::select! {
-        t = tokio::time::timeout(Duration::from_secs(20), video_rx.recv()) => t
-            .map_err(|_| anyhow!("no video from the host within 20 s"))?
+        t = tokio::time::timeout(Duration::from_secs(wait), video_rx.recv()) => t
+            .map_err(|_| anyhow!("no video from the host within {wait} s"))?
             .ok_or_else(|| anyhow!("session closed before video arrived"))?,
         Ok(why) = &mut refused_rx => {
             dc_task.abort();

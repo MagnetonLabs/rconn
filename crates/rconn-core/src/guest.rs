@@ -6,13 +6,38 @@
 //! * the password never leaves the viewer, and the host stores only a derived verifier;
 //! * the signaling server (or anyone relaying) learns nothing it could test guesses
 //!   against offline: each guess costs a live attempt, which the host rate-limits;
-//! * both sides prove they derived the same key, bound to this session's id.
+//! * both sides prove they derived the same key, bound to this session's id and to the
+//!   DTLS certificates of its WebRTC connection ([`Binding`]).
+//!
+//! The DTLS binding is what stops a malicious signaling server. The server relays the SDP,
+//! so it could hand each side its own certificate fingerprint and sit in the middle of the
+//! "encrypted" connection, relaying the SPAKE2 messages untouched. Each WebRTC stack only
+//! accepts the certificate named in the SDP it received, so in that case the two sides
+//! see different fingerprints, bind different values, and the confirmations don't match:
+//! the password check fails instead of opening a session the server can watch.
+//!
+//! Sessions the person at the computer accepts without a password (no access password set)
+//! have no shared secret to bind, so they trust the signaling server not to do this.
 
 use crate::ids::SessionId;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use thiserror::Error;
+
+/// What the host agent asks the local app to show (`rconn --ask <json>`): someone wants to
+/// connect; accept or decline within `timeout_secs`. The app prints one of the `ANSWER_*`
+/// words on stdout and exits.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PromptRequest {
+    /// Who is asking, as the viewer described itself (unverified).
+    pub viewer: String,
+    pub timeout_secs: u64,
+}
+
+pub const ANSWER_ACCEPT: &str = "accept";
+pub const ANSWER_DECLINE: &str = "decline";
+pub const ANSWER_TIMEOUT: &str = "timeout";
 
 const SALT_LEN: usize = 16;
 const KEY_LEN: usize = 32;
@@ -30,6 +55,8 @@ pub enum GuestError {
     WrongPassword,
     #[error("malformed access-password message")]
     Malformed,
+    #[error("the connection has no DTLS fingerprint to bind the password check to")]
+    NoFingerprint,
     #[error("no randomness available: {0}")]
     Random(String),
 }
@@ -87,27 +114,84 @@ fn ids() -> (Identity, Identity) {
     (Identity::new(b"rconn-viewer"), Identity::new(b"rconn-host"))
 }
 
-/// Proof that the sender derived `key` in `session`, from one side's point of view.
-fn confirmation(key: &[u8], side: &[u8], session: &SessionId) -> Vec<u8> {
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC takes any key");
-    mac.update(b"rconn access password v1 ");
-    mac.update(side);
-    mac.update(session.0.as_bytes());
-    mac.finalize().into_bytes().to_vec()
+/// The DTLS certificate fingerprints in an SDP, canonical: every `a=fingerprint:` line
+/// (session or media level) as lowercase `algorithm value`, sorted, without duplicates,
+/// joined by `,`. `None` if there are none.
+pub fn sdp_fingerprints(sdp: &str) -> Option<String> {
+    let mut fps: Vec<String> = sdp
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("a=fingerprint:"))
+        .filter_map(|fp| {
+            let mut parts = fp.split_whitespace();
+            let (alg, value) = (parts.next()?, parts.next()?);
+            Some(format!(
+                "{} {}",
+                alg.to_ascii_lowercase(),
+                value.to_ascii_lowercase()
+            ))
+        })
+        .collect();
+    fps.sort();
+    fps.dedup();
+    (!fps.is_empty()).then(|| fps.join(","))
 }
 
-fn confirmation_matches(key: &[u8], side: &[u8], session: &SessionId, got: &[u8]) -> bool {
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC takes any key");
-    mac.update(b"rconn access password v1 ");
-    mac.update(side);
-    mac.update(session.0.as_bytes());
-    mac.verify_slice(got).is_ok() // constant time
+/// What a password check is bound to: the session, and the DTLS certificate fingerprints
+/// of its WebRTC connection as each side saw them (see the module docs). Both sides must
+/// compute the same value, so it is ordered by role, not by local/remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    pub session: SessionId,
+    /// The viewer's fingerprints, as [`sdp_fingerprints`] gives them.
+    pub viewer_dtls: String,
+    /// The host's fingerprints, likewise.
+    pub host_dtls: String,
+}
+
+impl Binding {
+    /// From the viewer's SDP (its offer) and the host's (its answer).
+    pub fn from_sdp(
+        session: SessionId,
+        viewer_sdp: &str,
+        host_sdp: &str,
+    ) -> Result<Self, GuestError> {
+        Ok(Self {
+            session,
+            viewer_dtls: sdp_fingerprints(viewer_sdp).ok_or(GuestError::NoFingerprint)?,
+            host_dtls: sdp_fingerprints(host_sdp).ok_or(GuestError::NoFingerprint)?,
+        })
+    }
+
+    fn mac(&self, key: &[u8], side: &[u8]) -> Hmac<Sha256> {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC takes any key");
+        mac.update(b"rconn access password v2\0");
+        // Length-prefixed, so no two different inputs produce the same byte string.
+        for part in [
+            side,
+            self.session.0.as_bytes(),
+            self.viewer_dtls.as_bytes(),
+            self.host_dtls.as_bytes(),
+        ] {
+            mac.update(&(part.len() as u32).to_be_bytes());
+            mac.update(part);
+        }
+        mac
+    }
+
+    /// Proof that the sender derived `key` on this connection, from one side's view.
+    fn confirmation(&self, key: &[u8], side: &[u8]) -> Vec<u8> {
+        self.mac(key, side).finalize().into_bytes().to_vec()
+    }
+
+    fn confirmation_matches(&self, key: &[u8], side: &[u8], got: &[u8]) -> bool {
+        self.mac(key, side).verify_slice(got).is_ok() // constant time
+    }
 }
 
 /// The host's half of one attempt.
 pub struct HostCheck {
     spake: Spake2<Ed25519Group>,
-    session: SessionId,
+    binding: Binding,
 }
 
 /// Sent by the host to start: the salt to derive with, and its SPAKE2 message.
@@ -117,11 +201,11 @@ pub struct HostChallenge {
 }
 
 impl HostCheck {
-    pub fn start(verifier: &str, session: SessionId) -> Result<(Self, HostChallenge), GuestError> {
+    pub fn start(verifier: &str, binding: Binding) -> Result<(Self, HostChallenge), GuestError> {
         let (salt, key) = parse_verifier(verifier)?;
         let (a, b) = ids();
         let (spake, msg) = Spake2::<Ed25519Group>::start_b(&Password::new(&key), &a, &b);
-        Ok((Self { spake, session }, HostChallenge { salt, msg }))
+        Ok((Self { spake, binding }, HostChallenge { salt, msg }))
     }
 
     /// Check the viewer's answer. On success, returns the host's own confirmation for the
@@ -131,10 +215,13 @@ impl HostCheck {
             .spake
             .finish(viewer_msg)
             .map_err(|_| GuestError::Malformed)?;
-        if !confirmation_matches(&key, b"viewer", &self.session, viewer_confirm) {
+        if !self
+            .binding
+            .confirmation_matches(&key, b"viewer", viewer_confirm)
+        {
             return Err(GuestError::WrongPassword);
         }
-        Ok(confirmation(&key, b"host", &self.session))
+        Ok(self.binding.confirmation(&key, b"host"))
     }
 }
 
@@ -143,7 +230,7 @@ pub struct ViewerAnswer {
     pub msg: Vec<u8>,
     pub confirm: Vec<u8>,
     key: Vec<u8>,
-    session: SessionId,
+    binding: Binding,
 }
 
 impl ViewerAnswer {
@@ -151,7 +238,7 @@ impl ViewerAnswer {
         password: &str,
         salt: &[u8],
         host_msg: &[u8],
-        session: SessionId,
+        binding: Binding,
     ) -> Result<Self, GuestError> {
         let derived = derive(password, salt)?;
         let (a, b) = ids();
@@ -159,15 +246,17 @@ impl ViewerAnswer {
         let key = spake.finish(host_msg).map_err(|_| GuestError::Malformed)?;
         Ok(Self {
             msg,
-            confirm: confirmation(&key, b"viewer", &session),
+            confirm: binding.confirmation(&key, b"viewer"),
             key,
-            session,
+            binding,
         })
     }
 
-    /// Is the host's confirmation genuine (the computer knows the password as well)?
+    /// Is the host's confirmation genuine (the computer knows the password as well, on
+    /// this very connection)?
     pub fn host_is_genuine(&self, host_confirm: &[u8]) -> bool {
-        confirmation_matches(&self.key, b"host", &self.session, host_confirm)
+        self.binding
+            .confirmation_matches(&self.key, b"host", host_confirm)
     }
 }
 
@@ -175,10 +264,17 @@ impl ViewerAnswer {
 mod tests {
     use super::*;
 
+    const VIEWER_SDP: &str = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:sha-256 AA:BB:CC\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=fingerprint:sha-256 AA:BB:CC\r\n";
+    const HOST_SDP: &str = "v=0\r\na=fingerprint:sha-256 11:22:33\r\n";
+
+    fn binding(session: SessionId) -> Binding {
+        Binding::from_sdp(session, VIEWER_SDP, HOST_SDP).unwrap()
+    }
+
     fn attempt(stored: &str, typed: &str) -> (Result<Vec<u8>, GuestError>, ViewerAnswer) {
-        let session = SessionId::new();
-        let (host, ch) = HostCheck::start(stored, session).unwrap();
-        let answer = ViewerAnswer::new(typed, &ch.salt, &ch.msg, session).unwrap();
+        let b = binding(SessionId::new());
+        let (host, ch) = HostCheck::start(stored, b.clone()).unwrap();
+        let answer = ViewerAnswer::new(typed, &ch.salt, &ch.msg, b).unwrap();
         (host.finish(&answer.msg, &answer.confirm), answer)
     }
 
@@ -202,12 +298,76 @@ mod tests {
     #[test]
     fn a_proof_from_another_session_is_refused() {
         let v = make_verifier("correct horse").unwrap();
-        let (host, ch) = HostCheck::start(&v, SessionId::new()).unwrap();
-        let replay =
-            ViewerAnswer::new("correct horse", &ch.salt, &ch.msg, SessionId::new()).unwrap();
+        let (host, ch) = HostCheck::start(&v, binding(SessionId::new())).unwrap();
+        let replay = ViewerAnswer::new(
+            "correct horse",
+            &ch.salt,
+            &ch.msg,
+            binding(SessionId::new()),
+        )
+        .unwrap();
         assert_eq!(
             host.finish(&replay.msg, &replay.confirm),
             Err(GuestError::WrongPassword)
+        );
+    }
+
+    /// A signaling server in the middle relays the SPAKE2 messages untouched (both sides
+    /// derive the same key), but each side's DTLS connection ends at the server, so each
+    /// sees one of the server's fingerprints instead of the other side's.
+    #[test]
+    fn a_proof_made_over_different_dtls_keys_is_refused() {
+        let v = make_verifier("correct horse").unwrap();
+        let session = SessionId::new();
+        let host_view =
+            Binding::from_sdp(session, "a=fingerprint:sha-256 EE:EE\r\n", HOST_SDP).unwrap();
+        let viewer_view =
+            Binding::from_sdp(session, VIEWER_SDP, "a=fingerprint:sha-256 FF:FF\r\n").unwrap();
+        let (host, ch) = HostCheck::start(&v, host_view.clone()).unwrap();
+        let answer = ViewerAnswer::new("correct horse", &ch.salt, &ch.msg, viewer_view).unwrap();
+        assert_eq!(
+            host.finish(&answer.msg, &answer.confirm),
+            Err(GuestError::WrongPassword),
+            "right password, wrong connection"
+        );
+
+        // The host's confirmation is bound the same way: one made on the host's view of
+        // the connection doesn't convince a viewer that sees another one.
+        let key = [7u8; 32];
+        let host_confirm = host_view.confirmation(&key, b"host");
+        assert!(host_view.confirmation_matches(&key, b"host", &host_confirm));
+        assert!(!binding(session).confirmation_matches(&key, b"host", &host_confirm));
+
+        // Roles are part of it: swapping which fingerprint is whose changes the binding.
+        let b = binding(session);
+        let swapped = Binding {
+            session,
+            viewer_dtls: b.host_dtls.clone(),
+            host_dtls: b.viewer_dtls.clone(),
+        };
+        let (host, ch) = HostCheck::start(&v, b).unwrap();
+        let answer = ViewerAnswer::new("correct horse", &ch.salt, &ch.msg, swapped).unwrap();
+        assert_eq!(
+            host.finish(&answer.msg, &answer.confirm),
+            Err(GuestError::WrongPassword)
+        );
+    }
+
+    #[test]
+    fn fingerprints_are_canonical() {
+        assert_eq!(
+            sdp_fingerprints(VIEWER_SDP).as_deref(),
+            Some("sha-256 aa:bb:cc"),
+            "one per media section collapses; case is folded"
+        );
+        assert_eq!(
+            sdp_fingerprints("a=fingerprint:sha-512 02\r\na=fingerprint:SHA-256 01\n"),
+            Some("sha-256 01,sha-512 02".into())
+        );
+        assert_eq!(sdp_fingerprints("v=0\r\n"), None);
+        assert_eq!(
+            Binding::from_sdp(SessionId::new(), "v=0", HOST_SDP),
+            Err(GuestError::NoFingerprint)
         );
     }
 
@@ -218,6 +378,6 @@ mod tests {
         assert_ne!(a, b, "random salt");
         assert!(!a.contains("correct"));
         assert_eq!(make_verifier("short"), Err(GuestError::TooShort));
-        assert!(HostCheck::start("garbage", SessionId::new()).is_err());
+        assert!(HostCheck::start("garbage", binding(SessionId::new())).is_err());
     }
 }

@@ -8,10 +8,12 @@
 use crate::rtc::{CandidateSink, Peer, PeerEvent, PeerOptions, apply_remote};
 use crate::signaling::{SignalingClient, SignalingTx};
 use crate::video::{AudioSender, TargetBitrate, VideoSender};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use rconn_core::guest::Binding;
 use rconn_core::ids::{HostId, OperatorId, SessionId};
 use rconn_core::protocol::{
-    ClientMessage, DATA_CHANNEL_PROTOCOL, SdpType, ServerMessage, SessionPolicy, SignalPayload,
+    ClientMessage, DATA_CHANNEL_LABEL, DATA_CHANNEL_PROTOCOL, SdpType, ServerMessage,
+    SessionPolicy, SignalPayload,
 };
 use rtc::rtp_transceiver::RTCRtpTransceiverDirection;
 use rtc::rtp_transceiver::RTCRtpTransceiverInit;
@@ -20,7 +22,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use webrtc::data_channel::{DataChannel, RTCDataChannelInit};
-use webrtc::peer_connection::RTCPeerConnectionState;
+use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState};
 
 pub struct ViewerSession {
     pub session_id: SessionId,
@@ -31,7 +33,39 @@ pub struct ViewerSession {
     pump: JoinHandle<()>,
 }
 
+/// Which end of the connection `pc` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Viewer,
+    Host,
+}
+
+/// What this connection's password check is bound to: the session and the DTLS
+/// fingerprints in the SDP each side applied (which its DTLS stack enforces). Needs both
+/// descriptions, i.e. the offer/answer exchange done.
+pub async fn binding(pc: &dyn PeerConnection, session: SessionId, role: Role) -> Result<Binding> {
+    let local = pc
+        .local_description()
+        .await
+        .context("no local description yet")?;
+    let remote = pc
+        .remote_description()
+        .await
+        .context("no remote description yet")?;
+    let (viewer, host) = match role {
+        Role::Viewer => (local.sdp, remote.sdp),
+        Role::Host => (remote.sdp, local.sdp),
+    };
+    Ok(Binding::from_sdp(session, &viewer, &host)?)
+}
+
 impl ViewerSession {
+    /// This session's password binding (see [`binding`]); ready once the data channel is
+    /// open.
+    pub async fn binding(&self) -> Result<Binding> {
+        binding(&*self.peer.pc, self.session_id, Role::Viewer).await
+    }
+
     pub async fn close(self) {
         let _ = self.tx.send(ClientMessage::EndSession {
             session_id: self.session_id,
@@ -74,7 +108,10 @@ pub async fn open_viewer_session(
         protocol: DATA_CHANNEL_PROTOCOL.into(),
         ..Default::default()
     };
-    let data = peer.pc.create_data_channel("rconn", Some(init)).await?;
+    let data = peer
+        .pc
+        .create_data_channel(DATA_CHANNEL_LABEL, Some(init))
+        .await?;
     peer.pc
         .add_transceiver_from_kind(
             RtpCodecKind::Video,
@@ -154,6 +191,8 @@ pub struct HostSession {
     /// session may skip the access password.
     pub operator_id: OperatorId,
     pub policy: SessionPolicy,
+    /// What a guest's password check is bound to (session + both DTLS fingerprints).
+    pub binding: Binding,
     /// The screen track. Write encoded access units here.
     pub video: VideoSender,
     /// Host sound track, if the viewer asked for audio.
@@ -221,6 +260,14 @@ pub async fn run_host(
                 )
                 .await?;
                 let (answer, video, audio) = peer.answer_with_video(sdp).await?;
+                let binding = match binding(&*peer.pc, sid, Role::Host).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), %sid, "no DTLS fingerprints; dropping the session");
+                        let _ = peer.pc.close().await;
+                        continue;
+                    }
+                };
                 tx.send(ClientMessage::Signal {
                     session_id: sid,
                     payload: answer,
@@ -258,6 +305,7 @@ pub async fn run_host(
                     session_id: sid,
                     operator_id,
                     policy,
+                    binding,
                     video,
                     audio,
                     target_bitrate: peer.target_bitrate.clone(),
