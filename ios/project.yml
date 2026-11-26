@@ -1,0 +1,60 @@
+# xcodegen spec for the iOS viewer. Generate the project with:
+#   ios/build-rust.sh && (cd ios && xcodegen)
+name: Rconn
+options:
+  bundleIdPrefix: app.rconn
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: 7727LYTG96
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  Rconn:
+    type: application
+    platform: iOS
+    sources:
+      - path: Rconn
+      - path: Generated/Swift
+        group: Rust
+    dependencies:
+      - framework: Generated/RconnMobileFFI.xcframework
+        embed: false
+      - sdk: SystemConfiguration.framework
+      - sdk: Security.framework
+    preBuildScripts:
+      - name: Check Rust library
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ ! -d "$PROJECT_DIR/Generated/RconnMobileFFI.xcframework" ]; then
+            echo "error: run ios/build-rust.sh first (builds the Rust library and its Swift bindings)"
+            exit 1
+          fi
+    info:
+      path: Rconn/Info.plist
+      properties:
+        CFBundleDisplayName: Rconn
+        UILaunchScreen: {}
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # WebRTC connects straight to the computer when it is on the same network.
+        NSLocalNetworkUsageDescription: Rconn connects directly to your computers when they are on the same network.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.rconn.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        DEAD_CODE_STRIPPING: YES

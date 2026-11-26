@@ -1,0 +1,4 @@
+# Built by build-rust.sh and xcodegen.
+Generated/
+Rconn.xcodeproj/
+build/
