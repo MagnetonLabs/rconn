@@ -19,6 +19,7 @@ clap = { version = "4.6.9", features = ["derive", "env"] }
 webrtc = "=0.21.1"
 bytes = "1.12.2"
 uuid.workspace = true
+serde_json.workspace = true
 cpal = "0.18.2"
 
 [lints]
@@ -33,3 +34,6 @@ x11rb = { version = "0.13", features = ["xtest"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGDirectDisplay", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "CGWindow"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+
+[dev-dependencies]
+tempfile.workspace = true

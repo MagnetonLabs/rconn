@@ -31,7 +31,8 @@ enum Cmd {
     SetAccessPassword,
     /// (Windows, admin) write host.toml (+ identity) into ProgramData\rconn and lock it
     /// down. Without --identity-from the agent gets an ID from the server at first start
-    /// (no account; every session then needs the access password).
+    /// (no account; every session then needs the access password, or the OK of the person
+    /// at the computer when none is set).
     Configure {
         /// Signaling server URL (also the identity bound into host proofs). Default: the
         /// public server.

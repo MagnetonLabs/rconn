@@ -16,7 +16,6 @@ struct ConnectView: View {
     private var canConnect: Bool {
         !server.trimmingCharacters(in: .whitespaces).isEmpty
             && computerID.filter(\.isNumber).count >= 9
-            && !password.isEmpty
     }
 
     var body: some View {
@@ -42,6 +41,8 @@ struct ConnectView: View {
                 } footer: {
                     if let lastError {
                         Text(lastError).foregroundStyle(.red)
+                    } else if password.isEmpty {
+                        Text("No password: the person at the computer is asked to accept.")
                     }
                 }
 

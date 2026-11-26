@@ -115,7 +115,7 @@ async fn host_session(
     size: (usize, usize),
 ) {
     let HostSession {
-        session_id,
+        binding,
         policy,
         video,
         mut channels,
@@ -133,7 +133,7 @@ async fn host_session(
             let _ = dc.send(BytesMut::from(&b[..])).await;
         }
     };
-    let (check, challenge) = HostCheck::start(&verifier, session_id).unwrap();
+    let (check, challenge) = HostCheck::start(&verifier, binding).unwrap();
     let mut check = Some(check);
     send(DataMessage::Guest(GuestMessage::Challenge {
         salt: challenge.salt,

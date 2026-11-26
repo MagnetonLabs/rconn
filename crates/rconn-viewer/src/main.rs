@@ -41,7 +41,8 @@ enum Cmd {
     /// Open a window on the host's screen with mouse and keyboard control.
     Connect {
         /// The computer: its id (signed in), or its 9-digit ID with the access password in
-        /// the RCONN_ACCESS_PASSWORD environment variable (no account needed).
+        /// the RCONN_ACCESS_PASSWORD environment variable (no account needed). Without a
+        /// password the person at the computer is asked to accept.
         host: String,
         #[arg(long, env = "RCONN_OPENH264")]
         openh264: Option<std::path::PathBuf>,
@@ -441,24 +442,21 @@ fn default_openh264() -> Result<std::path::PathBuf> {
 }
 
 /// Which computer, and how: a full id means "signed in"; anything else is an ID to use with
-/// the access password from [`access::PASSWORD_ENV`].
+/// the access password from [`access::PASSWORD_ENV`], or, with none, by asking the person
+/// at the computer to accept.
 fn target(host: &str) -> Result<(HostId, Option<access::GuestLogin>)> {
     let password = std::env::var(access::PASSWORD_ENV)
         .ok()
         .filter(|p| !p.is_empty());
     match (uuid::Uuid::parse_str(host.trim()), password) {
         (Ok(id), None) => Ok((HostId(id), None)),
-        (id, Some(password)) => Ok((
+        (id, password) => Ok((
             HostId(id.unwrap_or_default()),
             Some(access::GuestLogin {
                 id: host.trim().to_owned(),
-                password,
+                password: password.unwrap_or_default(),
             }),
         )),
-        (Err(_), None) => anyhow::bail!(
-            "`{host}` isn't a computer id; to connect with its 9-digit ID, put its access password in {}",
-            access::PASSWORD_ENV
-        ),
     }
 }
 

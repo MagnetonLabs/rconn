@@ -38,6 +38,11 @@ import { version } from '../lib/releases';
             <li>Learn your access password. It never receives it.</li>
             <li>Test password guesses offline. Every guess has to be a live attempt on your computer.</li>
             <li>Read the screen, keystrokes, clipboard or sound of a session, including when it relays one.</li>
+            <li>
+              Put itself in the middle of a password session, even if modified to attack you: the
+              password check would fail. (Sessions you accept without a password are different;
+              see below.)
+            </li>
           </ul>
         </div>
       </div>
@@ -57,12 +62,19 @@ import { version } from '../lib/releases';
         </li>
         <li>
           Over that connection, the two devices run a password check called SPAKE2. Each side
-          proves it knows the password without sending it. Someone who records the exchange
-          learns nothing they can use to guess the password offline.
+          proves it knows the password without sending it. The proof also covers the
+          connection’s own encryption keys, so it only works on that exact connection.
+          Someone who records the exchange learns nothing they can use to guess the password
+          offline.
         </li>
         <li>
-          Only when the check passes does your computer start sending its screen and accepting
-          input. Until then nothing is shown, played or accepted.
+          No password set on your computer? Then it asks you instead: a window on your screen
+          says who wants to connect, and you accept or decline. Nobody answers within 30
+          seconds, and it declines.
+        </li>
+        <li>
+          Only when the check passes, or you accept, does your computer start sending its
+          screen and accepting input. Until then nothing is shown, played or accepted.
         </li>
       </ol>
 
@@ -73,23 +85,30 @@ import { version } from '../lib/releases';
           readable only by the computer’s administrators.
         </li>
         <li>Passwords need at least eight characters.</li>
-        <li>After five wrong tries, your computer refuses every attempt for a minute.</li>
+        <li>
+          After five wrong tries or declined requests, your computer refuses every attempt for a
+          minute. It shows one request at a time, and at most three a minute.
+        </li>
         <li>A password session reaches only that one computer.</li>
       </ul>
 
       <h2>What this doesn’t protect against</h2>
       <ul>
         <li>
-          <strong>People you give the password to.</strong> Anyone with your ID and password
-          can see and control your computer. Only share them with people you trust, and change
-          the password afterwards. Be wary of anyone who calls you and asks you to install
-          remote-access software.
+          <strong>People you give the password to, or accept.</strong> Anyone with your ID and
+          password, or anyone you accept, can see and control your computer. Only share them
+          with people you trust, and change the password afterwards. Be wary of anyone who
+          calls you and asks you to install remote-access software or accept a connection.
         </li>
         <li>
-          <strong>A server that turns hostile.</strong> The devices exchange their encryption
-          keys through the server, and today’s password check doesn’t confirm those keys. A
-          server modified to attack you could place itself in the middle of a session. If that
-          risk matters to you, <a href="/self-host">run your own server</a>.
+          <strong>A hostile server, when you accept without a password.</strong> The devices
+          exchange their encryption keys through the server. With a password, the password
+          check confirms those keys, so a server that put itself in the middle would fail it.
+          When you accept a connection instead, there is no shared secret to confirm them
+          with: a server modified to attack you could sit in the middle of a session you
+          accepted. The name in the request comes from the other device and isn’t checked
+          either. Set a password, or <a href="/self-host">run your own server</a>, if that
+          matters to you.
         </li>
         <li>
           <strong>Information about connections.</strong> The server knows which devices

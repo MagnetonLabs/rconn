@@ -20,6 +20,16 @@ pub const CHALLENGE_LEN: usize = 32;
 /// differs, so a [`DataMessage`] schema change bumps this, never edits v1 in place.
 pub const DATA_CHANNEL_PROTOCOL: &str = "rconn-data/1";
 
+/// Label of the data channel a viewer opens. It tells the host which guest check the
+/// viewer speaks: this label means the access-password proof is bound to the connection's
+/// DTLS keys and the viewer can ask the person at the computer ([`GuestMessage::AskUser`]).
+/// Viewers from before open [`LEGACY_DATA_CHANNEL_LABEL`] and are refused guest sessions
+/// (their proof isn't bound to the connection). Only a hint: a server that changed it
+/// gains nothing (the host then refuses, or the bound proof fails).
+pub const DATA_CHANNEL_LABEL: &str = "rconn guest/2";
+/// The data channel label of viewers that predate [`DATA_CHANNEL_LABEL`].
+pub const LEGACY_DATA_CHANNEL_LABEL: &str = "rconn";
+
 /// Capabilities this build's server advertises in [`ServerMessage::Welcome`]. Clients
 /// only use optional features the server lists; unknown entries are ignored.
 pub const SERVER_CAPABILITIES: &[&str] = &["sessions", "ice-relay"];
@@ -256,7 +266,9 @@ pub enum ErrorCode {
 
 /// Frozen for [`DATA_CHANNEL_PROTOCOL`] `rconn-data/1`: postcard encodes variants by
 /// index, so variants and fields here (and in nested enums) must never be reordered,
-/// removed or inserted. Changes go into a new protocol version.
+/// removed or inserted. New variants may only be appended at the end of an enum, and only
+/// where an older peer that can't decode one is safe (it ignores the message); anything
+/// else goes into a new protocol version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DataMessage {
     Input(InputEvent),
@@ -278,17 +290,45 @@ pub enum GuestMessage {
     Accepted { confirm: Vec<u8> },
     /// Host -> viewer: refused; the session ends.
     Refused(GuestRefusal),
+    // Appended for viewers on DATA_CHANNEL_LABEL; never sent to older ones.
+    /// Host -> viewer: this computer has no access password; the person at it decides.
+    /// The viewer answers with [`GuestMessage::AskUser`].
+    ApprovalNeeded,
+    /// Viewer -> host: ask the person at the computer to accept (instead of the password,
+    /// where the host allows that). `name` says who is asking: it comes from the viewer and
+    /// is shown as unverified, cut to [`MAX_VIEWER_NAME`] characters.
+    AskUser { name: String },
+    /// Host -> viewer: the person at the computer is being asked; the answer comes within
+    /// `timeout_secs` ([`GuestMessage::Approved`] or a refusal).
+    AskingUser { timeout_secs: u32 },
+    /// Host -> viewer: the person at the computer accepted. No proof comes with it: an
+    /// approval-only session has no shared secret (see [`crate::guest`]).
+    Approved,
 }
+
+/// Longest viewer name shown in the host's prompt; longer ones are cut.
+pub const MAX_VIEWER_NAME: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuestRefusal {
     WrongPassword,
-    /// This computer has no access password set.
+    /// This computer has no access password set (sent to viewers that can't ask instead).
     NotEnabled,
-    /// Too many wrong passwords lately; try again later.
+    /// Too many wrong passwords or declined requests lately; try again later.
     TooManyAttempts {
         retry_after_secs: u32,
     },
+    // Appended for viewers on DATA_CHANNEL_LABEL; never sent to older ones.
+    /// The person at the computer declined.
+    Declined,
+    /// Nobody at the computer answered in time.
+    NoAnswer,
+    /// This computer takes its access password only (asking isn't allowed here).
+    PasswordRequired,
+    /// The computer is already asking about another connection.
+    Busy,
+    /// The computer couldn't show the question (nobody logged in to its desktop).
+    CannotAsk,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -505,6 +545,12 @@ mod tests {
             }),
             DataMessage::Control(Control::Ping(42)),
             DataMessage::Clipboard("héllo".into()),
+            DataMessage::Guest(GuestMessage::AskUser {
+                name: "Ana on LAPTOP".into(),
+            }),
+            DataMessage::Guest(GuestMessage::AskingUser { timeout_secs: 30 }),
+            DataMessage::Guest(GuestMessage::Approved),
+            DataMessage::Guest(GuestMessage::Refused(GuestRefusal::Declined)),
         ];
         for m in msgs {
             let bytes = m.encode().unwrap();
@@ -549,6 +595,30 @@ mod tests {
             panic!("not welcome")
         };
         assert!(capabilities.is_empty());
+    }
+
+    /// Guest messages older peers know keep their encoding (postcard variant indexes): the
+    /// new ones were appended after them.
+    #[test]
+    fn guest_messages_older_peers_know_keep_their_encoding() {
+        let enc = |m: GuestMessage| DataMessage::Guest(m).encode().unwrap();
+        assert_eq!(
+            enc(GuestMessage::Refused(GuestRefusal::WrongPassword)),
+            [3, 3, 0]
+        );
+        assert_eq!(
+            enc(GuestMessage::Refused(GuestRefusal::NotEnabled)),
+            [3, 3, 1]
+        );
+        assert_eq!(
+            enc(GuestMessage::Accepted { confirm: vec![9] }),
+            [3, 2, 1, 9]
+        );
+        assert_eq!(enc(GuestMessage::ApprovalNeeded), [3, 4]);
+        assert_eq!(
+            enc(GuestMessage::Refused(GuestRefusal::Declined)),
+            [3, 3, 3]
+        );
     }
 
     #[test]

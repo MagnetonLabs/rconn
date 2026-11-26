@@ -40,7 +40,9 @@ pub async fn run(
     let mut session = open_viewer_session(sig, host, opts).await?;
     let mut exchange = guest
         .as_ref()
-        .map(|g| rconn_peer::guest::Exchange::new(g.password.clone(), session.session_id));
+        .map(|g| rconn_peer::guest::Exchange::new(g.password.clone(), &session));
+    // Guests may wait for the person at the computer (up to a minute on the host's side).
+    let first_video = Duration::from_secs(if guest.is_some() { 75 } else { 20 });
     let (refused_tx, mut refused_rx) = tokio::sync::oneshot::channel::<String>();
     let mut refused_tx = Some(refused_tx);
 
@@ -96,8 +98,9 @@ pub async fn run(
                                         let _ = dc.send(BytesMut::from(&b[..])).await;
                                     }
                                 }
+                                rconn_peer::guest::Step::Waiting(text) => println!("{text}"),
                                 rconn_peer::guest::Step::Accepted => {
-                                    println!("access password accepted");
+                                    println!("accepted");
                                     send_kf(dc.clone()).await;
                                 }
                                 rconn_peer::guest::Step::Refused(why) => {
@@ -153,8 +156,8 @@ pub async fn run(
         }
     });
     let track = tokio::select! {
-        t = tokio::time::timeout(Duration::from_secs(20), video_rx.recv()) => t
-            .map_err(|_| anyhow!("no video from the host within 20 s (is it capturing?)"))?
+        t = tokio::time::timeout(first_video, video_rx.recv()) => t
+            .map_err(|_| anyhow!("no video from the host within {} s (is it capturing?)", first_video.as_secs()))?
             .ok_or_else(|| anyhow!("session closed before video arrived"))?,
         Ok(why) = &mut refused_rx => {
             println!("refused: {why}");

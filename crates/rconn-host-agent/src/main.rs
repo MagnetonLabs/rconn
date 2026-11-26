@@ -10,6 +10,7 @@ mod display;
 mod hostkind;
 mod indicator;
 mod input;
+mod prompt;
 mod stream;
 
 use anyhow::{Context, Result};
@@ -54,7 +55,8 @@ struct Cli {
     #[arg(long, env = "RCONN_FINGERPRINT")]
     fingerprint: Option<String>,
     /// No identity in --identity yet: get an ID from the server without an account (owned
-    /// by nobody; every session then needs the access password) and save it there.
+    /// by nobody; every session then needs the access password, or the person at the computer
+    /// accepts it) and save it there.
     #[arg(long, env = "RCONN_ENROLL_IF_MISSING")]
     enroll_if_missing: bool,
     /// Directory with host.id, host.cert.pem and host.key.pem from `enroll-host`.
@@ -292,8 +294,8 @@ async fn serve_session(
     // Data channels: Ping/Pong, keyframe requests, input, clipboard (if policy allows).
     let clipboard = session.policy.clipboard;
     let kf = keyframes.clone();
-    // Guests (ID + access password, no account) see and control nothing until it checks
-    // out; nor does anyone at all on a computer owned by nobody.
+    // Guests (ID, no account) see and control nothing until the access password checks out
+    // or the person here accepts; nor does anyone at all on a computer owned by nobody.
     let owner = cli.identity.as_deref().map_or(
         rconn_peer::identity::LocalOwner::Recorded(None),
         rconn_peer::identity::local_owner,
@@ -303,7 +305,11 @@ async fn serve_session(
         tracing::warn!(%session.session_id, "server sent a session without the password check to a computer owned by nobody; requiring the password");
     }
     let gate = access::Gate::new(password_first);
-    let verifier = settings.settings().access_password.clone();
+    let policy = access::Policy {
+        verifier: settings.settings().access_password.clone(),
+        ask_with_password: settings.settings().ask_with_password,
+    };
+    let binding = session.binding.clone();
     let session_id = session.session_id;
     let channel_gate = gate.clone();
     // The screen fitted to the viewer's window; the original size returns at the end.
@@ -322,8 +328,8 @@ async fn serve_session(
                 channel_fit.clone(),
                 Guest {
                     gate: channel_gate.clone(),
-                    verifier: verifier.clone(),
-                    session: session_id,
+                    policy: policy.clone(),
+                    binding: binding.clone(),
                 },
             ));
         }
@@ -351,7 +357,7 @@ async fn serve_session(
         anyhow::bail!("peer connection did not connect");
     }
     if password_first {
-        tracing::info!(%session_id, "access-password session: waiting for the password");
+        tracing::info!(%session_id, "guest session: waiting for the password or the person here");
         if !gate.wait(Duration::from_secs(60)).await {
             // Let the refusal reach the viewer before the connection closes.
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -403,12 +409,15 @@ async fn serve_session(
     result
 }
 
-/// The access-password check for a session (open from the start for signed-in operators).
+/// The guest check for a session (open from the start for signed-in operators).
 struct Guest {
     gate: Arc<access::Gate>,
-    verifier: String,
-    session: rconn_core::ids::SessionId,
+    policy: access::Policy,
+    binding: rconn_core::guest::Binding,
 }
+
+/// The person at the computer's answer, once they give it.
+type Asking = std::pin::Pin<Box<dyn std::future::Future<Output = GuestMessage> + Send>>;
 
 async fn serve_channel(
     dc: Arc<dyn DataChannel>,
@@ -442,22 +451,49 @@ async fn serve_channel(
         }
     };
     let gate = guest.gate.clone();
-    let mut check = None;
-    if gate.needs_password() {
-        let (c, first) = access::open(&gate, &guest.verifier, guest.session);
-        check = c;
+    let mut pending = access::Pending::None;
+    if gate.needs_check() {
+        let label = dc.label().await.unwrap_or_default();
+        let (p, first) = access::open(&gate, &guest.policy, &guest.binding, &label);
+        pending = p;
         send(DataMessage::Guest(first)).await;
     }
+    // The question on screen, while it is (dropping it closes the window).
+    let mut asking: Option<Asking> = None;
     loop {
         tokio::select! {
+            reply = async { asking.as_mut().expect("guarded").await }, if asking.is_some() => {
+                asking = None;
+                send(DataMessage::Guest(reply)).await;
+            }
             ev = dc.poll() => match ev {
                 Some(DataChannelEvent::OnMessage(msg)) => match DataMessage::decode(&msg.data) {
                     Ok(DataMessage::Guest(GuestMessage::Proof { msg, confirm })) => {
-                        if let Some(c) = check.take() {
-                            send(DataMessage::Guest(access::answer(&gate, c, &msg, &confirm))).await;
+                        match std::mem::replace(&mut pending, access::Pending::None) {
+                            access::Pending::Password { check, .. } => {
+                                send(DataMessage::Guest(access::answer(&gate, *check, &msg, &confirm))).await;
+                            }
+                            other => pending = other,
                         }
                     }
-                    // Until the access password checks out, nothing else is accepted.
+                    Ok(DataMessage::Guest(GuestMessage::AskUser { name })) if asking.is_none() => {
+                        let p = std::mem::replace(&mut pending, access::Pending::None);
+                        match access::ask(&gate, p, &name) {
+                            Ok(ticket) => {
+                                send(DataMessage::Guest(GuestMessage::AskingUser {
+                                    timeout_secs: access::ASK_TIMEOUT.as_secs() as u32,
+                                }))
+                                .await;
+                                let gate = gate.clone();
+                                asking = Some(Box::pin(async move {
+                                    let answer = prompt::ask(&ticket.viewer, access::ASK_TIMEOUT).await;
+                                    access::decided(&gate, ticket, answer)
+                                }));
+                            }
+                            Err(reply) => send(DataMessage::Guest(reply)).await,
+                        }
+                    }
+                    // Until the guest check passes, nothing else is accepted.
                     Ok(_) if !gate.is_open() => {}
                     Ok(DataMessage::Control(Control::Ping(n))) => send(DataMessage::Control(Control::Pong(n))).await,
                     Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),

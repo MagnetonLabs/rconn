@@ -5386,6 +5386,8 @@ dependencies = [
  "rconn-core",
  "rconn-media",
  "rconn-peer",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
