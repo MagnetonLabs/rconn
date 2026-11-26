@@ -7,6 +7,7 @@ mod audio;
 mod awake;
 mod cursor;
 mod display;
+mod encode_bench;
 mod files;
 mod gpu_selftest;
 mod hostkind;
@@ -51,14 +52,18 @@ struct Cli {
     /// (a test window animates the screen meanwhile), print the numbers, then exit.
     #[arg(long, value_name = "N", conflicts_with_all = ["selftest_input", "selftest_fit"])]
     selftest_gpu: Option<usize>,
+    /// Time N synthetic 1920x1080 desktop frames per scenario (idle, typing, scrolling,
+    /// video) through BGRA->I420 and each software encoder, no capture; print, then exit.
+    #[arg(long, value_name = "N", conflicts_with_all = ["selftest_input", "selftest_fit", "selftest_gpu"])]
+    selftest_encode: Option<usize>,
     /// Signaling WebSocket URL, e.g. wss://rconn.example.com/v1/ws
-    #[arg(long, env = "RCONN_SERVER", required_unless_present_any = ["selftest_input", "selftest_fit", "selftest_gpu"])]
+    #[arg(long, env = "RCONN_SERVER", required_unless_present_any = ["selftest_input", "selftest_fit", "selftest_gpu", "selftest_encode"])]
     server: Option<String>,
     /// Server identity this host was enrolled for (bound into the auth proof).
     #[arg(
         long,
         env = "RCONN_SERVER_ID",
-        required_unless_present_any = ["selftest_input", "selftest_fit", "selftest_gpu"]
+        required_unless_present_any = ["selftest_input", "selftest_fit", "selftest_gpu", "selftest_encode"]
     )]
     server_id: Option<String>,
     /// Pinned server key (`sha256:...` from `rconn-signaling init`). Omit for servers
@@ -74,7 +79,7 @@ struct Cli {
     #[arg(
         long,
         env = "RCONN_IDENTITY_DIR",
-        required_unless_present_any = ["selftest_input", "selftest_fit", "selftest_gpu"]
+        required_unless_present_any = ["selftest_input", "selftest_fit", "selftest_gpu", "selftest_encode"]
     )]
     identity: Option<PathBuf>,
     /// Cisco openh264 library. Default: next to this executable.
@@ -165,6 +170,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.selftest_input {
         println!("{}", input::selftest()?);
+        return Ok(());
+    }
+    if let Some(n) = cli.selftest_encode {
+        let openh264 = cli.openh264_path()?;
+        println!(
+            "{}",
+            tokio::task::spawn_blocking(move || encode_bench::run(n, &openh264)).await??
+        );
         return Ok(());
     }
     if let Some(n) = cli.selftest_gpu {

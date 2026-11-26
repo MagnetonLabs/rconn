@@ -617,10 +617,10 @@ fn picture_size(picture: &Option<I420>, surface: &Option<Surface>) -> Option<(us
     }
 }
 
-/// CPU seconds used so far by (this process, the calling thread). Windows only.
+/// CPU seconds used so far by (this process, the calling thread).
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI: GetProcessTimes, GetThreadTimes
-fn cpu_times() -> (f64, f64) {
+pub(crate) fn cpu_times() -> (f64, f64) {
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::System::Threading::{
         GetCurrentProcess, GetCurrentThread, GetProcessTimes, GetThreadTimes,
@@ -637,9 +637,14 @@ fn cpu_times() -> (f64, f64) {
     (process, thread)
 }
 
-#[cfg(not(windows))]
-fn cpu_times() -> (f64, f64) {
-    (0.0, 0.0)
+#[cfg(unix)]
+pub(crate) fn cpu_times() -> (f64, f64) {
+    use rustix::time::{ClockId, clock_gettime};
+    let secs = |id| {
+        let t = clock_gettime(id);
+        t.tv_sec as f64 + t.tv_nsec as f64 / 1e9
+    };
+    (secs(ClockId::ProcessCPUTime), secs(ClockId::ThreadCPUTime))
 }
 
 #[derive(Default)]

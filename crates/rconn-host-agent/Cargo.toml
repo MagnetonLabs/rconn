@@ -29,7 +29,7 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_Input_Ke
 
 # File transfer: free space on the disk uploads go to.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "time"] }
 
 # Windows/macOS sound capture; Linux records the output through PipeWire instead.
 [target.'cfg(not(target_os = "linux"))'.dependencies]

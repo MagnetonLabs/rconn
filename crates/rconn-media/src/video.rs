@@ -170,9 +170,10 @@ pub struct VideoEncoder {
     /// This engine turns bitrate changes into keyframes (seen, or known: Microsoft's
     /// software Media Foundation encoder): change its bitrate rarely.
     retarget_costs_key: bool,
-    /// macOS: openh264 rather than VideoToolbox, as asked for (`RCONN_ENCODER=openh264`,
-    /// [`VideoEncoder::software`]) or because VideoToolbox failed.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// openh264 rather than VideoToolbox / Media Foundation, as asked for
+    /// (`RCONN_ENCODER=openh264`, [`VideoEncoder::software`]) or because VideoToolbox
+    /// failed.
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     software_only: bool,
     /// VideoToolbox failures in a row.
     #[cfg(target_os = "macos")]
@@ -197,8 +198,8 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    /// Cisco's openh264 rather than VideoToolbox (comparisons, tests).
-    #[cfg(target_os = "macos")]
+    /// Cisco's openh264 rather than the platform's encoder (VideoToolbox, Media
+    /// Foundation): comparisons, tests.
     pub fn software(
         openh264_path: &std::path::Path,
         settings: EncoderSettings,
@@ -274,18 +275,20 @@ impl VideoEncoder {
             }
         }
         #[cfg(windows)]
-        match crate::mf::MfH264Encoder::new(
-            width as u32,
-            height as u32,
-            self.settings.max_fps.round().max(1.0) as u32,
-            self.settings.bitrate_bps,
-        ) {
-            Ok(mf) => {
-                self.engine_name = format!("Media Foundation ({})", mf.name());
-                return Ok(Engine::MediaFoundation(mf));
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Media Foundation encoder unavailable; using openh264")
+        if !self.software_only {
+            match crate::mf::MfH264Encoder::new(
+                width as u32,
+                height as u32,
+                self.settings.max_fps.round().max(1.0) as u32,
+                self.settings.bitrate_bps,
+            ) {
+                Ok(mf) => {
+                    self.engine_name = format!("Media Foundation ({})", mf.name());
+                    return Ok(Engine::MediaFoundation(mf));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Media Foundation encoder unavailable; using openh264")
+                }
             }
         }
         self.engine_name = if self.openh264_ltr {
@@ -589,7 +592,8 @@ impl VideoEncoder {
     /// surface; if not, that capture generation ends and the next one uses memory.
     pub fn wants_surfaces(&self) -> bool {
         #[cfg(windows)]
-        return crate::d3d11::texture_path_allowed()
+        return !self.software_only
+            && crate::d3d11::texture_path_allowed()
             && (crate::d3d11::software_texture_test()
                 || crate::mf::MfH264Encoder::hardware_available());
         #[cfg(not(windows))]
