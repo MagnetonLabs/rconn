@@ -6,13 +6,15 @@
 
 use bytes::BytesMut;
 use rconn_core::files::FILES_CHANNEL_PROTOCOL;
-use rconn_core::protocol::{Control, DataMessage};
 use rconn_core::fleet::{FleetCa, HostKey};
 use rconn_core::ids::{HostId, OperatorId, OrgId};
 use rconn_core::protocol::SessionPolicy;
+use rconn_core::protocol::{Control, DataMessage};
 use rconn_peer::files::{FilesClient, Progress, ServeConfig, Stopped};
 use rconn_peer::rtc::PeerOptions;
-use rconn_peer::session::{HostSession, SessionHandler, ViewerSession, open_viewer_session, run_host};
+use rconn_peer::session::{
+    HostSession, SessionHandler, ViewerSession, open_viewer_session, run_host,
+};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
 use rconn_peer::trust::ServerTrust;
 use rconn_signaling::auth::OperatorIdentity;

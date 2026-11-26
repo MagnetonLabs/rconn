@@ -582,13 +582,7 @@ impl Host {
         }
     }
 
-    async fn put(
-        &self,
-        req: u32,
-        name: &str,
-        size: u64,
-        mut control: mpsc::Receiver<FileMessage>,
-    ) {
+    async fn put(&self, req: u32, name: &str, size: u64, mut control: mpsc::Receiver<FileMessage>) {
         let mut saved = String::new();
         let result: Result<(u64, [u8; 32])> = async {
             let inbox = &self.cfg.inbox;
@@ -866,7 +860,9 @@ impl FilesClient {
     ) -> Result<PathBuf> {
         let mut route = self.start()?;
         let req = route.req;
-        let result = self.download_inner(&mut route, remote, dest_dir, progress).await;
+        let result = self
+            .download_inner(&mut route, remote, dest_dir, progress)
+            .await;
         if result.is_err() {
             let _ = self.client.wire.send(&FileMessage::Cancel { req }).await;
         }

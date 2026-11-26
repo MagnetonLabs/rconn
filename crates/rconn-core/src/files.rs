@@ -464,7 +464,10 @@ mod tests {
             ["Documents", "Reports", "q3.pdf"]
         );
         assert_eq!(relative_components("a\\b").unwrap(), ["a", "b"]);
-        assert_eq!(relative_components("..").unwrap_err(), PathRefused::ParentDir);
+        assert_eq!(
+            relative_components("..").unwrap_err(),
+            PathRefused::ParentDir
+        );
         assert_eq!(
             relative_components("a/../../etc").unwrap_err(),
             PathRefused::ParentDir
@@ -473,7 +476,13 @@ mod tests {
             relative_components("a\\..\\b").unwrap_err(),
             PathRefused::ParentDir
         );
-        for abs in ["/etc/passwd", "\\Windows", "C:\\Windows", "C:x", "\\\\srv\\share"] {
+        for abs in [
+            "/etc/passwd",
+            "\\Windows",
+            "C:\\Windows",
+            "C:x",
+            "\\\\srv\\share",
+        ] {
             assert_eq!(
                 relative_components(abs).unwrap_err(),
                 PathRefused::Absolute,
@@ -484,16 +493,16 @@ mod tests {
             relative_components("file.txt:stream").unwrap_err(),
             PathRefused::Absolute
         );
-        assert_eq!(
-            relative_components("a\0b").unwrap_err(),
-            PathRefused::Nul
-        );
+        assert_eq!(relative_components("a\0b").unwrap_err(), PathRefused::Nul);
         assert_eq!(
             relative_components(&"a".repeat(MAX_PATH_BYTES + 1)).unwrap_err(),
             PathRefused::TooLong
         );
         // Names that merely start with dots are ordinary.
-        assert_eq!(relative_components("...x/.hidden").unwrap(), ["...x", ".hidden"]);
+        assert_eq!(
+            relative_components("...x/.hidden").unwrap(),
+            ["...x", ".hidden"]
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod audio;
 mod awake;
 mod cursor;
 mod display;
+mod files;
 mod hostkind;
 mod indicator;
 mod input;
@@ -16,6 +17,7 @@ mod stream;
 use anyhow::{Context, Result};
 use bytes::BytesMut;
 use clap::Parser;
+use rconn_core::files::FILES_CHANNEL_PROTOCOL;
 use rconn_core::fleet::HostKey;
 use rconn_core::ids::HostId;
 use rconn_core::protocol::{Control, DATA_CHANNEL_PROTOCOL, DataMessage, GuestMessage};
@@ -319,19 +321,29 @@ async fn serve_session(
         &mut session.channels,
         tokio::sync::mpsc::unbounded_channel().1,
     );
+    // File transfer runs on a channel of its own, so bulk data never delays input.
+    let file_setting = settings.settings().file_transfer;
+    let file_policy = session.policy.file_transfer;
     tokio::spawn(async move {
         while let Some(dc) = channels.recv().await {
-            tokio::spawn(serve_channel(
-                dc,
-                kf.clone(),
-                clipboard,
-                channel_fit.clone(),
-                Guest {
-                    gate: channel_gate.clone(),
-                    policy: policy.clone(),
-                    binding: binding.clone(),
-                },
-            ));
+            let guest = Guest {
+                gate: channel_gate.clone(),
+                policy: policy.clone(),
+                binding: binding.clone(),
+            };
+            let (kf, fit) = (kf.clone(), channel_fit.clone());
+            tokio::spawn(async move {
+                if dc
+                    .protocol()
+                    .await
+                    .is_ok_and(|p| p == FILES_CHANNEL_PROTOCOL)
+                {
+                    files::serve_channel(dc, session_id, file_setting, file_policy, guest.gate)
+                        .await
+                } else {
+                    serve_channel(dc, kf, clipboard, fit, guest).await
+                }
+            });
         }
     });
 
