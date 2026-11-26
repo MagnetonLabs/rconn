@@ -35,11 +35,16 @@ pub use macos::Surface;
 #[cfg(windows)]
 pub use crate::d3d11::Surface;
 
-/// A captured picture still on the GPU. Only macOS and Windows have them so far.
-#[cfg(not(any(target_os = "macos", windows)))]
+/// A captured picture still on the GPU, converted and encoded there (Linux: the Wayland
+/// screen as a DMA-BUF, for VA-API).
+#[cfg(target_os = "linux")]
+pub use crate::dmabuf::Surface;
+
+/// A captured picture still on the GPU. Only macOS, Windows and Linux have them so far.
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub enum Surface {}
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 impl Surface {
     pub fn dimensions(&self) -> (usize, usize) {
         match *self {}

@@ -9,6 +9,8 @@ pub enum CodecError {
     OpenH264(String),
     #[error("VideoToolbox: {0}")]
     VideoToolbox(String),
+    #[error("VA-API: {0}")]
+    VaApi(String),
     #[error("opus: {0}")]
     Opus(#[from] opus::Error),
 }

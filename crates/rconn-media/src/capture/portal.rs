@@ -1,10 +1,16 @@
 //! Wayland capture: the desktop portal's screen stream ([`crate::portal`]), read from
-//! PipeWire. Frames arrive in shared memory (MemFd/MemPtr, never DMA-BUF: no modifiers are
-//! offered) as BGRx/BGRA (or RGBx/RGBA, swapped here). Only the areas the compositor's
-//! `SPA_META_VideoDamage` reports are copied and converted; buffers without damage
-//! metadata count as wholly changed.
+//! PipeWire. Frames arrive in shared memory (MemFd/MemPtr) as BGRx/BGRA (or RGBx/RGBA,
+//! swapped here). Only the areas the compositor's `SPA_META_VideoDamage` reports are
+//! copied and converted; buffers without damage metadata count as wholly changed.
+//!
+//! Surface mode ([`Capturer::use_surfaces`], when the VA-API encoder can convert on the
+//! GPU): a new stream offers DMA-BUF formats with modifiers first (and shared memory
+//! after them, per PipeWire's DMA-BUF negotiation). If the compositor picks DMA-BUF,
+//! each buffer is handed on as a [`Surface`] without touching its pixels; damage still
+//! drives the frame pacing. If it doesn't, the stream carries on in shared memory.
 
 use super::{CaptureError, Captured, Capturer, convert_whole};
+use crate::dmabuf::{self, DmaBuf, Plane, Surface};
 use crate::portal::{self, Lease};
 use crate::video::Frame;
 use crate::yuv::{I420, Rect};
@@ -23,6 +29,12 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 const STOPPED_AFTER: Duration = Duration::from_millis(500);
 /// More damage rectangles than this pending: treat the frame as wholly changed.
 const MAX_RECTS: usize = 64;
+/// How long a new stream may take to agree on a format.
+const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(3);
+/// A DMA-BUF stream with no usable frame this long after it was agreed has failed.
+const FIRST_SURFACE_TIMEOUT: Duration = Duration::from_secs(5);
+/// DMA-BUF buffers that can't be used, in a row, before the stream counts as failed.
+const MAX_BAD_DMABUFS: u32 = 10;
 
 fn backend(what: &str, e: impl std::fmt::Display) -> CaptureError {
     CaptureError::Backend(format!("Wayland {what}: {e}"))
@@ -56,12 +68,24 @@ impl Damage {
     }
 }
 
-/// The newest picture, tightly packed BGRA (`width * 4` bytes per row).
+/// How the negotiated stream delivers pictures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Memory,
+    DmaBuf,
+}
+
+/// The newest picture, tightly packed BGRA (`width * 4` bytes per row), or (DMA-BUF
+/// streams) the newest buffer.
 #[derive(Default)]
 struct Latest {
     image: Vec<u8>,
+    /// DMA-BUF streams: the newest screen buffer (`image` stays empty).
+    dmabuf: Option<Arc<DmaBuf>>,
     width: usize,
     height: usize,
+    /// The negotiated format: how pictures come, and their size.
+    negotiated: Option<(Kind, (usize, usize))>,
     damage: Damage,
     captured_at: Option<Instant>,
     error: Option<String>,
@@ -97,11 +121,12 @@ impl Latest {
                 src.bytes.len()
             ));
         }
-        let resized = (w, h) != (self.width, self.height);
+        let resized = (w, h) != (self.width, self.height) || self.image.len() != row * h;
         if resized {
             (self.width, self.height) = (w, h);
             self.image = vec![0; row * h];
         }
+        self.dmabuf = None;
         let whole = [Rect { x: 0, y: 0, w, h }];
         let clipped: Vec<Rect> = match damage {
             Some(d) if !resized => d.iter().filter_map(|r| clip(*r, w, h)).collect(),
@@ -128,6 +153,51 @@ impl Latest {
         self.captured_at = Some(Instant::now());
         self.frames += 1;
         Ok(())
+    }
+
+    /// A DMA-BUF screen buffer arrived (`damage` in buffer pixels; `None` = all): keep a
+    /// reference to it, and add up what changed.
+    fn note_dmabuf(&mut self, frame: DmaBuf, damage: Option<&[Rect]>) {
+        let (w, h) = (frame.width as usize, frame.height as usize);
+        let resized = (w, h) != (self.width, self.height) || self.dmabuf.is_none();
+        (self.width, self.height) = (w, h);
+        self.image = Vec::new();
+        self.dmabuf = Some(Arc::new(frame));
+        match damage {
+            Some(d) if !resized => {
+                let clipped: Vec<Rect> = d.iter().filter_map(|r| clip(*r, w, h)).collect();
+                if !clipped.is_empty() {
+                    self.damage.add(Some(&clipped));
+                }
+            }
+            _ => self.damage.add(None),
+        }
+        self.captured_at = Some(Instant::now());
+        self.frames += 1;
+    }
+}
+
+/// What a surface-mode capture changed, in the sent picture (`size`, the `w` x `h`
+/// screen fitted): its even row range and share of the area.
+fn surface_change(
+    damage: &Damage,
+    whole: bool,
+    (w, h): (usize, usize),
+    size: (usize, usize),
+) -> ((usize, usize), f32) {
+    match damage {
+        _ if whole => ((0, size.1), 1.0),
+        Damage::Whole => ((0, size.1), 1.0),
+        Damage::None => ((0, 0), 0.0),
+        Damage::Rects(v) => {
+            let area: usize = v.iter().map(|r| r.w * r.h).sum();
+            let top = v.iter().map(|r| r.y).min().unwrap_or(0);
+            let bottom = v.iter().map(|r| r.y + r.h).max().unwrap_or(h);
+            (
+                dmabuf::scale_rows((top, bottom), h, size.1),
+                (area as f32 / (w * h).max(1) as f32).min(1.0),
+            )
+        }
     }
 }
 
@@ -167,8 +237,9 @@ struct PwStream {
 
 impl PwStream {
     /// Connect to `node` via the portal's PipeWire connection `fd` (or, with `None`, the
-    /// user's default PipeWire daemon: tests).
-    fn start(fd: Option<OwnedFd>, node: Option<u32>) -> Result<Self, CaptureError> {
+    /// user's default PipeWire daemon: tests). With `dmabuf`, DMA-BUF formats are offered
+    /// first.
+    fn start(fd: Option<OwnedFd>, node: Option<u32>, dmabuf: bool) -> Result<Self, CaptureError> {
         let shared = Arc::new(Shared {
             latest: Mutex::new(Latest::default()),
             changed: Condvar::new(),
@@ -179,7 +250,7 @@ impl PwStream {
         let thread = std::thread::Builder::new()
             .name("rconn-pipewire".into())
             .spawn(move || {
-                if let Err(e) = pw_main(fd, node, &s, quit_rx, &ready_tx) {
+                if let Err(e) = pw_main(fd, node, dmabuf, &s, quit_rx, &ready_tx) {
                     let _ = ready_tx.send(Err(e.clone()));
                     s.fail(e);
                 }
@@ -198,12 +269,19 @@ impl PwStream {
     }
 }
 
-impl Drop for PwStream {
-    fn drop(&mut self) {
-        let _ = self.quit.send(());
+impl PwStream {
+    /// Disconnect the stream and end its thread.
+    fn stop(&mut self) {
         if let Some(t) = self.thread.take() {
+            let _ = self.quit.send(());
             let _ = t.join();
         }
+    }
+}
+
+impl Drop for PwStream {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -213,7 +291,44 @@ struct Negotiated {
     width: usize,
     height: usize,
     swap_rb: bool,
+    /// DMA-BUF: the buffers' modifier and DRM format.
+    dmabuf: Option<(u64, u32)>,
+    /// DMA-BUF buffers in a row that could not be used.
+    bad_dmabufs: u32,
     warned_unmapped: bool,
+}
+
+/// The DRM format of a 32-bit RGB PipeWire format (same bytes in memory).
+fn drm_format(f: VideoFormat) -> Option<u32> {
+    Some(match f {
+        VideoFormat::BGRx => dmabuf::DRM_XRGB8888,
+        VideoFormat::BGRA => dmabuf::DRM_ARGB8888,
+        VideoFormat::RGBx => dmabuf::DRM_XBGR8888,
+        VideoFormat::RGBA => dmabuf::DRM_ABGR8888,
+        _ => return None,
+    })
+}
+
+/// The modifier in a negotiated Format, if it has one (a DMA-BUF format). Should the
+/// producer leave a choice, its default.
+fn modifier_of(format: &Pod) -> Option<u64> {
+    let obj = format.as_object().ok()?;
+    let prop = obj.find_prop(spa::utils::Id(spa::sys::SPA_FORMAT_VIDEO_modifier))?;
+    let value = prop.value();
+    if value.is_long() {
+        return value.get_long().ok().map(|m| m as u64);
+    }
+    let (_, v) =
+        spa::pod::deserialize::PodDeserializer::deserialize_any_from(value.as_bytes()).ok()?;
+    match v {
+        Value::Long(m) => Some(m as u64),
+        Value::Choice(spa::pod::ChoiceValue::Long(spa::utils::Choice(_, choice))) => match choice {
+            spa::utils::ChoiceEnum::None(m) => Some(m as u64),
+            spa::utils::ChoiceEnum::Enum { default, .. } => Some(default as u64),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn serialize(obj: spa::pod::Object) -> Result<Vec<u8>, String> {
@@ -222,7 +337,125 @@ fn serialize(obj: spa::pod::Object) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("pod: {e:?}"))
 }
 
-/// Formats we take: raw 32-bit BGR/RGB, any size, variable frame rate up to 60 fps.
+/// The size and frame-rate properties every offered format has: any size, variable
+/// frame rate up to 60 fps.
+fn common_properties() -> Vec<Property> {
+    use spa::param::format::FormatProperties;
+    use spa::pod::ChoiceValue;
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Rectangle};
+    fn range<T: spa::pod::CanonicalFixedSizedPod>(default: T, min: T, max: T) -> ChoiceEnum<T> {
+        ChoiceEnum::Range { default, min, max }
+    }
+    vec![
+        Property::new(
+            FormatProperties::VideoSize.as_raw(),
+            Value::Choice(ChoiceValue::Rectangle(Choice(
+                ChoiceFlags::empty(),
+                range(
+                    Rectangle {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    Rectangle {
+                        width: 1,
+                        height: 1,
+                    },
+                    Rectangle {
+                        width: 16384,
+                        height: 16384,
+                    },
+                ),
+            ))),
+        ),
+        Property::new(
+            FormatProperties::VideoFramerate.as_raw(),
+            Value::Choice(ChoiceValue::Fraction(Choice(
+                ChoiceFlags::empty(),
+                range(
+                    Fraction { num: 30, denom: 1 },
+                    Fraction { num: 0, denom: 1 },
+                    Fraction { num: 360, denom: 1 },
+                ),
+            ))),
+        ),
+        Property::new(
+            FormatProperties::VideoMaxFramerate.as_raw(),
+            Value::Choice(ChoiceValue::Fraction(Choice(
+                ChoiceFlags::empty(),
+                range(
+                    Fraction { num: 60, denom: 1 },
+                    Fraction { num: 1, denom: 1 },
+                    Fraction { num: 60, denom: 1 },
+                ),
+            ))),
+        ),
+    ]
+}
+
+/// A DMA-BUF format: `format` in one of `modifiers` (mandatory, so a producer without
+/// DMA-BUF skips it; not to be fixated by PipeWire: the producer picks one it can
+/// allocate).
+fn dmabuf_format_pod(format: VideoFormat, modifiers: &[u64]) -> Result<Vec<u8>, String> {
+    use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+    use spa::pod::{ChoiceValue, PropertyFlags};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
+    let first = *modifiers.first().ok_or("no modifiers")? as i64;
+    let mut properties = vec![
+        Property::new(
+            FormatProperties::MediaType.as_raw(),
+            Value::Id(Id(MediaType::Video.as_raw())),
+        ),
+        Property::new(
+            FormatProperties::MediaSubtype.as_raw(),
+            Value::Id(Id(MediaSubtype::Raw.as_raw())),
+        ),
+        Property::new(
+            FormatProperties::VideoFormat.as_raw(),
+            Value::Id(Id(format.as_raw())),
+        ),
+    ];
+    properties.extend(common_properties());
+    properties.push(Property {
+        key: spa::sys::SPA_FORMAT_VIDEO_modifier,
+        flags: PropertyFlags::from_bits_retain(
+            spa::sys::SPA_POD_PROP_FLAG_MANDATORY | spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE,
+        ),
+        value: Value::Choice(ChoiceValue::Long(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Enum {
+                default: first,
+                alternatives: modifiers.iter().map(|&m| m as i64).collect(),
+            },
+        ))),
+    });
+    serialize(spa::pod::Object {
+        type_: spa::sys::SPA_TYPE_OBJECT_Format,
+        id: spa::sys::SPA_PARAM_EnumFormat,
+        properties,
+    })
+}
+
+/// The formats offered, in order of preference: with `dmabuf`, the 32-bit RGB formats as
+/// DMA-BUFs with our modifiers, then shared memory.
+fn format_pods(dmabuf: bool) -> Result<Vec<Vec<u8>>, String> {
+    let mut v = Vec::new();
+    if dmabuf {
+        let modifiers = dmabuf::offered_modifiers();
+        for f in [
+            VideoFormat::BGRx,
+            VideoFormat::BGRA,
+            VideoFormat::RGBx,
+            VideoFormat::RGBA,
+        ] {
+            v.push(dmabuf_format_pod(f, &modifiers)?);
+        }
+    }
+    v.push(format_pod()?);
+    Ok(v)
+}
+
+/// Formats we take in shared memory: raw 32-bit BGR/RGB, any size, variable frame rate
+/// up to 60 fps.
 fn format_pod() -> Result<Vec<u8>, String> {
     use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     use spa::utils::{Fraction, Rectangle};
@@ -282,10 +515,15 @@ fn format_pod() -> Result<Vec<u8>, String> {
     ))
 }
 
-/// Shared-memory buffers only, plus up to 16 damage rectangles per buffer.
-fn buffer_pods() -> Result<[Vec<u8>; 2], String> {
+/// Shared-memory buffers (or, for a DMA-BUF format, DMA-BUFs), plus up to 16 damage
+/// rectangles per buffer.
+fn buffer_pods(dmabuf: bool) -> Result<[Vec<u8>; 2], String> {
     use spa::sys;
-    let data_types = (1i32 << sys::SPA_DATA_MemFd) | (1i32 << sys::SPA_DATA_MemPtr);
+    let data_types = if dmabuf {
+        1i32 << sys::SPA_DATA_DmaBuf
+    } else {
+        (1i32 << sys::SPA_DATA_MemFd) | (1i32 << sys::SPA_DATA_MemPtr)
+    };
     let buffers = serialize(spa::pod::Object {
         type_: sys::SPA_TYPE_OBJECT_ParamBuffers,
         id: sys::SPA_PARAM_Buffers,
@@ -322,6 +560,7 @@ fn buffer_pods() -> Result<[Vec<u8>; 2], String> {
 fn pw_main(
     fd: Option<OwnedFd>,
     node: Option<u32>,
+    dmabuf: bool,
     shared: &Arc<Shared>,
     quit_rx: pw::channel::Receiver<()>,
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
@@ -354,8 +593,7 @@ fn pw_main(
         },
     )
     .map_err(|e| format!("stream: {e}"))?;
-    let [buffers, meta] = buffer_pods()?;
-    let (s_state, s_frames) = (shared.clone(), shared.clone());
+    let (s_state, s_format, s_frames) = (shared.clone(), shared.clone(), shared.clone());
     let _listener = stream
         .add_local_listener_with_user_data(Negotiated::default())
         .state_changed(move |_, _, old, new| {
@@ -389,13 +627,28 @@ fn pw_main(
                 }
             };
             (fmt.width, fmt.height) = (info.size().width as usize, info.size().height as usize);
+            fmt.dmabuf = modifier_of(param).zip(drm_format(format));
             tracing::info!(
                 ?format,
                 width = fmt.width,
                 height = fmt.height,
-                modifier = info.modifier(),
+                dmabuf = fmt.dmabuf.is_some(),
+                modifier = format_args!("{:#x}", fmt.dmabuf.map_or(0, |d| d.0)),
                 "PipeWire screen format"
             );
+            {
+                let mut l = s_format.latest.lock().expect("latest frame");
+                let kind = if fmt.dmabuf.is_some() {
+                    Kind::DmaBuf
+                } else {
+                    Kind::Memory
+                };
+                l.negotiated = Some((kind, (fmt.width, fmt.height)));
+                s_format.changed.notify_all();
+            }
+            let Ok([buffers, meta]) = buffer_pods(fmt.dmabuf.is_some()) else {
+                return;
+            };
             let (Some(b), Some(m)) = (Pod::from_bytes(&buffers), Pod::from_bytes(&meta)) else {
                 return;
             };
@@ -406,8 +659,11 @@ fn pw_main(
         .process(move |stream, fmt| on_process(stream, fmt, &s_frames))
         .register()
         .map_err(|e| format!("stream listener: {e}"))?;
-    let format = format_pod()?;
-    let mut params = [Pod::from_bytes(&format).ok_or("format pod")?];
+    let formats = format_pods(dmabuf)?;
+    let mut params = formats
+        .iter()
+        .map(|f| Pod::from_bytes(f).ok_or("format pod"))
+        .collect::<Result<Vec<_>, _>>()?;
     stream
         .connect(
             spa::utils::Direction::Input,
@@ -462,6 +718,29 @@ fn on_process(stream: &pw::stream::Stream, fmt: &mut Negotiated, shared: &Shared
         return; // a cursor-only or empty update
     }
     let kind = data.type_();
+    if kind == spa::buffer::DataType::DmaBuf {
+        let damage = (!whole).then_some(rects.as_slice());
+        match dmabuf_frame(buf.datas_mut(), fmt) {
+            Ok(frame) => {
+                fmt.bad_dmabufs = 0;
+                let mut l = shared.latest.lock().expect("latest frame");
+                l.note_dmabuf(frame, damage);
+                shared.changed.notify_all();
+            }
+            Err(e) => {
+                fmt.bad_dmabufs += 1;
+                if fmt.bad_dmabufs == MAX_BAD_DMABUFS {
+                    // Memory capture from the next capture on.
+                    let why = format!("DMA-BUF screen buffers unusable: {e}");
+                    crate::vaapi::zero_copy_failed(&why);
+                    shared.fail(why);
+                } else {
+                    tracing::debug!(error = %e, "skipped a DMA-BUF screen buffer");
+                }
+            }
+        }
+        return;
+    }
     let Some(bytes) = data.data() else {
         if !fmt.warned_unmapped {
             fmt.warned_unmapped = true;
@@ -486,12 +765,49 @@ fn on_process(stream: &pw::stream::Stream, fmt: &mut Negotiated, shared: &Shared
     }
 }
 
+/// Our references to a DMA-BUF buffer's planes (one per PipeWire data).
+fn dmabuf_frame(datas: &[spa::buffer::Data], fmt: &Negotiated) -> Result<DmaBuf, String> {
+    let (modifier, drm_format) = fmt
+        .dmabuf
+        .ok_or("a DMA-BUF in a stream negotiated for memory")?;
+    let planes = datas
+        .iter()
+        .filter(|d| d.type_() == spa::buffer::DataType::DmaBuf)
+        .map(|d| {
+            let c = d.chunk();
+            Plane::from_raw(
+                d.fd() as std::os::fd::RawFd,
+                c.offset(),
+                c.stride().max(0) as u32,
+                d.as_raw().maxsize,
+            )
+            .map_err(|e| format!("DMA-BUF fd: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if planes.is_empty() {
+        return Err("a buffer without planes".into());
+    }
+    Ok(DmaBuf {
+        width: fmt.width as u32,
+        height: fmt.height as u32,
+        drm_format,
+        modifier,
+        planes,
+    })
+}
+
 /// The Wayland screen via the desktop portal (or, for tests, any PipeWire video node).
 pub struct PortalCapturer {
     pw: PwStream,
     /// Keeps the portal session (and its stream) alive; `None` for a plain node.
     lease: Option<Lease>,
+    node: u32,
     want_full: bool,
+    /// Surface mode: DMA-BUF screens, sent within this size.
+    surfaces: Option<(usize, usize)>,
+    /// Surface mode: when it began, and whether a DMA-BUF frame has come since.
+    surfaces_since: Option<Instant>,
+    got_surface: bool,
 }
 
 impl PortalCapturer {
@@ -499,22 +815,92 @@ impl PortalCapturer {
         let lease = portal::acquire(ACQUIRE_TIMEOUT).map_err(|e| backend("capture", e))?;
         let stream = lease.stream();
         let fd = lease.open_pipewire().map_err(|e| backend("capture", e))?;
-        let pw = PwStream::start(Some(fd), Some(stream.node_id))?;
+        let pw = PwStream::start(Some(fd), Some(stream.node_id), false)?;
         tracing::info!(node = stream.node_id, size = ?stream.size, "Wayland capture via the desktop portal");
         Ok(Self {
             pw,
             lease: Some(lease),
+            node: stream.node_id,
             want_full: true,
+            surfaces: None,
+            surfaces_since: None,
+            got_surface: false,
         })
     }
 
     /// Capture PipeWire node `node` from the default PipeWire daemon, without a portal.
     pub fn from_node(node: u32) -> Result<Self, CaptureError> {
         Ok(Self {
-            pw: PwStream::start(None, Some(node))?,
+            pw: PwStream::start(None, Some(node), false)?,
             lease: None,
+            node,
             want_full: true,
+            surfaces: None,
+            surfaces_since: None,
+            got_surface: false,
         })
+    }
+
+    /// A new stream to the same screen (offering DMA-BUFs or not).
+    fn restart(&mut self, dmabuf: bool) -> Result<(), CaptureError> {
+        let fd = match &self.lease {
+            Some(l) => Some(l.open_pipewire().map_err(|e| backend("capture", e))?),
+            None => None,
+        };
+        // The old stream goes first: while it is linked, the compositor would also have
+        // to serve its formats.
+        self.pw.stop();
+        match PwStream::start(fd, Some(self.node), dmabuf) {
+            Ok(pw) => self.pw = pw,
+            Err(e) => {
+                // No stream now: the next wait fails, and the capture restarts.
+                self.pw.shared.fail(e.to_string());
+                return Err(e);
+            }
+        }
+        self.want_full = true;
+        Ok(())
+    }
+
+    /// Wait up to `timeout` for the stream's format.
+    fn negotiated(&self, timeout: Duration) -> Option<(Kind, (usize, usize))> {
+        let deadline = Instant::now() + timeout;
+        let mut l = self.pw.shared.latest.lock().expect("latest frame");
+        loop {
+            if l.negotiated.is_some() || l.error.is_some() {
+                return l.negotiated;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            l = self
+                .pw
+                .shared
+                .changed
+                .wait_timeout(l, deadline - now)
+                .expect("latest frame")
+                .0;
+        }
+    }
+
+    /// [`Capturer::use_surfaces`]: switch to a stream of DMA-BUFs if the video processor
+    /// converts this screen's size with the right colours and the compositor offers them.
+    fn try_surfaces(&mut self, max: (usize, usize)) -> Result<(), String> {
+        let (_, (w, h)) = self
+            .negotiated(NEGOTIATE_TIMEOUT)
+            .ok_or("the screen stream has no format yet")?;
+        crate::vaapi::check_zero_copy(dmabuf::fitted(w, h, max))?;
+        self.restart(true).map_err(|e| e.to_string())?;
+        match self.negotiated(NEGOTIATE_TIMEOUT) {
+            Some((Kind::DmaBuf, _)) => Ok(()),
+            Some((Kind::Memory, _)) => Err("the compositor offered no DMA-BUF".into()),
+            None => {
+                // No format at all: back to the plain stream.
+                self.restart(false).map_err(|e| e.to_string())?;
+                Err("no format agreed for DMA-BUF capture".into())
+            }
+        }
     }
 
     /// Wait up to `timeout` for a change; the lock is held on return.
@@ -568,12 +954,105 @@ impl PortalCapturer {
     }
 }
 
+/// Memory mode met a DMA-BUF stream (it never asks for one).
+fn no_pixels() -> CaptureError {
+    backend("capture", "DMA-BUF screen buffers outside surface mode")
+}
+
 impl Capturer for PortalCapturer {
+    fn use_surfaces(&mut self, max: (usize, usize)) -> bool {
+        if !crate::vaapi::zero_copy_allowed() {
+            return false;
+        }
+        let t = Instant::now();
+        match self.try_surfaces(max) {
+            Ok(()) => {
+                tracing::info!(
+                    setup_ms = t.elapsed().as_millis() as u64,
+                    "frames stay on the GPU (DMA-BUF capture, VA-API convert and encode)"
+                );
+                self.surfaces = Some(max);
+                self.surfaces_since = Some(Instant::now());
+                self.got_surface = false;
+                true
+            }
+            Err(e) => {
+                crate::vaapi::zero_copy_failed(&e);
+                false
+            }
+        }
+    }
+
+    fn next_surface(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<(Surface, Captured)>, CaptureError> {
+        let max = self
+            .surfaces
+            .ok_or_else(|| backend("capture", "not in surface mode"))?;
+        let want_full = self.want_full;
+        let first = !self.got_surface;
+        let mut l = match self.wait(timeout) {
+            Ok(l) => l,
+            Err(e) => {
+                if first {
+                    // The compositor agreed to DMA-BUFs but could not deliver them.
+                    crate::vaapi::zero_copy_failed(&format!("before the first DMA-BUF: {e}"));
+                }
+                return Err(e);
+            }
+        };
+        if l.width == 0 || (l.damage == Damage::None && !want_full) {
+            if first
+                && self
+                    .surfaces_since
+                    .is_some_and(|t| t.elapsed() > FIRST_SURFACE_TIMEOUT)
+            {
+                drop(l);
+                crate::vaapi::zero_copy_failed("no DMA-BUF frame arrived");
+                return Err(backend("capture", "no DMA-BUF frame arrived"));
+            }
+            return Ok(None);
+        }
+        let Some(frame) = l.dmabuf.clone() else {
+            // The compositor went back to shared memory (a renegotiation).
+            drop(l);
+            crate::vaapi::zero_copy_failed("the screen stream switched to memory buffers");
+            return Err(backend(
+                "capture",
+                "the screen stream switched to memory buffers",
+            ));
+        };
+        let (w, h) = (l.width, l.height);
+        let size = dmabuf::fitted(w, h, max);
+        if size.0 == 0 || size.1 == 0 {
+            return Ok(None);
+        }
+        let damage = std::mem::take(&mut l.damage);
+        let captured_at = l.captured_at.unwrap_or_else(Instant::now);
+        drop(l);
+        self.note_size(w, h);
+        self.want_full = false;
+        self.got_surface = true;
+        let (rows, changed) = surface_change(&damage, want_full, (w, h), size);
+        Ok(Some((
+            Surface { frame, size },
+            Captured {
+                rows,
+                changed,
+                captured_at,
+            },
+        )))
+    }
+
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
         let want_full = self.want_full;
         let mut l = self.wait(timeout)?;
         if l.width == 0 || (l.damage == Damage::None && !want_full) {
             return Ok(None);
+        }
+        if l.image.len() < l.width * l.height * 4 {
+            return Err(no_pixels());
         }
         l.damage = Damage::None;
         self.note_size(l.width, l.height);
@@ -600,6 +1079,9 @@ impl Capturer for PortalCapturer {
             return Ok(None);
         }
         let (w, h) = (l.width, l.height);
+        if l.image.len() < w * h * 4 {
+            return Err(no_pixels());
+        }
         self.note_size(w, h);
         let (ew, eh) = (w & !1, h & !1);
         if ew == 0 || eh == 0 {
@@ -828,8 +1310,166 @@ mod tests {
     fn negotiation_pods_serialize() {
         let f = format_pod().unwrap();
         assert!(Pod::from_bytes(&f).is_some());
-        let [b, m] = buffer_pods().unwrap();
-        assert!(Pod::from_bytes(&b).is_some() && Pod::from_bytes(&m).is_some());
+        for dmabuf in [false, true] {
+            let [b, m] = buffer_pods(dmabuf).unwrap();
+            assert!(Pod::from_bytes(&b).is_some() && Pod::from_bytes(&m).is_some());
+        }
+    }
+
+    fn data_types(buffers: &[u8]) -> i32 {
+        let pod = Pod::from_bytes(buffers).unwrap();
+        let obj = pod.as_object().unwrap();
+        let p = obj
+            .find_prop(spa::utils::Id(spa::sys::SPA_PARAM_BUFFERS_dataType))
+            .unwrap();
+        p.value().get_int().unwrap()
+    }
+
+    #[test]
+    fn buffers_follow_the_negotiated_kind() {
+        use spa::sys::{SPA_DATA_DmaBuf, SPA_DATA_MemFd, SPA_DATA_MemPtr};
+        let [memory, _] = buffer_pods(false).unwrap();
+        assert_eq!(
+            data_types(&memory),
+            (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr)
+        );
+        let [gpu, _] = buffer_pods(true).unwrap();
+        assert_eq!(data_types(&gpu), 1 << SPA_DATA_DmaBuf);
+    }
+
+    #[test]
+    fn dmabuf_formats_come_first_with_mandatory_modifiers() {
+        assert_eq!(format_pods(false).unwrap().len(), 1, "memory only");
+        let pods = format_pods(true).unwrap();
+        assert_eq!(pods.len(), 5, "four DMA-BUF formats, then memory");
+        let key = spa::utils::Id(spa::sys::SPA_FORMAT_VIDEO_modifier);
+        for (i, bytes) in pods.iter().enumerate() {
+            let pod = Pod::from_bytes(bytes).unwrap();
+            let obj = pod.as_object().unwrap();
+            match obj.find_prop(key) {
+                Some(p) if i < 4 => {
+                    let want = spa::sys::SPA_POD_PROP_FLAG_MANDATORY
+                        | spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE;
+                    assert_eq!(p.flags().bits() & want, want);
+                    assert_eq!(modifier_of(pod), Some(dmabuf::MOD_LINEAR));
+                }
+                None if i == 4 => assert_eq!(modifier_of(pod), None),
+                other => panic!("format {i}: modifier {:?}", other.map(|p| p.flags())),
+            }
+        }
+    }
+
+    #[test]
+    fn a_fixated_modifier_is_read() {
+        use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+        let bytes = serialize(spa::pod::object!(
+            spa::utils::SpaTypes::ObjectParamFormat,
+            spa::param::ParamType::Format,
+            spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+            spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+            spa::pod::property!(FormatProperties::VideoFormat, Id, VideoFormat::BGRx),
+            spa::pod::property!(FormatProperties::VideoModifier, Long, 0x0100_0000_0000_0002),
+        ))
+        .unwrap();
+        assert_eq!(
+            modifier_of(Pod::from_bytes(&bytes).unwrap()),
+            Some(0x0100_0000_0000_0002)
+        );
+    }
+
+    #[test]
+    fn rgb_formats_map_to_drm_formats() {
+        assert_eq!(drm_format(VideoFormat::BGRx), Some(dmabuf::DRM_XRGB8888));
+        assert_eq!(drm_format(VideoFormat::BGRA), Some(dmabuf::DRM_ARGB8888));
+        assert_eq!(drm_format(VideoFormat::RGBx), Some(dmabuf::DRM_XBGR8888));
+        assert_eq!(drm_format(VideoFormat::RGBA), Some(dmabuf::DRM_ABGR8888));
+        assert_eq!(drm_format(VideoFormat::NV12), None);
+    }
+
+    fn fake_dmabuf(w: u32, h: u32) -> DmaBuf {
+        DmaBuf {
+            width: w,
+            height: h,
+            drm_format: dmabuf::DRM_XRGB8888,
+            modifier: dmabuf::MOD_LINEAR,
+            planes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dmabuf_damage_accumulates_without_copying() {
+        let mut l = Latest::default();
+        let r = Rect {
+            x: 8,
+            y: 4,
+            w: 16,
+            h: 8,
+        };
+        // First buffer: everything.
+        l.note_dmabuf(fake_dmabuf(64, 32), Some(&[r]));
+        assert_eq!(l.damage, Damage::Whole);
+        assert!(l.image.is_empty() && l.dmabuf.is_some());
+        l.damage = Damage::None;
+        l.note_dmabuf(fake_dmabuf(64, 32), Some(&[r]));
+        l.note_dmabuf(fake_dmabuf(64, 32), None);
+        assert_eq!(l.damage, Damage::Whole, "no damage metadata: all");
+        l.damage = Damage::None;
+        let edge = Rect {
+            x: 60,
+            y: 30,
+            w: 10,
+            h: 10,
+        };
+        l.note_dmabuf(fake_dmabuf(64, 32), Some(&[r, edge]));
+        let clipped = Rect {
+            x: 60,
+            y: 30,
+            w: 4,
+            h: 2,
+        };
+        assert_eq!(l.damage, Damage::Rects(vec![r, clipped]));
+        // A new size: all.
+        l.note_dmabuf(fake_dmabuf(32, 32), Some(&[r]));
+        assert_eq!(l.damage, Damage::Whole);
+        // A memory buffer after DMA-BUFs: the reference goes.
+        let (bytes, stride) = padded(4, 4, 0);
+        let src = Source {
+            bytes: &bytes,
+            stride,
+            width: 4,
+            height: 4,
+            swap_rb: false,
+        };
+        l.ingest(&src, None).unwrap();
+        assert!(l.dmabuf.is_none() && l.image.len() == 64);
+    }
+
+    #[test]
+    fn surface_changes_are_in_sent_rows() {
+        let r = Rect {
+            x: 0,
+            y: 100,
+            w: 400,
+            h: 101,
+        };
+        let full = (3840, 2160);
+        let sent = (1920, 1080);
+        assert_eq!(
+            surface_change(&Damage::Rects(vec![r]), false, full, sent),
+            ((50, 102), 400.0 * 101.0 / (3840.0 * 2160.0))
+        );
+        assert_eq!(
+            surface_change(&Damage::None, true, full, sent),
+            ((0, 1080), 1.0)
+        );
+        assert_eq!(
+            surface_change(&Damage::Whole, false, full, sent),
+            ((0, 1080), 1.0)
+        );
+        assert_eq!(
+            surface_change(&Damage::None, false, full, sent),
+            ((0, 0), 0.0)
+        );
     }
 
     /// Against a real PipeWire daemon: `RCONN_PW_TEST_NODE=<id>` of a video source node
@@ -877,5 +1517,32 @@ mod tests {
         }
         eprintln!("{more} more pictures in 2 s");
         assert!(more > 0, "a moving test source should keep sending");
+    }
+
+    /// As above, with DMA-BUF formats offered first: GStreamer's `pipewiresink` has no
+    /// DMA-BUFs, so the stream must settle on shared memory and keep delivering.
+    #[test]
+    fn captures_a_pipewire_node_offering_dmabuf() {
+        let Some(node) = std::env::var("RCONN_PW_TEST_NODE")
+            .ok()
+            .and_then(|n| n.parse().ok())
+        else {
+            eprintln!("skipped: RCONN_PW_TEST_NODE not set");
+            return;
+        };
+        let mut cap = PortalCapturer::from_node(node).expect("PipeWire stream");
+        assert_eq!(
+            cap.negotiated(Duration::from_secs(5)).map(|n| n.0),
+            Some(Kind::Memory)
+        );
+        cap.restart(true).expect("a stream offering DMA-BUF");
+        let negotiated = cap.negotiated(Duration::from_secs(5));
+        eprintln!("negotiated with DMA-BUF offered: {negotiated:?}");
+        assert_eq!(negotiated.map(|n| n.0), Some(Kind::Memory));
+        let mut picture = None;
+        let first = cap
+            .next_into(Duration::from_secs(5), &mut picture, (8192, 8192))
+            .unwrap();
+        assert!(first.is_some(), "pictures keep coming in shared memory");
     }
 }

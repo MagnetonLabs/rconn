@@ -48,8 +48,9 @@ struct Cli {
     /// it back, then exit. With --state-dir, the portal restore token there is used.
     #[arg(long, value_name = "WxH", conflicts_with = "selftest_input")]
     selftest_fit: Option<String>,
-    /// Windows: time N frames through the memory and the GPU capture -> encode paths
-    /// (a test window animates the screen meanwhile), print the numbers, then exit.
+    /// Windows/Linux: time N frames through the memory and the GPU capture -> encode
+    /// paths (a test window animates the screen meanwhile), print the numbers, then exit.
+    /// Linux: openh264, va-upload and va-zerocopy (VA-API on Intel/AMD GPUs).
     #[arg(long, value_name = "N", conflicts_with_all = ["selftest_input", "selftest_fit"])]
     selftest_gpu: Option<usize>,
     /// Time N synthetic 1920x1080 desktop frames per scenario (idle, typing, scrolling,
