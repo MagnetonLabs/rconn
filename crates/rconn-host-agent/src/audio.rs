@@ -1,11 +1,12 @@
 //! Host sound: capture what the machine is playing (loopback), encode Opus, send.
 //!
 //! Windows: WASAPI loopback (cpal opens an *input* stream on the default *output*
-//! device). Audio is converted to 48 kHz stereo, cut into 20 ms frames and Opus-encoded.
+//! device). Linux: PipeWire's capture of the default output (never a microphone, which is
+//! what cpal's "input on the output device" opens there). Audio is converted to 48 kHz stereo, cut into 20 ms frames and Opus-encoded.
 //! A machine without an output device (soundcard-less cloud VM) simply has no audio;
 //! the session carries on without it.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use rconn_peer::video::AudioSender;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -147,10 +148,30 @@ impl ToStereo48k {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_loopback(
     tx: mpsc::UnboundedSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>> {
+    use rconn_media::audio_monitor::{CHANNELS, RATE as PW_RATE, spawn};
+    let mut conv = ToStereo48k::new(PW_RATE, CHANNELS as usize);
+    let thread = spawn(
+        move |data| {
+            let _ = tx.send(conv.process(data));
+        },
+        stop,
+    )
+    .map_err(|e| anyhow!("PipeWire sound capture: {e}"))?;
+    tracing::info!("host audio: capturing the default output through PipeWire");
+    Ok(thread)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_loopback(
+    tx: mpsc::UnboundedSender<Vec<f32>>,
+    stop: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
+    use anyhow::Context as _;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String>>();
     // cpal streams are not Send everywhere: build and own the stream on this thread.
