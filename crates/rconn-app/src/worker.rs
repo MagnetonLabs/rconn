@@ -355,6 +355,10 @@ impl Worker {
                 });
                 self.connect_guest(id, password.0).await
             }
+            Request::RenameRecent { code, label } => self.home(|h| {
+                h.profile.rename(&code, &label);
+                let _ = h.profile.save(&self.paths.config);
+            }),
             Request::ForgetRecent(code) => self.home(|h| {
                 h.profile.recent.retain(|r| r.code() != code);
                 let _ = h.profile.save(&self.paths.config);
@@ -573,14 +577,23 @@ impl Worker {
         self.home(|h| h.busy = Some(format!("Connecting to {typed}…")));
         let (server, _, fp) = self.server();
         let log = self.paths.config.join("viewer.log");
+        // The viewer writes the computer's name here once it's let in.
+        let code = profile::tidy_code(&typed);
+        let name_file = self
+            .paths
+            .config
+            .join(format!("name-{}.txt", code.replace(' ', "")));
+        let _ = std::fs::remove_file(&name_file);
         let child =
             viewer_cmd(&self.paths.viewer_exe, &server, fp.as_deref(), &log).and_then(|mut c| {
                 c.env("RCONN_ACCESS_PASSWORD", &password)
+                    .env("RCONN_NAME_FILE", &name_file)
                     .args(["connect", &typed]);
                 c.spawn()
                     .map_err(|e| format!("{}: {e}", self.paths.viewer_exe.display()))
             });
-        self.wait_session(child, typed).await;
+        self.wait_session(child, typed, Some((code, name_file)))
+            .await;
     }
 
     /// Open a session window (`rconn-viewer connect`) for `id`.
@@ -603,11 +616,16 @@ impl Worker {
                 c.spawn()
                     .map_err(|e| format!("{}: {e}", self.paths.viewer_exe.display()))
             });
-        self.wait_session(child, name).await;
+        self.wait_session(child, name, None).await;
     }
 
     /// Track a session window until it closes; report how it ended.
-    async fn wait_session(&self, child: Result<std::process::Child, String>, name: String) {
+    async fn wait_session(
+        &self,
+        child: Result<std::process::Child, String>,
+        name: String,
+        mut name_file: Option<(String, std::path::PathBuf)>,
+    ) {
         let mut child = match child {
             Ok(c) => c,
             Err(e) => return self.notice(format!("Couldn't open the session window: {e}"), true),
@@ -617,11 +635,31 @@ impl Worker {
         if let Ok(mut v) = SESSIONS.lock() {
             v.push(pid);
         }
-        let status = tokio::task::spawn_blocking(move || child.wait()).await;
+        let status = loop {
+            let done = child.try_wait();
+            if let Some((code, path)) = &name_file
+                && let Ok(learned) = std::fs::read_to_string(path)
+            {
+                let _ = std::fs::remove_file(path);
+                self.home(|h| {
+                    h.profile.learn_name(code, &learned);
+                    let _ = h.profile.save(&self.paths.config);
+                });
+                name_file = None;
+            }
+            match done {
+                Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
+                Ok(Some(s)) => break Ok(s),
+                Err(e) => break Err(e),
+            }
+        };
+        if let Some((_, path)) = &name_file {
+            let _ = std::fs::remove_file(path);
+        }
         if let Ok(mut v) = SESSIONS.lock() {
             v.retain(|p| *p != pid);
         }
-        if let Ok(Ok(s)) = status
+        if let Ok(s) = status
             && !s.success()
         {
             self.notice(

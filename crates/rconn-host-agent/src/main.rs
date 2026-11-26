@@ -463,7 +463,13 @@ async fn serve_channel(
     }
     // The question on screen, while it is (dropping it closes the window).
     let mut asking: Option<Asking> = None;
+    let mut named = false;
     loop {
+        // Once allowed in, the viewer learns this computer's name (for its recent list).
+        if !named && gate.is_open() {
+            named = true;
+            send(DataMessage::HostName(machine_name())).await;
+        }
         tokio::select! {
             reply = async { asking.as_mut().expect("guarded").await }, if asking.is_some() => {
                 asking = None;

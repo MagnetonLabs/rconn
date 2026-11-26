@@ -43,6 +43,7 @@ impl SessionListener for App {
         self.frames.lock().unwrap().push(frame);
     }
     fn on_clipboard(&self, _text: String) {}
+    fn on_host_name(&self, _name: String) {}
     fn on_closed(&self, reason: String) {
         let mut c = self.closed.lock().unwrap();
         assert!(c.is_none(), "on_closed called twice");

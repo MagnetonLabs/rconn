@@ -58,6 +58,11 @@ pub enum Request {
     ClearAccessPassword,
     /// Take this ID ("123 456 789") off the recent list.
     ForgetRecent(String),
+    /// Name a recent computer here (empty: back to the computer's own name).
+    RenameRecent {
+        code: String,
+        label: String,
+    },
 }
 
 /// A password that must not show up in logs or debug output.
@@ -89,6 +94,8 @@ pub struct Home {
     /// Recent IDs (digits only) the server last said were online or not; no account needed.
     /// Empty when the server hasn't answered (or is too old to know the question).
     pub presence: std::collections::HashMap<String, bool>,
+    /// A recent computer being renamed: (its ID, the name being typed).
+    pub renaming: Option<(String, String)>,
     pub username: String,
     pub password: String,
     pub server_edit: String,
@@ -127,6 +134,7 @@ impl Home {
             host_password_saved: None,
             computers: None,
             presence: Default::default(),
+            renaming: None,
             password: String::new(),
             notice: None,
             busy: None,
@@ -428,6 +436,9 @@ fn tabs(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
 enum CardClick {
     Connect,
     Remove,
+    Rename,
+    SaveName,
+    CancelName,
 }
 
 fn computer_card(
@@ -436,8 +447,10 @@ fn computer_card(
     label: Option<&str>,
     online: Option<bool>,
     enabled: bool,
-    removable: bool,
+    editable: bool,
+    renaming: Option<&mut String>,
 ) -> Option<CardClick> {
+    let is_renaming = renaming.is_some();
     let mut clicked = None;
     egui::Frame::group(ui.style())
         .corner_radius(10.0)
@@ -447,7 +460,29 @@ fn computer_card(
             ui.horizontal(|ui| {
                 ui.label(RichText::new("🖥").size(28.0));
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(label.unwrap_or("Unnamed computer")).strong());
+                    match renaming {
+                        Some(text) => {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(text)
+                                    .hint_text("Name")
+                                    .char_limit(rconn_core::protocol::MAX_HOST_NAME_CHARS)
+                                    .desired_width(CARD_W - 60.0),
+                            );
+                            if !r.has_focus() && !r.lost_focus() {
+                                r.request_focus();
+                            }
+                            if r.lost_focus() {
+                                clicked = Some(if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    CardClick::CancelName
+                                } else {
+                                    CardClick::SaveName
+                                });
+                            }
+                        }
+                        None => {
+                            ui.label(RichText::new(label.unwrap_or("Unnamed computer")).strong());
+                        }
+                    }
                     ui.label(RichText::new(code).monospace().color(Color32::GRAY));
                     if let Some(online) = online {
                         let (c, t) = if online {
@@ -463,20 +498,34 @@ fn computer_card(
                 });
             });
             ui.add_space(6.0);
+            let link = |ui: &mut egui::Ui, text: &str, hover: &str| {
+                ui.add(egui::Button::new(RichText::new(text).small()).frame(false))
+                    .on_hover_text(hover)
+                    .clicked()
+            };
             ui.horizontal(|ui| {
+                if is_renaming {
+                    if ui.button("Save").clicked() {
+                        clicked = Some(CardClick::SaveName);
+                    }
+                    if link(ui, "Cancel", "Keep the current name") {
+                        clicked = Some(CardClick::CancelName);
+                    }
+                    return;
+                }
                 if ui
                     .add_enabled(enabled, egui::Button::new("Connect"))
                     .clicked()
                 {
                     clicked = Some(CardClick::Connect);
                 }
-                if removable
-                    && ui
-                        .add(egui::Button::new(RichText::new("Remove").small()).frame(false))
-                        .on_hover_text("Take it off this list")
-                        .clicked()
-                {
-                    clicked = Some(CardClick::Remove);
+                if editable {
+                    if link(ui, "Rename", "Give it a name on this computer") {
+                        clicked = Some(CardClick::Rename);
+                    }
+                    if link(ui, "Remove", "Take it off this list") {
+                        clicked = Some(CardClick::Remove);
+                    }
                 }
             });
         });
@@ -511,7 +560,7 @@ fn computers(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
         .iter()
         .map(|c| (c.host_id.short_code(), c.label.clone(), Some(true)))
         .collect();
-    if let Some((i, CardClick::Connect)) = card_grid(ui, &cards, enabled, false) {
+    if let Some((i, CardClick::Connect)) = card_grid(ui, &cards, enabled, false, None) {
         out.push(Request::Connect(list[i].host_id, list[i].label.clone()));
     }
 }
@@ -548,12 +597,27 @@ fn recent(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
         .iter()
         .map(|(c, l, o, _)| (c.clone(), l.clone(), *o))
         .collect();
-    let Some((i, click)) = card_grid(ui, &shown, enabled, true) else {
+    let Some((i, click)) = card_grid(ui, &shown, enabled, true, h.renaming.as_mut()) else {
         return;
     };
-    if click == CardClick::Remove {
-        out.push(Request::ForgetRecent(cards[i].0.clone()));
-        return;
+    let code = cards[i].0.clone();
+    match click {
+        CardClick::Remove => return out.push(Request::ForgetRecent(code)),
+        CardClick::Rename => {
+            h.renaming = Some((code, cards[i].1.clone().unwrap_or_default()));
+            return;
+        }
+        CardClick::SaveName => {
+            if let Some((code, label)) = h.renaming.take() {
+                out.push(Request::RenameRecent { code, label });
+            }
+            return;
+        }
+        CardClick::CancelName => {
+            h.renaming = None;
+            return;
+        }
+        CardClick::Connect => {}
     }
     {
         let r = h.profile.recent[i].clone();
@@ -882,7 +946,8 @@ fn card_grid(
     ui: &mut egui::Ui,
     cards: &[(String, Option<String>, Option<bool>)],
     enabled: bool,
-    removable: bool,
+    editable: bool,
+    mut renaming: Option<&mut (String, String)>,
 ) -> Option<(usize, CardClick)> {
     let per_row = ((ui.available_width() + 12.0) / (CARD_W + 12.0 + 26.0))
         .floor()
@@ -893,8 +958,12 @@ fn card_grid(
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
             for (i, (code, label, online)) in row.iter().enumerate() {
+                let edit = match renaming.as_deref_mut() {
+                    Some((c, text)) if c == code => Some(text),
+                    _ => None,
+                };
                 if let Some(c) =
-                    computer_card(ui, code, label.as_deref(), *online, enabled, removable)
+                    computer_card(ui, code, label.as_deref(), *online, enabled, editable, edit)
                 {
                     clicked = Some((r * per_row + i, c));
                 }

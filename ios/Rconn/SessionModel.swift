@@ -6,6 +6,9 @@ import UIKit
 final class SessionModel: ObservableObject, Identifiable, SessionListener, @unchecked Sendable {
     let id = UUID()
     let computerID: String
+    let server: String
+    /// Called on the main thread when the computer sends its name.
+    var onHostName: ((String) -> Void)?
     let renderer = VideoRenderer()
     @Published var status = "connecting…"
     @Published var closedReason: String?
@@ -15,6 +18,7 @@ final class SessionModel: ObservableObject, Identifiable, SessionListener, @unch
 
     init(server: String, fingerprint: String?, computerID: String, password: String) {
         self.computerID = computerID
+        self.server = server
         let s = connectGuest(
             serverUrl: server, fingerprintPin: fingerprint, computerId: computerID,
             password: password, listener: self)
@@ -48,6 +52,13 @@ final class SessionModel: ObservableObject, Identifiable, SessionListener, @unch
 
     func onClipboard(text: String) {
         DispatchQueue.main.async { UIPasteboard.general.string = text }
+    }
+
+    func onHostName(name: String) {
+        DispatchQueue.main.async {
+            Recents.learnName(server: self.server, computerID: self.computerID, name: name)
+            self.onHostName?(name)
+        }
     }
 
     func onClosed(reason: String) {

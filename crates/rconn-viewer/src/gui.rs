@@ -543,6 +543,15 @@ async fn session(
                     }
                     Some(DataChannelEvent::OnMessage(msg)) => match DataMessage::decode(&msg.data) {
                         Ok(DataMessage::Clipboard(text)) => clip.apply_remote(text),
+                        Ok(DataMessage::HostName(name)) => {
+                            // The Rconn app asks for the name to label its recent list.
+                            if let (Some(path), Some(name)) = (
+                                std::env::var_os("RCONN_NAME_FILE"),
+                                rconn_core::protocol::tidy_host_name(&name),
+                            ) {
+                                let _ = std::fs::write(path, name);
+                            }
+                        }
                         Ok(DataMessage::Control(Control::Cursor(shape))) => {
                             cursor.lock().expect("cursor").replace(shape);
                             repaint_cursor();

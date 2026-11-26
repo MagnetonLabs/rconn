@@ -60,6 +60,8 @@ pub trait SessionListener: Send + Sync {
     fn on_video(&self, frame: VideoFrame);
     /// Text the computer copied, for the app's pasteboard.
     fn on_clipboard(&self, text: String);
+    /// The computer's name, once the session is allowed (for the recent list).
+    fn on_host_name(&self, name: String);
     /// The session is over (refused, failed, ended or disconnected). Called exactly once.
     fn on_closed(&self, reason: String);
 }
@@ -106,6 +108,43 @@ fn init_logging() {
             .with_ansi(false)
             .try_init();
     });
+}
+
+/// Which of `computer_ids` ("482 915 306") are online at `server_url` (no account needed).
+/// Blocks for up to a few seconds: call it off the main thread. None when the server
+/// couldn't say (unreachable, or too old to know the question).
+#[uniffi::export]
+pub fn online_computers(
+    server_url: String,
+    fingerprint_pin: Option<String>,
+    computer_ids: Vec<String>,
+) -> Option<Vec<String>> {
+    init_logging();
+    let pin = fingerprint_pin.filter(|p| !p.trim().is_empty());
+    let trust = ServerTrust::from_fingerprint(pin.as_deref().map(str::trim));
+    let ids: Vec<String> = computer_ids
+        .iter()
+        .map(|c| c.chars().filter(char::is_ascii_digit).collect())
+        .collect();
+    let asked = tokio::time::timeout(
+        Duration::from_secs(8),
+        SignalingClient::presence(server_url.trim(), &trust, ids.clone()),
+    );
+    match runtime().block_on(asked) {
+        Ok(Ok(online)) => Some(
+            computer_ids
+                .into_iter()
+                .zip(ids)
+                .filter(|(_, digits)| online.contains(digits))
+                .map(|(typed, _)| typed)
+                .collect(),
+        ),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %format!("{e:#}"), "presence");
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// Connect to the computer `computer_id` ("482 915 306") through the signaling server at
@@ -285,6 +324,11 @@ async fn run(
                         Step::Refused(why) => break Err(anyhow!(why)),
                     },
                     Ok(DataMessage::Clipboard(text)) if accepted => listener.on_clipboard(text),
+                    Ok(DataMessage::HostName(name)) => {
+                        if let Some(name) = rconn_core::protocol::tidy_host_name(&name) {
+                            listener.on_host_name(name);
+                        }
+                    }
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "bad data message"),
                 },

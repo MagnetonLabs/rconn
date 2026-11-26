@@ -29,6 +29,9 @@ pub struct Recent {
     #[serde(default)]
     pub code: String,
     pub label: Option<String>,
+    /// The name was typed here (Rename): the computer's own name doesn't replace it.
+    #[serde(default)]
+    pub renamed: bool,
 }
 
 impl Recent {
@@ -89,6 +92,11 @@ impl Profile {
     /// Move `host` to the front of the recent list.
     pub fn remember(&mut self, host_id: HostId, label: Option<String>) {
         let code = host_id.short_code();
+        let own = self
+            .recent
+            .iter()
+            .find(|r| r.renamed && (r.host_id == Some(host_id) || r.code() == code))
+            .and_then(|r| r.label.clone());
         self.recent
             .retain(|r| r.host_id != Some(host_id) && r.code() != code);
         self.recent.insert(
@@ -96,7 +104,8 @@ impl Profile {
             Recent {
                 host_id: Some(host_id),
                 code,
-                label,
+                renamed: own.is_some(),
+                label: own.or(label),
             },
         );
         self.recent.truncate(MAX_RECENT);
@@ -106,18 +115,44 @@ impl Profile {
     pub fn remember_code(&mut self, typed: &str) {
         let code = tidy_code(typed);
         let old = self.recent.iter().position(|r| r.code() == code);
-        let (host_id, label) = old
+        let (host_id, label, renamed) = old
             .map(|i| self.recent.remove(i))
-            .map_or((None, None), |r| (r.host_id, r.label));
+            .map_or((None, None, false), |r| (r.host_id, r.label, r.renamed));
         self.recent.insert(
             0,
             Recent {
                 host_id,
                 code,
                 label,
+                renamed,
             },
         );
         self.recent.truncate(MAX_RECENT);
+    }
+
+    /// Name a recent computer here; empty goes back to the computer's own name.
+    pub fn rename(&mut self, code: &str, label: &str) {
+        let label = rconn_core::protocol::tidy_host_name(label);
+        for r in self.recent.iter_mut().filter(|r| r.code() == code) {
+            r.renamed = label.is_some();
+            if label.is_some() {
+                r.label = label.clone();
+            }
+        }
+    }
+
+    /// The computer told us its name: use it unless it was renamed here.
+    pub fn learn_name(&mut self, code: &str, name: &str) {
+        let Some(name) = rconn_core::protocol::tidy_host_name(name) else {
+            return;
+        };
+        for r in self
+            .recent
+            .iter_mut()
+            .filter(|r| r.code() == code && !r.renamed)
+        {
+            r.label = Some(name.clone());
+        }
     }
 
     pub fn fingerprint(&self) -> Option<&str> {

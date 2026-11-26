@@ -9,6 +9,10 @@ struct ConnectView: View {
     @State private var recents = Recents.load()
     @State private var session: SessionModel?
     @State private var lastError: String?
+    /// Recent computers the server says are online (by `RecentComputer.id`); nil: unknown.
+    @State private var online: Set<String>?
+    @State private var renaming: RecentComputer?
+    @State private var newName = ""
     @FocusState private var focus: Field?
 
     private enum Field { case server, fingerprint, id, password }
@@ -72,20 +76,67 @@ struct ConnectView: View {
                                 fingerprint = Keychain.fingerprint(for: r.server) ?? ""
                                 focus = .password
                             } label: {
-                                VStack(alignment: .leading) {
-                                    Text(r.computerID).font(.body.monospacedDigit())
-                                    Text(r.server).font(.caption).foregroundStyle(.secondary)
+                                HStack {
+                                    VStack(alignment: .leading) {
+                                        Text(r.name ?? "Unnamed computer")
+                                        Text(r.computerID).font(.callout.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if let online {
+                                        let up = online.contains(r.id)
+                                        Label(up ? "online" : "offline", systemImage: "circle.fill")
+                                            .font(.caption)
+                                            .foregroundStyle(up ? .green : .secondary)
+                                    }
                                 }
                             }
-                        }
-                        .onDelete { idx in
-                            idx.map { recents[$0] }.forEach(Recents.remove)
-                            recents = Recents.load()
+                            .swipeActions {
+                                Button("Remove", role: .destructive) {
+                                    Recents.remove(r)
+                                    recents = Recents.load()
+                                }
+                                Button("Rename") {
+                                    newName = r.name ?? ""
+                                    renaming = r
+                                }
+                                .tint(.blue)
+                            }
+                            .contextMenu {
+                                Button("Rename", systemImage: "pencil") {
+                                    newName = r.name ?? ""
+                                    renaming = r
+                                }
+                                Button("Remove", systemImage: "trash", role: .destructive) {
+                                    Recents.remove(r)
+                                    recents = Recents.load()
+                                }
+                            }
                         }
                     }
                 }
             }
             .navigationTitle("Rconn")
+            .alert("Rename", isPresented: Binding(
+                get: { renaming != nil }, set: { if !$0 { renaming = nil } }
+            )) {
+                TextField("Name", text: $newName)
+                Button("Save") {
+                    if let r = renaming { Recents.rename(r, to: newName) }
+                    recents = Recents.load()
+                    renaming = nil
+                }
+                Button("Cancel", role: .cancel) { renaming = nil }
+            } message: {
+                Text("Empty: the computer's own name.")
+            }
+            .task {
+                // Online or not, like the desktop app; every 15 s while this screen shows.
+                while !Task.isCancelled {
+                    await refreshOnline()
+                    try? await Task.sleep(for: .seconds(15))
+                }
+            }
             .onAppear {
                 fingerprint = Keychain.fingerprint(for: server) ?? ""
                 autoConnectForTesting()
@@ -102,6 +153,25 @@ struct ConnectView: View {
         }
     }
 
+    /// Ask each recent computer's server which of them are online (no account needed).
+    private func refreshOnline() async {
+        let list = recents
+        guard !list.isEmpty else { return }
+        var up = Set<String>()
+        var known = false
+        for (server, group) in Dictionary(grouping: list, by: \.server) {
+            let pin = Keychain.fingerprint(for: server)
+            let ids = group.map(\.computerID)
+            let answer = await Task.detached {
+                onlineComputers(serverUrl: server, fingerprintPin: pin, computerIds: ids)
+            }.value
+            guard let answer else { continue }
+            known = true
+            for r in group where answer.contains(r.computerID) { up.insert(r.id) }
+        }
+        online = known ? up : nil
+    }
+
     private func connect() {
         guard canConnect else { return }
         let url = server.trimmingCharacters(in: .whitespaces)
@@ -111,7 +181,9 @@ struct ConnectView: View {
         recents = Recents.load()
         lastError = nil
         focus = nil
-        session = SessionModel(server: url, fingerprint: pin.isEmpty ? nil : pin, computerID: computerID, password: password)
+        let model = SessionModel(server: url, fingerprint: pin.isEmpty ? nil : pin, computerID: computerID, password: password)
+        model.onHostName = { _ in recents = Recents.load() }
+        session = model
         password = ""
     }
 

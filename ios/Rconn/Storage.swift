@@ -42,6 +42,10 @@ struct RecentComputer: Codable, Hashable, Identifiable {
     var server: String
     var computerID: String
     var lastUsed: Date
+    /// The computer's own name (sent once a session is allowed), or one typed here.
+    var name: String? = nil
+    /// `name` was typed here (Rename): the computer's own name doesn't replace it.
+    var renamed: Bool? = nil
 }
 
 enum Recents {
@@ -56,13 +60,41 @@ enum Recents {
     }
 
     static func remember(server: String, computerID: String) {
-        var list = load().filter { !($0.server == server && $0.computerID == computerID) }
-        list.insert(RecentComputer(server: server, computerID: computerID, lastUsed: Date()), at: 0)
+        var list = load()
+        var entry = RecentComputer(server: server, computerID: computerID, lastUsed: Date())
+        if let old = list.first(where: { $0.id == entry.id }) {
+            entry.name = old.name
+            entry.renamed = old.renamed
+        }
+        list.removeAll { $0.id == entry.id }
+        list.insert(entry, at: 0)
         save(Array(list.prefix(limit)))
     }
 
     static func remove(_ c: RecentComputer) {
-        save(load().filter { $0 != c })
+        save(load().filter { $0.id != c.id })
+    }
+
+    /// Name a computer here; empty goes back to the computer's own name (next session).
+    static func rename(_ c: RecentComputer, to name: String) {
+        let name = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
+        save(load().map { r in
+            guard r.id == c.id else { return r }
+            var r = r
+            r.renamed = !name.isEmpty
+            if !name.isEmpty { r.name = name }
+            return r
+        })
+    }
+
+    /// The computer told us its name: use it unless it was renamed here.
+    static func learnName(server: String, computerID: String, name: String) {
+        save(load().map { r in
+            guard r.server == server, r.computerID == computerID, r.renamed != true else { return r }
+            var r = r
+            r.name = name
+            return r
+        })
     }
 
     private static func save(_ list: [RecentComputer]) {

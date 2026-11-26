@@ -292,6 +292,23 @@ pub enum DataMessage {
     Control(Control),
     /// Access-password check (see [`crate::guest`]), before a guest session starts.
     Guest(GuestMessage),
+    /// Host -> viewer, once the session is allowed: the computer's name, so a computer
+    /// reached by its ID shows a name in the viewer's recent list. See [`tidy_host_name`].
+    HostName(String),
+}
+
+/// Longest computer name kept from [`DataMessage::HostName`].
+pub const MAX_HOST_NAME_CHARS: usize = 64;
+
+/// A computer name fit to show: no control characters, trimmed, at most
+/// [`MAX_HOST_NAME_CHARS`]; None when nothing is left.
+pub fn tidy_host_name(name: &str) -> Option<String> {
+    let clean: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_HOST_NAME_CHARS)
+        .collect();
+    Some(clean.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
 /// The access-password exchange on the data channel. The host speaks first.
@@ -490,6 +507,9 @@ impl DataMessage {
             Self::Clipboard(text) if text.len() > MAX_CLIPBOARD_BYTES => {
                 Err(CodecError::ClipboardTooLarge(text.len()))
             }
+            Self::HostName(name) if name.len() > MAX_HOST_NAME_CHARS * 4 => {
+                Err(CodecError::ClipboardTooLarge(name.len()))
+            }
             _ => Ok(()),
         }
     }
@@ -498,6 +518,19 @@ impl DataMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_names_are_tidied_and_round_trip() {
+        assert_eq!(tidy_host_name("  Office-PC\n"), Some("Office-PC".into()));
+        assert_eq!(tidy_host_name("\u{1b}[31m"), Some("[31m".into()));
+        assert_eq!(tidy_host_name(" \t "), None);
+        assert_eq!(
+            tidy_host_name(&"x".repeat(200)).map(|s| s.chars().count()),
+            Some(MAX_HOST_NAME_CHARS)
+        );
+        let m = DataMessage::HostName("Office-PC".into());
+        assert_eq!(DataMessage::decode(&m.encode().unwrap()).unwrap(), m);
+    }
 
     #[test]
     fn signaling_round_trips_as_tagged_json() {
