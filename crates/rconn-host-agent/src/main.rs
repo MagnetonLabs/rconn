@@ -600,6 +600,13 @@ async fn serve_channel(
                     Ok(DataMessage::Control(Control::RestoreResolution)) => {
                         resize.send_replace(Some(display::Want::Restore));
                     }
+                    Ok(DataMessage::Control(Control::CopyRects { version })) => {
+                        if version == rconn_media::copyrect::VERSION && rconn_media::copyrect::host_enabled() {
+                            keyframes.enable_copy_rects();
+                        } else {
+                            tracing::debug!(version, "copy instructions not used");
+                        }
+                    }
                     Ok(DataMessage::Input(ev)) => {
                         stream::note_input(); // someone is interacting: full frame rate
                         input.get_or_insert_with(input::InputSink::start).send(ev)

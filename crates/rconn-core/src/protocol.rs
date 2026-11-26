@@ -454,6 +454,13 @@ pub enum Control {
     /// the resolution to its window). Appended: hosts that predate it reject it as an
     /// unknown message, log it and carry on.
     RestoreResolution,
+    /// Viewer -> host: this viewer builds its picture from copy instructions carried in
+    /// the video (scrolls and window moves sent as "copy this rectangle"; `version` of
+    /// `rconn_media::copyrect`). Appended: older hosts log it as unknown and keep sending
+    /// plain video, which such a viewer still shows.
+    CopyRects {
+        version: u16,
+    },
     /// Viewer -> host: the newest video frame (by the id the host tags each frame with)
     /// decoded with every frame before it intact; with `lost`, the frames after it are
     /// missing or broken and the host should repair them (from a long-term reference, or
@@ -748,11 +755,18 @@ mod tests {
             DataMessage::decode(&restore).unwrap(),
             DataMessage::Control(Control::RestoreResolution)
         );
+        let copy = enc(Control::CopyRects { version: 1 });
+        assert_eq!(
+            restore[1] + 1,
+            copy[1],
+            "CopyRects follows RestoreResolution"
+        );
+        assert_eq!(&copy[2..], [1]);
         let ack = enc(Control::FrameAck {
             decoded: 300,
             lost: true,
         });
-        assert_eq!(restore[1] + 1, ack[1], "FrameAck appended after it");
+        assert_eq!(copy[1] + 1, ack[1], "FrameAck appended after CopyRects");
         assert_eq!(&ack[2..], [0xac, 0x02, 1], "varint id, then the flag");
     }
 
