@@ -1,0 +1,8 @@
+# Windows: link the C runtime into the executables, so they start on machines without the
+# Visual C++ Redistributable (fresh Windows Server, some fresh Windows installs). 4099: the
+# static runtime's debug symbols aren't shipped.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/IGNORE:4099"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/IGNORE:4099"]
