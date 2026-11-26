@@ -1,5 +1,6 @@
-//! openh264 options the `openh264` crate does not wrap: live rate changes and long-term
-//! reference (LTR) feedback. Each is one `SetOption` call on an initialized encoder.
+//! openh264 options the `openh264` crate does not wrap: live rate changes, long-term
+//! reference (LTR) feedback, several slices. Each is a `SetOption` call on an
+//! initialized encoder.
 //!
 //! Unsafe is confined to this module: `SetOption` with a pointer to a correctly typed,
 //! live local, on an encoder that has encoded at least one frame (initialized).
@@ -8,8 +9,9 @@
 use openh264::encoder::Encoder;
 use openh264_sys2::{
     ENCODER_LTR_MARKING_FEEDBACK, ENCODER_LTR_RECOVERY_REQUEST, ENCODER_OPTION_BITRATE,
-    ENCODER_OPTION_MAX_BITRATE, LTR_MARKING_SUCCESS, LTR_RECOVERY_REQUEST, SBitrateInfo,
-    SLTRMarkingFeedback, SLTRRecoverRequest, SPATIAL_LAYER_0, SPATIAL_LAYER_ALL,
+    ENCODER_OPTION_MAX_BITRATE, ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, LTR_MARKING_SUCCESS,
+    LTR_RECOVERY_REQUEST, SBitrateInfo, SEncParamExt, SLTRMarkingFeedback, SLTRRecoverRequest,
+    SM_FIXEDSLCNUM_SLICE, SPATIAL_LAYER_0, SPATIAL_LAYER_ALL,
 };
 use std::os::raw::c_int;
 
@@ -74,5 +76,31 @@ pub fn ltr_recover(enc: &mut Encoder, idr_pic_id: u32, last_correct: u32, curren
     unsafe {
         enc.raw_api()
             .set_option(ENCODER_LTR_RECOVERY_REQUEST, (&raw mut req).cast());
+    }
+}
+
+/// Cut every picture into `n` slices (horizontal bands) encoded on up to `n` threads. The
+/// `openh264` crate only offers one slice, which keeps openh264 on one core whatever its
+/// thread setting. Re-initializes the encoder: the next picture is an IDR.
+pub fn set_slices(enc: &mut Encoder, n: u32) -> bool {
+    // SAFETY: `SEncParamExt` is plain data (numbers, flags, fixed arrays), so all zeroes
+    // is a valid value; GetOption fills it from the encoder's own parameters (a type that
+    // starts with an `SEncParamExt`), and SetOption reads it back. It outlives both calls.
+    unsafe {
+        let mut p: SEncParamExt = std::mem::zeroed();
+        if enc
+            .raw_api()
+            .get_option(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, (&raw mut p).cast())
+            != 0
+        {
+            return false;
+        }
+        p.iMultipleThreadIdc = n.min(u32::from(u16::MAX)) as u16;
+        let slices = &mut p.sSpatialLayers[0].sSliceArgument;
+        slices.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
+        slices.uiSliceNum = n;
+        enc.raw_api()
+            .set_option(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, (&raw mut p).cast())
+            == 0
     }
 }

@@ -1,35 +1,31 @@
 //! `--selftest-encode N`: the software encode path without a capturer, on any OS.
 //!
-//! Synthetic 1920x1080 desktops go through what `stream.rs` does with a captured picture:
-//! the changed areas are converted from BGRA to I420 (as the capturers do), then the
-//! picture is encoded. Four scenarios, N frames each:
+//! Synthetic desktops (1920x1080 unless `RCONN_BENCH_SIZE`, e.g. `2992x1878`) go through
+//! what `stream.rs` does with a captured picture: the changed areas are converted from
+//! BGRA to I420 (as the capturers do), scaled to the viewer's size where the host would
+//! (`RCONN_BENCH_VIEW`, default 1280x720), then encoded. Four scenarios, N frames each:
 //! * idle: a blinking caret (one 2x18 area per frame);
 //! * typing: one character and the caret per frame;
 //! * scrolling: the whole screen moves up 7 px per frame;
-//! * video: a 1280x720 player in the middle plays noisy footage.
+//! * video: a player of two thirds the screen's size plays noisy footage.
 //!
-//! Per engine and scenario it prints the time per stage, the frame rate the host could
-//! keep if it did nothing else, the CPU used (100 % = one core) and the bytes per frame.
+//! Frames are offered at the stream's rate (30 fps, `RCONN_BENCH_FPS`), as while someone
+//! interacts. Per engine and scenario it prints the time per stage, the pictures per
+//! second put out (and the most it could if it did nothing else), the CPU used
+//! (100 % = one core), bytes per picture and frames the rate controller skipped.
 //! Run it on the machine in question: `rconn-host-agent --selftest-encode 120`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rconn_media::video::{EncoderSettings, VideoEncoder};
-use rconn_media::yuv::{I420, Rect};
+use rconn_media::yuv::{I420, Rect, Scaler};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const W: usize = 1920;
-const H: usize = 1080;
 /// Pixels the page moves per scrolled frame.
 const SCROLL_STEP: usize = 7;
-/// The video player's area.
-const VIDEO: Rect = Rect {
-    x: 320,
-    y: 180,
-    w: 1280,
-    h: 720,
-};
+/// Height of the title bar, which doesn't scroll.
+const TITLE: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scenario {
@@ -57,21 +53,10 @@ impl Scenario {
     }
 }
 
-/// A text page taller than the screen (scrolling shows more of it), BGRA.
-fn page(rows: usize) -> Vec<u8> {
-    let mut bgra = vec![0u8; W * rows * 4];
-    for (y, row) in bgra.as_chunks_mut::<{ W * 4 }>().0.iter_mut().enumerate() {
-        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            *px = page_pixel(x, y);
-        }
-    }
-    bgra
-}
-
 /// One pixel of the page: a title bar, a sidebar, and lines of glyph-like strokes.
 fn page_pixel(x: usize, y: usize) -> [u8; 4] {
-    if y < 40 {
-        return [60, 50, 45, 255]; // title bar (fixed: `page` rows below it scroll)
+    if y < TITLE {
+        return [60, 50, 45, 255];
     }
     if x < 240 {
         let c = if (y / 32).is_multiple_of(2) { 238 } else { 230 };
@@ -87,31 +72,52 @@ fn page_pixel(x: usize, y: usize) -> [u8; 4] {
 /// Produces the scenario's frames: the current BGRA desktop and what changed.
 struct Desktop {
     scenario: Scenario,
+    w: usize,
+    h: usize,
+    /// A text page taller than the screen (scrolling shows more of it), BGRA.
     page: Vec<u8>,
     screen: Vec<u8>,
     seed: u32,
 }
 
 impl Desktop {
-    fn new(scenario: Scenario, frames: usize) -> Self {
-        let rows = H + if scenario == Scenario::Scrolling {
+    fn new(scenario: Scenario, (w, h): (usize, usize), frames: usize) -> Self {
+        let rows = h + if scenario == Scenario::Scrolling {
             frames * SCROLL_STEP
         } else {
             0
         };
-        let page = page(rows);
-        let screen = page[..W * H * 4].to_vec();
+        let mut page = vec![0u8; w * rows * 4];
+        for (y, row) in page.chunks_exact_mut(w * 4).enumerate() {
+            for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                *px = page_pixel(x, y);
+            }
+        }
+        let screen = page[..w * h * 4].to_vec();
         Self {
             scenario,
+            w,
+            h,
             page,
             screen,
             seed: 0x1234_5678,
         }
     }
 
+    fn video_area(&self) -> Rect {
+        let (vw, vh) = ((self.w * 2 / 3) & !1, (self.h * 2 / 3) & !1);
+        Rect {
+            x: ((self.w - vw) / 2) & !1,
+            y: ((self.h - vh) / 2) & !1,
+            w: vw,
+            h: vh,
+        }
+    }
+
     fn fill(&mut self, r: Rect, mut px: impl FnMut(usize, usize) -> [u8; 4]) {
+        let w = self.w;
         for y in r.y..r.y + r.h {
-            let row = &mut self.screen[(y * W + r.x) * 4..(y * W + r.x + r.w) * 4];
+            let row = &mut self.screen[(y * w + r.x) * 4..(y * w + r.x + r.w) * 4];
             for (i, p) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 *p = px(r.x + i, y);
             }
@@ -151,20 +157,21 @@ impl Desktop {
             }
             Scenario::Scrolling => {
                 // Below the title bar the page moves up.
+                let (w, h) = (self.w, self.h);
                 let off = k * SCROLL_STEP;
-                let top = 40;
-                let src = &self.page[(top + off) * W * 4..(H + off) * W * 4];
-                self.screen[top * W * 4..].copy_from_slice(src);
+                let src = &self.page[(TITLE + off) * w * 4..(h + off) * w * 4];
+                self.screen[TITLE * w * 4..].copy_from_slice(src);
                 vec![Rect {
                     x: 0,
-                    y: top,
-                    w: W,
-                    h: H - top,
+                    y: TITLE,
+                    w,
+                    h: h - TITLE,
                 }]
             }
             Scenario::Video => {
+                let area = self.video_area();
                 let mut seed = self.seed;
-                self.fill(VIDEO, |x, y| {
+                self.fill(area, |x, y| {
                     seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                     let noise = (seed >> 24) as usize % 24;
                     [
@@ -175,7 +182,7 @@ impl Desktop {
                     ]
                 });
                 self.seed = seed;
-                vec![VIDEO]
+                vec![area]
             }
         }
     }
@@ -193,17 +200,19 @@ pub struct Measured {
     pub frames: usize,
     pub coded: usize,
     pub convert: Duration,
+    pub scale: Duration,
     pub encode: Duration,
-    /// From the first counted frame to the last, paced at the stream's frame rate.
+    /// From the first counted frame to the last, paced at the offered frame rate.
     pub wall: Duration,
     pub cpu_secs: f64,
     pub bytes: usize,
+    /// Keyframes among the pictures (unasked: the encoder decided).
+    pub keys: usize,
 }
 
 impl Measured {
-    /// Conversion per frame handed over (ms).
-    pub fn convert_ms(&self) -> f64 {
-        self.convert.as_secs_f64() * 1e3 / self.frames.max(1) as f64
+    fn per_frame(&self, d: Duration) -> f64 {
+        d.as_secs_f64() * 1e3 / self.frames.max(1) as f64
     }
 
     /// Encoder time per picture put out (ms), skipped frames' time included.
@@ -211,9 +220,12 @@ impl Measured {
         self.encode.as_secs_f64() * 1e3 / self.coded.max(1) as f64
     }
 
-    /// Pictures per second if the host did nothing but convert and encode.
+    /// Pictures per second if the host did nothing but convert, scale and encode.
     pub fn max_fps(&self) -> f64 {
-        self.coded as f64 / (self.convert + self.encode).as_secs_f64().max(1e-9)
+        self.coded as f64
+            / (self.convert + self.scale + self.encode)
+                .as_secs_f64()
+                .max(1e-9)
     }
 
     /// Pictures per second put out while offered frames at the stream's rate.
@@ -250,6 +262,17 @@ fn knob(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// `WxH` from the environment, or `default`.
+fn size_knob(name: &str, default: (usize, usize)) -> Result<(usize, usize)> {
+    let Ok(v) = std::env::var(name) else {
+        return Ok(default);
+    };
+    let (w, h) = v
+        .split_once('x')
+        .with_context(|| format!("{name} must look like 1920x1080"))?;
+    Ok((w.parse::<usize>()? & !1, h.parse::<usize>()? & !1))
+}
+
 /// The host's settings for a 30 fps stream at a typical bandwidth estimate
 /// (`RCONN_BENCH_KBPS`, default 8000).
 pub fn settings() -> EncoderSettings {
@@ -271,43 +294,54 @@ fn offer_fps() -> f32 {
 pub fn engines(openh264: &Path) -> Vec<Engine> {
     let lib = openh264.to_owned();
     let mut out = vec![Engine {
-        name: "openh264 (screen mode)".into(),
+        name: "openh264".into(),
         make: Box::new(move || Ok(VideoEncoder::software(&lib, settings())?)),
     }];
-    let lib = openh264.to_owned();
-    out.push(Engine {
-        name: "openh264 (camera mode, RCONN_OPENH264_LTR=1)".into(),
-        make: Box::new(move || {
-            let mut e = VideoEncoder::software(&lib, settings())?;
-            e.set_long_term_refs(true);
-            Ok(e)
-        }),
-    });
     if cfg!(any(windows, target_os = "macos")) {
+        // What the host picks here (a GPU's encoder where there is one).
         let lib = openh264.to_owned();
         out.push(Engine {
-            name: if cfg!(windows) {
-                "Media Foundation (as the host picks it)".into()
-            } else {
-                "VideoToolbox (hardware; for reference)".into()
-            },
+            name: "as the host picks it".into(),
             make: Box::new(move || Ok(VideoEncoder::new(&lib, settings())?)),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let lib = openh264.to_owned();
+        out.push(Engine {
+            name: "Media Foundation".into(),
+            make: Box::new(move || {
+                let mut e = VideoEncoder::new(&lib, settings())?;
+                e.set_microsoft_software(true);
+                Ok(e)
+            }),
         });
     }
     out
 }
 
-/// Frames before counting starts: the first keyframe and the rate controller settling.
-const WARMUP: usize = 15;
-
-/// Run `frames` frames of `scenario` through `enc`, offered at the stream's frame rate
-/// (as fast as possible when the encoder can't keep up), as `stream.rs` does while
-/// someone interacts.
-pub fn measure(enc: &mut VideoEncoder, scenario: Scenario, frames: usize) -> Result<Measured> {
-    let mut desk = Desktop::new(scenario, frames + WARMUP + 1);
-    let mut pic = I420::new(W, H);
-    pic.fill_from_bgra(&desk.screen, W);
-    enc.encode_yuv(&pic, None)?;
+/// Run `frames` frames of `scenario` on a `size` screen through `enc`, scaled to `to`
+/// first if given.
+pub fn measure(
+    enc: &mut VideoEncoder,
+    scenario: Scenario,
+    size: (usize, usize),
+    to: Option<(usize, usize)>,
+    frames: usize,
+) -> Result<Measured> {
+    /// Frames before counting starts: the first keyframe and the rate controller settling.
+    const WARMUP: usize = 15;
+    let (w, h) = size;
+    let mut desk = Desktop::new(scenario, size, frames + WARMUP + 1);
+    let mut pic = I420::new(w, h);
+    pic.fill_from_bgra(&desk.screen, w);
+    let scaler = to.map(|to| Scaler::new(size, to));
+    enc.set_scaled_input(to.is_some());
+    let mut small = None;
+    if let Some(s) = &scaler {
+        s.scale(&pic, &mut small, None);
+    }
+    enc.encode_yuv(small.as_ref().unwrap_or(&pic), None)?;
     let interval = Duration::from_secs(1).div_f32(offer_fps());
     let mut m = Measured::default();
     let mut next = Instant::now();
@@ -325,21 +359,31 @@ pub fn measure(enc: &mut VideoEncoder, scenario: Scenario, frames: usize) -> Res
             m = Measured::default();
             started = Some((Instant::now(), process_cpu()));
         }
-        let rows = rects.iter().fold(pending.unwrap_or((H, 0)), |(a, b), r| {
+        let rows = rects.iter().fold(pending.unwrap_or((h, 0)), |(a, b), r| {
             (a.min(r.y), b.max(r.y + r.h))
         });
-        let rows = (rows.0 & !1, rows.1.next_multiple_of(2).min(H));
+        let rows = (rows.0 & !1, rows.1.next_multiple_of(2).min(h));
         let t0 = Instant::now();
-        pic.fill_rects_from_bgra(&desk.screen, W * 4, &rects);
+        pic.fill_rects_from_bgra(&desk.screen, w * 4, &rects);
         let t1 = Instant::now();
-        let out = enc.encode_yuv(&pic, Some(rows))?;
+        let (input, input_rows) = match &scaler {
+            Some(s) => {
+                let r = s.scale(&pic, &mut small, Some(rows));
+                (small.as_ref().expect("allocated"), r)
+            }
+            None => (&pic, rows),
+        };
+        let t2 = Instant::now();
+        let out = enc.encode_yuv(input, Some(input_rows))?;
         m.convert += t1 - t0;
-        m.encode += t1.elapsed();
+        m.scale += t2 - t1;
+        m.encode += t2.elapsed();
         m.frames += 1;
         match out {
             Some(au) => {
                 m.bytes += au.len();
                 m.coded += 1;
+                m.keys += usize::from(enc.last_frame().key);
                 pending = None;
             }
             None => pending = Some(rows),
@@ -355,46 +399,72 @@ pub fn measure(enc: &mut VideoEncoder, scenario: Scenario, frames: usize) -> Res
 /// The whole report, as printed by `--selftest-encode`.
 pub fn run(frames: usize, openh264: &Path) -> Result<String> {
     let frames = frames.max(10);
+    let size = size_knob("RCONN_BENCH_SIZE", (1920, 1080))?;
+    let view = size_knob("RCONN_BENCH_VIEW", (1280, 720))?;
+    let to = crate::stream::view_target(size, Some(view));
     let mut out = String::new();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     writeln!(
         out,
-        "{W}x{H}, {frames} frames per scenario offered at {} fps, {cores} logical CPUs, {} kbps, encoder max {} fps",
+        "screen {}x{}, viewer {}x{} (encoded at {}), {frames} frames per scenario offered at {} fps, {cores} logical CPUs, {} kbps",
+        size.0,
+        size.1,
+        view.0,
+        view.1,
+        to.map_or("full size".into(), |(w, h)| format!("{w}x{h}")),
         offer_fps(),
         settings().bitrate_bps / 1000,
-        settings().max_fps
     )?;
     writeln!(
         out,
-        "{:<46} {:<10} {:>8} {:>8} {:>8} {:>7} {:>6} {:>8} {:>5}",
-        "engine", "scenario", "conv ms", "enc ms", "max fps", "fps", "CPU%", "KB/pic", "skip"
+        "{:<44} {:<10} {:>7} {:>7} {:>7} {:>8} {:>6} {:>6} {:>8} {:>5} {:>4}",
+        "engine",
+        "scenario",
+        "conv ms",
+        "scale",
+        "enc ms",
+        "max fps",
+        "fps",
+        "CPU%",
+        "KB/pic",
+        "skip",
+        "keys"
     )?;
     for engine in engines(openh264) {
-        let mut name = engine.name.clone();
-        for scenario in Scenario::ALL {
-            let mut enc = match (engine.make)() {
-                Ok(e) => e,
-                Err(e) => {
-                    writeln!(out, "{name:<46} unavailable: {e:#}")?;
-                    break;
+        // The full screen, then (if the viewer is smaller) at the viewer's size.
+        for scaled in std::iter::once(None).chain(to.map(Some)) {
+            let mut name = engine.name.clone();
+            for scenario in Scenario::ALL {
+                let mut enc = match (engine.make)() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        writeln!(out, "{name:<44} unavailable: {e:#}")?;
+                        break;
+                    }
+                };
+                let m = measure(&mut enc, scenario, size, scaled, frames)?;
+                if !enc.engine_name().is_empty() {
+                    name = enc.engine_name().to_owned(); // which encoder it found
                 }
-            };
-            let m = measure(&mut enc, scenario, frames)?;
-            if name.starts_with("Media Foundation") {
-                name = enc.engine_name().to_owned(); // which MFT it found
+                let label = match scaled {
+                    Some((w, h)) => format!("{name} @{w}x{h}"),
+                    None => name.clone(),
+                };
+                writeln!(
+                    out,
+                    "{label:<44} {:<10} {:>7.2} {:>7.2} {:>7.2} {:>8.1} {:>6.1} {:>6.0} {:>8.1} {:>5} {:>4}",
+                    scenario.name(),
+                    m.per_frame(m.convert),
+                    m.per_frame(m.scale),
+                    m.encode_ms(),
+                    m.max_fps(),
+                    m.fps(),
+                    m.cpu_pct(),
+                    m.kb_per_picture(),
+                    m.skipped(),
+                    m.keys
+                )?;
             }
-            writeln!(
-                out,
-                "{name:<46} {:<10} {:>8.2} {:>8.2} {:>8.1} {:>7.1} {:>6.0} {:>8.1} {:>5}",
-                scenario.name(),
-                m.convert_ms(),
-                m.encode_ms(),
-                m.max_fps(),
-                m.fps(),
-                m.cpu_pct(),
-                m.kb_per_picture(),
-                m.skipped()
-            )?;
         }
     }
     Ok(out)
@@ -406,8 +476,9 @@ mod tests {
 
     #[test]
     fn scenarios_change_what_they_report() {
+        let (w, h) = (1280, 720);
         for s in Scenario::ALL {
-            let mut d = Desktop::new(s, 4);
+            let mut d = Desktop::new(s, (w, h), 4);
             let before = d.screen.clone();
             let rects = d.step(1);
             // Every changed pixel lies inside a reported area.
@@ -419,11 +490,11 @@ mod tests {
                 .enumerate()
             {
                 if a != b {
-                    let (x, y) = (i % W, i / W);
+                    let (x, y) = (i % w, i / w);
                     assert!(
-                        rects
-                            .iter()
-                            .any(|r| (r.x..r.x + r.w).contains(&x) && (r.y..r.y + r.h).contains(&y)),
+                        rects.iter().any(
+                            |r| (r.x..r.x + r.w).contains(&x) && (r.y..r.y + r.h).contains(&y)
+                        ),
                         "{s:?}: change at {x},{y} not reported"
                     );
                 }
@@ -432,11 +503,72 @@ mod tests {
         }
     }
 
+    /// Luma PSNR (dB) of `decoded` against `want`.
+    fn psnr(want: &I420, decoded: &rconn_media::video::DecodedFrame) -> f64 {
+        let mse = want
+            .luma()
+            .iter()
+            .zip(decoded.y())
+            .map(|(&a, &b)| f64::from(a.abs_diff(b)).powi(2))
+            .sum::<f64>()
+            / want.luma().len() as f64;
+        10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+    }
+
+    /// Text scrolled at the viewer's size, then still: how sharp it is after the last
+    /// scrolled picture, and after each re-encode of the still picture ("top-off").
+    /// `cargo test --release -p rconn-host-agent sharpness_after_scrolling -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn sharpness_after_scrolling() {
+        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let (size, to) = ((1920, 1080), (1280, 720));
+        let mut enc = VideoEncoder::software(&lib, settings()).unwrap();
+        enc.set_scaled_input(true);
+        let mut dec = rconn_media::video::VideoDecoder::software(&lib).unwrap();
+        let mut desk = Desktop::new(Scenario::Scrolling, size, 61);
+        let mut pic = I420::new(size.0, size.1);
+        pic.fill_from_bgra(&desk.screen, size.0);
+        let scaler = Scaler::new(size, to);
+        let mut small = None;
+        let interval = Duration::from_secs(1) / 30;
+        let mut last = None;
+        let mut send = |enc: &mut VideoEncoder, small: &I420, dec: &mut _| {
+            std::thread::sleep(interval);
+            if let Some(au) = enc.encode_yuv(small, None).unwrap()
+                && let Some(f) = rconn_media::video::VideoDecoder::decode(dec, &au).unwrap()
+            {
+                last = Some(f);
+            }
+            last.as_ref().map(|f| psnr(small, f))
+        };
+        for k in 0..=60 {
+            if k > 0 {
+                let rects = desk.step(k);
+                pic.fill_rects_from_bgra(&desk.screen, size.0 * 4, &rects);
+            }
+            scaler.scale(&pic, &mut small, None);
+            send(&mut enc, small.as_ref().unwrap(), &mut dec);
+        }
+        let mut line = format!(
+            "after scrolling {:.1} dB",
+            send(&mut enc, small.as_ref().unwrap(), &mut dec).unwrap_or(0.0)
+        );
+        for k in 1..=6 {
+            let p = send(&mut enc, small.as_ref().unwrap(), &mut dec).unwrap_or(0.0);
+            line += &format!(", top-off {k}: {p:.1}");
+        }
+        println!("{line}");
+    }
+
     /// `cargo test --release -p rconn-host-agent encode_bench -- --ignored --nocapture`
+    /// (`FRAMES=n`, and the `RCONN_BENCH_*` settings above).
     #[test]
     #[ignore = "timing, run by hand"]
     fn report() {
-        let Some(lib) = rconn_media::cisco::local_binary_path() else {
+        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
             return;
         };
         let frames = std::env::var("FRAMES")

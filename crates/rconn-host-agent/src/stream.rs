@@ -221,20 +221,116 @@ impl ViewScale {
     }
 }
 
+/// Scaled pictures may be coarse while they move (openh264 allows a higher quantizer for
+/// them): once the screen is still, the same picture is encoded this many times more, each
+/// sharper (720p text after a scroll: 25.5 dB, then 31 dB after 6;
+/// `encode_bench::sharpness_after_scrolling`).
+const TOPOFF_FRAMES: u32 = 6;
+
 /// With [`ViewScale::Refine`], a still screen gets one full-size picture after this long.
 const REFINE_AFTER: Duration = Duration::from_secs(2);
 /// Scaling to less than this share of the screen's width is worth a size switch (each
 /// costs a keyframe); closer to full size, the full picture is sent.
 const VIEW_SCALE_BELOW: f32 = 0.9;
-/// Encoding taking this share of the frame interval (averaged) counts as CPU-bound: even
-/// a hardware encoder then gets pictures at the viewer's size.
+/// Encoding taking this share of the frame interval (averaged) counts as CPU-bound: the
+/// encoder then gets fewer pixels ([`CpuCap`]).
 const CPU_BOUND: f64 = 0.7;
+/// [`CpuCap`] aims at this share of the frame interval when it lowers the size...
+const CPU_AIM: f64 = 0.5;
+/// ...and raises it again when encoding takes less than this share for a while.
+const CPU_IDLE: f64 = 0.25;
+/// [`CpuCap`] never goes below this many pixels (640x360).
+const MIN_CAP_PIXELS: usize = 640 * 360;
+
+/// Keeps an encoder that can't keep up within the frame interval by capping the pixels
+/// it gets, whatever size the viewer shows the picture at: openh264 on a 4-vCPU VM took
+/// 85-143 ms a picture at 2992x1878 (4-5 fps), 11-16 ms at 1152x722 (23-30 fps).
+#[derive(Debug, Default)]
+struct CpuCap {
+    max_pixels: Option<usize>,
+    /// Encoder time per picture (ms, moving average) at `size`, over `samples` pictures.
+    avg_ms: f64,
+    size: (usize, usize),
+    samples: u32,
+}
+
+impl CpuCap {
+    /// A picture of `size` took `ms` to encode; frames are due every `budget_ms`.
+    fn note(&mut self, size: (usize, usize), ms: f64, budget_ms: f64, screen_pixels: usize) {
+        if size != self.size {
+            *self = Self {
+                max_pixels: self.max_pixels,
+                size,
+                ..Self::default()
+            };
+        }
+        self.avg_ms = if self.samples == 0 {
+            ms
+        } else {
+            self.avg_ms * 0.9 + ms * 0.1
+        };
+        self.samples += 1;
+        let pixels = size.0 * size.1;
+        if self.samples >= 10 && self.avg_ms > budget_ms * CPU_BOUND {
+            let fit = (pixels as f64 * budget_ms * CPU_AIM / self.avg_ms) as usize;
+            let max = fit
+                .min(self.max_pixels.unwrap_or(usize::MAX))
+                .max(MIN_CAP_PIXELS);
+            if self.max_pixels != Some(max) {
+                tracing::info!(
+                    encode_ms = format!("{:.1}", self.avg_ms),
+                    at = format!("{}x{}", size.0, size.1),
+                    max_pixels = max,
+                    "encoder can't keep up; sending fewer pixels"
+                );
+            }
+            self.max_pixels = Some(max);
+            self.samples = 0; // measure the new size
+        } else if self.samples >= 60
+            && self.avg_ms < budget_ms * CPU_IDLE
+            && let Some(max) = self.max_pixels
+        {
+            let up = max * 3 / 2;
+            self.max_pixels = (up < screen_pixels).then_some(up);
+            self.samples = 0;
+        }
+    }
+
+    fn capped(&self) -> bool {
+        self.max_pixels.is_some()
+    }
+
+    /// `target` (the size to encode a `w` x `h` screen at; `None`: full), made smaller
+    /// if it has more pixels than the cap.
+    fn apply(
+        &self,
+        (w, h): (usize, usize),
+        target: Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        let Some(max) = self.max_pixels else {
+            return target;
+        };
+        let (tw, th) = target.unwrap_or((w, h));
+        if tw * th <= max {
+            return target;
+        }
+        let s = (max as f64 / (w * h) as f64).sqrt();
+        view_target(
+            (w, h),
+            Some(((w as f64 * s) as usize, (h as f64 * s) as usize)),
+        )
+        .or(target)
+    }
+}
 
 /// The size to encode a `w` x `h` screen at for a viewer showing it `view` large, or
 /// `None` for the full size. Same shape as the screen; width a multiple of 16 (a size
 /// that changes by a few pixels would cost a keyframe for nothing), height even; at most
 /// a quarter of the screen's width.
-fn view_target((w, h): (usize, usize), view: Option<(usize, usize)>) -> Option<(usize, usize)> {
+pub(crate) fn view_target(
+    (w, h): (usize, usize),
+    view: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
     let (vw, vh) = view?;
     if w < 64 || h < 64 {
         return None;
@@ -378,8 +474,9 @@ fn run_generation(
     // The last picture out was scaled; the full-size one after it (`Refine`) is sent.
     let mut sent_scaled = false;
     let mut refined = false;
-    // Encoder time per picture (ms, moving average).
-    let mut encode_avg_ms = 0.0f64;
+    // Top-off pictures still due for the last scaled picture with a change in it.
+    let mut topoff_left = 0u32;
+    let mut cpu_cap = CpuCap::default();
     // Copy instructions (scrolls and moves as copies), once the viewer asks for them.
     // Pictures only: GPU surfaces go to the encoder untouched.
     let mut composer: Option<Composer> = None;
@@ -521,11 +618,11 @@ fn run_generation(
             }
         }
         // A CPU encoder (or one that can't keep up) gets the picture at the size the
-        // viewer shows it; GPU surfaces go to a hardware encoder as they are.
-        let cpu_bound = encode_avg_ms > budget.as_secs_f64() * 1e3 * CPU_BOUND;
+        // viewer shows it, and no more pixels than it can encode in time; GPU surfaces go
+        // to a hardware encoder as they are.
         let mut target =
-            (!surfaces && view_scale != ViewScale::Off && (enc.is_software() || cpu_bound))
-                .then(|| view_target((w, h), ctx.view_size()))
+            (!surfaces && view_scale != ViewScale::Off && (enc.is_software() || cpu_cap.capped()))
+                .then(|| cpu_cap.apply((w, h), view_target((w, h), ctx.view_size())))
                 .flatten();
         // `Refine`: a still screen gets one sharp full-size picture, then stays so
         // until it changes.
@@ -566,10 +663,19 @@ fn run_generation(
         } else {
             BACKGROUND_INTERVAL.max(budget)
         };
+        // A still picture at the viewer's size: sharpen it (see `TOPOFF_FRAMES`).
+        let topoff = topoff_left > 0
+            && pending.is_none()
+            && target.is_some()
+            && now >= last_encode + BACKGROUND_INTERVAL;
+        if pending.is_some() || target.is_none() {
+            topoff_left = 0;
+        }
         let encode_now = force
             || repair
             || sharpen
             || refine
+            || topoff
             || (pending.is_some() && now >= last_encode + interval);
         if !encode_now {
             continue;
@@ -616,6 +722,7 @@ fn run_generation(
             (Some(s), _) => enc.encode_surface(s)?,
             (None, Some(pic)) if motion && may_halve => {
                 pic.half_into(&mut small);
+                enc.set_scaled_input(true);
                 stats.half += 1;
                 enc.encode_yuv(small.as_ref().expect("allocated by half_into"), None)?
             }
@@ -640,8 +747,20 @@ fn run_generation(
                     }
                 };
                 sent_scaled = target.is_some();
+                enc.set_scaled_input(sent_scaled);
+                if topoff {
+                    topoff_left -= 1;
+                    stats.topoffs += 1;
+                } else if sent_scaled && p.is_some() {
+                    topoff_left = TOPOFF_FRAMES;
+                }
                 match composer.as_mut() {
                     Some(c) => {
+                        if topoff {
+                            // The viewer shows only the regions an instruction names: the
+                            // sharper picture is shown whole.
+                            c.request_full();
+                        }
                         let (canvas, found) = c.prepare(pic, &std::mem::take(&mut hints));
                         match enc.encode_yuv(canvas, found.rows)? {
                             Some(au) => {
@@ -673,7 +792,19 @@ fn run_generation(
         };
         let took = t0.elapsed();
         stats.encode += took;
-        encode_avg_ms = encode_avg_ms * 0.9 + took.as_secs_f64() * 1e3 * 0.1;
+        if !surfaces && view_scale != ViewScale::Off {
+            let size = target
+                .or(motion
+                    .then(|| small.as_ref().map(|s| s.dimensions()))
+                    .flatten())
+                .unwrap_or((w, h));
+            cpu_cap.note(
+                size,
+                took.as_secs_f64() * 1e3,
+                budget.as_secs_f64() * 1e3,
+                w * h,
+            );
+        }
         last_encode = Instant::now();
         if urgent {
             stats.urgent += 1;
@@ -793,6 +924,8 @@ struct Stats {
     half: u32,
     /// Frames sent at the viewer's (smaller) size.
     scaled: u32,
+    /// Still pictures re-sent to sharpen them (`TOPOFF_FRAMES`).
+    topoffs: u32,
     captures: u32,
     /// Keyframes, loss repairs from long-term references, losses the viewer reported,
     /// live bitrate changes.
@@ -833,6 +966,7 @@ impl Stats {
             urgent_fps = format!("{:.1}", f64::from(self.urgent) / secs),
             half_size_fps = format!("{:.1}", f64::from(self.half) / secs),
             view_size_fps = format!("{:.1}", f64::from(self.scaled) / secs),
+            topoff_fps = format!("{:.1}", f64::from(self.topoffs) / secs),
             moved_pct = format!("{:.1}", self.moved * 100.0 / n),
             kbps = format!("{:.0}", self.bytes as f64 * 8.0 / secs / 1000.0),
             changed_pct = format!("{:.1}", self.changed * 100.0 / n),
@@ -865,19 +999,13 @@ mod tests {
     use rconn_media::capture::TestPattern;
     use rconn_media::video::VideoDecoder;
 
-    /// A software host streaming a 1920x1080 screen to a viewer showing it 1280x720
-    /// sends 1280x720 pictures; once the viewer shows it full size, full-size ones.
-    #[test]
-    fn a_software_encoder_sends_the_viewer_size() {
-        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
-            return;
-        };
-        let keyframes = KeyframeRequests::default();
-        keyframes.set_view_size(1280, 720);
-        let ctx = Ctx {
+    /// A software (openh264) host's stream state, for `run_generation`.
+    fn software_ctx(lib: &std::path::Path, keyframes: &KeyframeRequests) -> Ctx {
+        Ctx {
             cfg: StreamConfig {
-                openh264: lib.clone(),
-                max_fps: 30,
+                openh264: lib.to_owned(),
+                // A slow frame rate: unoptimized builds must not look CPU-bound.
+                max_fps: 5,
                 max_bitrate_bps: 8_000_000,
                 max_size: (3840, 2400),
                 motion_half_res: false,
@@ -892,7 +1020,84 @@ mod tests {
             sending: Arc::default(),
             copy_rects: Arc::default(),
             view: keyframes.view.clone(),
+        }
+    }
+
+    /// A test pattern that changes `changes` times, then stays still.
+    struct Changes {
+        pattern: TestPattern,
+        changes: usize,
+    }
+
+    impl Capturer for Changes {
+        fn next_frame(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<rconn_media::video::Frame>, rconn_media::capture::CaptureError> {
+            if self.changes == 0 {
+                std::thread::sleep(timeout);
+                return Ok(None);
+            }
+            self.changes -= 1;
+            self.pattern.next_frame(timeout)
+        }
+    }
+
+    /// At the viewer's size, a screen that stops changing gets `TOPOFF_FRAMES` more
+    /// pictures of the same content (each sharper), then nothing.
+    #[test]
+    fn a_still_scaled_picture_is_topped_off() {
+        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
+            return;
         };
+        let keyframes = KeyframeRequests::default();
+        keyframes.set_view_size(1280, 720);
+        let ctx = software_ctx(&lib, &keyframes);
+        let (tx, mut rx) = mpsc::channel(4);
+        let make = || -> Result<Box<dyn Capturer>> {
+            Ok(Box::new(Changes {
+                pattern: TestPattern::new(1920, 1080, 30),
+                changes: 5,
+            }))
+        };
+        let mut tags = Vec::new();
+        std::thread::scope(|s| {
+            let worker = s.spawn(|| {
+                let tx = tx;
+                run_generation(&make, &ctx, &tx)
+            });
+            let mut first = None;
+            while let Some((au, _)) = rx.blocking_recv() {
+                let first = *first.get_or_insert_with(Instant::now);
+                tags.push(frames::read(&au).expect("tagged"));
+                // Before the third repeat of the first keyframe (2.5 s).
+                if first.elapsed() > Duration::from_millis(2300) {
+                    ctx.stop.store(true, Ordering::Relaxed);
+                }
+            }
+            drop(rx);
+            worker.join().unwrap().unwrap();
+        });
+        // 5 pictures for the changes, then the top-offs (repeats of the first keyframe at
+        // 300 ms and 1 s may stand in for one; openh264 may skip one after a keyframe),
+        // then nothing until the next repeat at 2.5 s.
+        let after = tags.len().saturating_sub(5);
+        assert!(
+            (3..=TOPOFF_FRAMES as usize).contains(&after),
+            "{after} pictures after the changes: {tags:?}"
+        );
+    }
+
+    /// A software host streaming a 1920x1080 screen to a viewer showing it 1280x720
+    /// sends 1280x720 pictures; once the viewer shows it full size, full-size ones.
+    #[test]
+    fn a_software_encoder_sends_the_viewer_size() {
+        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let keyframes = KeyframeRequests::default();
+        keyframes.set_view_size(1280, 720);
+        let ctx = software_ctx(&lib, &keyframes);
         let (tx, mut rx) = mpsc::channel(4);
         let make =
             || -> Result<Box<dyn Capturer>> { Ok(Box::new(TestPattern::new(1920, 1080, 30))) };
@@ -920,6 +1125,31 @@ mod tests {
         assert!(sizes[..10].iter().all(|&s| s == (1280, 720)), "{sizes:?}");
         // The switch back takes effect with the next picture encoded.
         assert!(sizes[11..].iter().all(|&s| s == (1920, 1080)), "{sizes:?}");
+    }
+
+    /// An encoder taking 90 ms a picture at 2992x1878 is capped until it takes about
+    /// half the 33 ms interval; one with time to spare gets the full screen back.
+    #[test]
+    fn a_slow_encoder_gets_fewer_pixels_and_a_fast_one_more() {
+        let screen = (2992, 1878);
+        let px = screen.0 * screen.1;
+        let mut cap = CpuCap::default();
+        for _ in 0..10 {
+            cap.note(screen, 90.0, 33.3, px);
+        }
+        let to = cap.apply(screen, None).expect("capped");
+        assert!(to.0 * to.1 <= px * 20 / 100, "{to:?}");
+        assert_eq!(to.0 * screen.1 / to.1 / 8, screen.0 / 8, "same shape");
+        // A viewer showing it even smaller wins.
+        assert_eq!(cap.apply(screen, Some((640, 400))), Some((640, 400)));
+        // Fast at the capped size: the cap rises step by step and goes.
+        for _ in 0..20 {
+            for _ in 0..60 {
+                let size = cap.apply(screen, None).unwrap_or(screen);
+                cap.note(size, 5.0, 33.3, px);
+            }
+        }
+        assert!(!cap.capped());
     }
 
     #[test]

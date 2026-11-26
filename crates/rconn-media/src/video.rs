@@ -106,8 +106,8 @@ impl Default for EncoderSettings {
 /// The H.264 encoder doing the work.
 enum Engine {
     OpenH264(Box<OpenH264>),
-    /// Windows' built-in encoder: 3.5-7x faster than openh264 on a measured 8-core VM,
-    /// and the GPU's encoder where a vendor registers one.
+    /// Windows' Media Foundation: the GPU's encoder where a vendor registers one;
+    /// Microsoft's software encoder only when asked for (see `build`).
     #[cfg(windows)]
     MediaFoundation(crate::mf::MfH264Encoder),
     /// Apple's encoder (the hardware one where there is one), in low-latency mode; it
@@ -126,6 +126,24 @@ struct OpenH264 {
     started: bool,
     /// Built in long-term-reference mode (see [`VideoEncoder::set_long_term_refs`]).
     ltr: bool,
+    /// Slices per picture, one thread each ([`openh264_slices`]).
+    slices: u32,
+}
+
+/// Slices (and threads) for openh264 at `w` x `h`: `RCONN_OPENH264_SLICES`, else one per
+/// core up to 4 from about 1 MP up (720p and smaller encode fast enough on one core,
+/// and every slice costs a little compression).
+fn openh264_slices(w: usize, h: usize) -> u32 {
+    if let Some(n) = std::env::var("RCONN_OPENH264_SLICES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        return n.clamp(1, 16);
+    }
+    if w * h < 1_000_000 {
+        return 1;
+    }
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(4) as u32)
 }
 
 /// Frames between long-term reference marks on Media Foundation (~1 s at 30 fps; openh264
@@ -179,6 +197,12 @@ pub struct VideoEncoder {
     vt_failures: u32,
     /// openh264 in long-term-reference mode for engines built from now on.
     openh264_ltr: bool,
+    /// openh264 engines built from now on get scaled screens ([`Self::set_scaled_input`]).
+    scaled_input: bool,
+    /// Windows: Microsoft's software encoder rather than openh264 when there is no GPU
+    /// encoder (`RCONN_ENCODER=software`, [`Self::set_microsoft_software`]).
+    #[cfg(windows)]
+    mf_software: bool,
     /// Reads our own output: frame numbers and reference marks for loss repair.
     syntax: SyntaxTracker,
     ledger: Ledger,
@@ -234,6 +258,9 @@ impl VideoEncoder {
             #[cfg(target_os = "macos")]
             vt_failures: 0,
             openh264_ltr: std::env::var("RCONN_OPENH264_LTR").is_ok_and(|v| v == "1"),
+            scaled_input: false,
+            #[cfg(windows)]
+            mf_software: std::env::var("RCONN_ENCODER").is_ok_and(|v| v == "software"),
             syntax: SyntaxTracker::default(),
             ledger: Ledger::default(),
             next_id: 0,
@@ -273,18 +300,31 @@ impl VideoEncoder {
                 }
             }
         }
+        // Windows: Media Foundation for the GPU's encoder. Without one, openh264 rather
+        // than Microsoft's software encoder (`RCONN_ENCODER=software` still picks it):
+        // on a Windows 11 ARM VM (8 vCPUs, `--selftest-encode`) that encoder was 3-7x
+        // faster per full-size picture, but ignored the bitrate (8 Mbps asked: 43 KB a
+        // picture for a blinking caret, 2.5 MB for a scrolling 2992x1878 screen) and
+        // added keyframes of its own; at the viewer's size openh264 keeps 23-30 fps on
+        // under half the CPU, within the bitrate, with live rate changes and no keyframes.
         #[cfg(windows)]
-        if !self.software_only {
+        if !self.software_only
+            && (self.mf_software || crate::mf::MfH264Encoder::hardware_available())
+        {
             match crate::mf::MfH264Encoder::new(
                 width as u32,
                 height as u32,
                 self.settings.max_fps.round().max(1.0) as u32,
                 self.settings.bitrate_bps,
             ) {
-                Ok(mf) => {
+                Ok(mf) if mf.is_hardware() || self.mf_software => {
                     self.engine_name = format!("Media Foundation ({})", mf.name());
                     return Ok(Engine::MediaFoundation(mf));
                 }
+                Ok(mf) => tracing::info!(
+                    engine = mf.name(),
+                    "the GPU's encoder did not start; openh264 rather than Microsoft's software encoder"
+                ),
                 Err(e) => {
                     tracing::warn!(error = %e, "Media Foundation encoder unavailable; using openh264")
                 }
@@ -292,6 +332,8 @@ impl VideoEncoder {
         }
         self.engine_name = if self.openh264_ltr {
             "openh264 (long-term references)".into()
+        } else if self.scaled_input {
+            "openh264 (camera mode)".into()
         } else {
             "openh264".into()
         };
@@ -300,6 +342,7 @@ impl VideoEncoder {
             bps: self.settings.bitrate_bps,
             started: false,
             ltr: self.openh264_ltr,
+            slices: openh264_slices(width, height),
         })))
     }
 
@@ -310,10 +353,17 @@ impl VideoEncoder {
         // mode measured 3.7x faster per frame, ~25 % more bytes on scrolling and static
         // text (`ltr_tests::compare_screen_and_ltr_modes`), so it is opt-in:
         // `RCONN_OPENH264_LTR=1`.
-        let (usage, ltr) = if self.openh264_ltr {
-            (UsageType::CameraVideoRealTime, true)
+        // Scaled pictures go to camera mode too: a scroll there moves the picture by a
+        // fraction of a pixel, which screen mode's scroll detection doesn't find; it calls
+        // every such frame a scene change, and in screen mode a scene change is always an
+        // IDR (a 2992x1878 screen at 1152x722: 7 fps, 132 KB a picture, every one a
+        // keyframe; camera mode 24 fps, 41 KB, none; `--selftest-encode`).
+        let ltr = self.openh264_ltr;
+        let camera = ltr || self.scaled_input;
+        let usage = if camera {
+            UsageType::CameraVideoRealTime
         } else {
-            (UsageType::ScreenContentRealTime, false)
+            UsageType::ScreenContentRealTime
         };
         let cfg = EncoderConfig::new()
             .usage_type(usage)
@@ -322,15 +372,23 @@ impl VideoEncoder {
             .max_frame_rate(FrameRate::from_hz(self.settings.max_fps))
             .complexity(Complexity::Low)
             // Never let quality fall apart (blocky text/images): cap the quantizer. Costs
-            // bandwidth on busy screens, which screen sharing can afford.
-            .qp(openh264::encoder::QpRange::new(10, 32))
+            // bandwidth on busy screens, which screen sharing can afford. Scaled pictures
+            // may go coarser while they move: at 8 Mbps a 720p scroll then keeps 30 fps
+            // instead of 13 (the rate controller skipped the rest), and the host re-sends a
+            // still picture a few times to sharpen it again (`stream.rs`, top-off: 25.5 dB
+            // after the scroll, 31 dB after 6, better than 30.4 with the cap at 32).
+            .qp(openh264::encoder::QpRange::new(
+                10,
+                if self.scaled_input && !ltr { 38 } else { 32 },
+            ))
             // Not supported for screen content; openh264 warns and disables them anyway.
             .adaptive_quantization(false)
             .background_detection(false)
             .skip_frames(true)
             .long_term_reference(ltr)
-            // Camera mode would add IDRs of its own on big changes (scrolling).
-            .scene_change_detect(!ltr)
+            // Camera mode would add IDRs of its own on big changes (scrolling). (Screen mode
+            // turns it on whatever is asked.)
+            .scene_change_detect(!camera)
             // Keyframes come from RequestKeyframe/PLI, not a timer.
             .intra_frame_period(IntraFramePeriod::from_num_frames(0))
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
@@ -421,6 +479,20 @@ impl VideoEncoder {
             #[cfg(not(windows))]
             None => self.software_only || !cfg!(target_os = "macos"),
         }
+    }
+
+    /// The pictures from now on are the screen scaled down (to the viewer's size, or
+    /// halved), not its own pixels: openh264 engines built for them use camera mode
+    /// (see `build_openh264`). Engines already built for a size keep their mode.
+    pub fn set_scaled_input(&mut self, on: bool) {
+        self.scaled_input = on;
+    }
+
+    /// Windows without a GPU encoder: Microsoft's software encoder for engines built from
+    /// now on, rather than openh264 (comparisons; `RCONN_ENCODER=software`).
+    #[cfg(windows)]
+    pub fn set_microsoft_software(&mut self, on: bool) {
+        self.mf_software = on;
     }
 
     /// openh264 engines built from now on use long-term references (camera mode), so
@@ -552,13 +624,19 @@ impl VideoEncoder {
         let (force_key, mut repair) = self.begin_frame();
         let out = match self.encoder.as_mut().expect("built above") {
             Engine::OpenH264(o) => {
-                if force_key {
+                let err = |e: openh264::Error| CodecError::OpenH264(e.to_string());
+                if !o.started && o.slices > 1 {
+                    // Slices can only be set on an initialized encoder, and openh264
+                    // initializes on its first picture: a blank one, not sent.
+                    o.encoder.encode(&I420::new(w, h)).map_err(err)?;
+                    if !crate::oh264::set_slices(&mut o.encoder, o.slices) {
+                        tracing::warn!(slices = o.slices, "openh264 refused slices; one core");
+                    }
+                }
+                if force_key || !o.started {
                     o.encoder.force_intra_frame();
                 }
-                let bits = o
-                    .encoder
-                    .encode(yuv)
-                    .map_err(|e| CodecError::OpenH264(e.to_string()))?;
+                let bits = o.encoder.encode(yuv).map_err(err)?;
                 self.last_was_key = matches!(
                     bits.frame_type(),
                     openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I

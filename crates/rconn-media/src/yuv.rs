@@ -40,6 +40,11 @@ impl I420 {
         (self.width, self.height)
     }
 
+    /// The Y plane (`width` bytes per row).
+    pub fn luma(&self) -> &[u8] {
+        &self.data[..self.width * self.height]
+    }
+
     /// The Y, U and V planes, writable (`width`, `width / 2`, `width / 2` bytes per row).
     pub fn planes_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
         let n = self.width * self.height;
