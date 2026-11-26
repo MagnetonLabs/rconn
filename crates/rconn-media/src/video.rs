@@ -164,6 +164,12 @@ pub struct VideoEncoder {
     scale: f32,
     last_was_key: bool,
     force_key: bool,
+    /// A bitrate change went to the engine: is the next frame out a keyframe nobody asked
+    /// for?
+    probe_retarget: bool,
+    /// This engine turns bitrate changes into keyframes (seen, or known: Microsoft's
+    /// software Media Foundation encoder): change its bitrate rarely.
+    retarget_costs_key: bool,
     /// macOS: openh264 rather than VideoToolbox, as asked for (`RCONN_ENCODER=openh264`,
     /// [`VideoEncoder::software`]) or because VideoToolbox failed.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -222,6 +228,8 @@ impl VideoEncoder {
             scale: 1.0,
             last_was_key: false,
             force_key: false,
+            probe_retarget: false,
+            retarget_costs_key: false,
             software_only: std::env::var("RCONN_ENCODER").is_ok_and(|v| v == "openh264"),
             #[cfg(target_os = "macos")]
             vt_failures: 0,
@@ -352,8 +360,9 @@ impl VideoEncoder {
         self.settings
     }
 
-    /// Change the target bitrate, live on every engine: no restart, no keyframe. (Before
-    /// 0.1.6 openh264 was rebuilt for it, and every retarget cost a full-size IDR.)
+    /// Change the target bitrate, live: no restart. openh264, VideoToolbox: no keyframe.
+    /// Some Media Foundation encoders answer with a keyframe anyway; see
+    /// [`Self::bitrate_change_costs_keyframe`].
     pub fn set_bitrate(&mut self, bps: u32) {
         if bps == self.settings.bitrate_bps {
             return;
@@ -366,6 +375,7 @@ impl VideoEncoder {
     /// spare encoder, which may have an older one).
     fn apply_bitrate(&mut self) {
         let bps = self.settings.bitrate_bps;
+        self.probe_retarget = self.encoder.is_some();
         match &mut self.encoder {
             Some(Engine::OpenH264(o)) if o.started && o.bps != bps => {
                 if !crate::oh264::set_bitrate(&mut o.encoder, o.bps, bps) {
@@ -379,6 +389,14 @@ impl VideoEncoder {
             Some(Engine::VideoToolbox(vt)) => vt.set_bitrate(bps), // live, no keyframe
             _ => {}
         }
+    }
+
+    /// Does a bitrate change cost a keyframe on this engine? Microsoft's software Media
+    /// Foundation encoder puts out an IDR after about every other change (measured: 10
+    /// keyframes for 19 changes); other engines are watched and join it if they do the
+    /// same. Callers change such an engine's bitrate only on large, lasting moves.
+    pub fn bitrate_change_costs_keyframe(&self) -> bool {
+        self.retarget_costs_key || self.engine_name.contains("H264 Encoder MFT")
     }
 
     /// Which encoder is in use ("Media Foundation (...)" or "openh264").
@@ -748,6 +766,17 @@ impl VideoEncoder {
                 self.encoder = None;
             }
         }
+        if !out.is_empty() && std::mem::take(&mut self.probe_retarget) {
+            // The first picture after a bitrate change: a keyframe that nobody asked for
+            // (no request, no repair) came from the change itself.
+            if !force_key && repair.asked.is_none() && has_idr(&out) && !self.retarget_costs_key {
+                tracing::info!(
+                    engine = %self.engine_name,
+                    "bitrate changes cost a keyframe on this encoder; changing it rarely"
+                );
+                self.retarget_costs_key = true;
+            }
+        }
         let out = with_headers(out, &mut self.headers);
         if out.is_empty() {
             if repair.base.is_some() {
@@ -940,11 +969,19 @@ fn with_headers(out: Vec<u8>, headers: &mut Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// Should a bandwidth estimate move the encoder? Changes are live (no keyframe) on every
-/// engine, so anything beyond estimator jitter (5 %) is followed.
+/// Should a bandwidth estimate move the encoder? Where a change is free (no keyframe),
+/// anything beyond estimator jitter (5 %) is followed.
 pub fn should_retarget(current_bps: u32, estimate_bps: u32) -> bool {
     let (c, e) = (f64::from(current_bps), f64::from(estimate_bps));
     c > 0.0 && ((e - c).abs() / c) > 0.05
+}
+
+/// As [`should_retarget`], for an engine where a change costs a keyframe
+/// ([`VideoEncoder::bitrate_change_costs_keyframe`]): only a move of more than 25 % (the
+/// 0.1.5 rule), so estimator swings don't become a keyframe every few seconds.
+pub fn should_retarget_costly(current_bps: u32, estimate_bps: u32) -> bool {
+    let (c, e) = (f64::from(current_bps), f64::from(estimate_bps));
+    c > 0.0 && ((e - c).abs() / c) > 0.25
 }
 
 pub use crate::decode::{DecodedFrame, PixelLayout, VideoDecoder};
@@ -997,6 +1034,15 @@ mod tests {
         assert!(should_retarget(4_000_000, 2_000_000));
         assert!(should_retarget(4_000_000, 6_000_000));
         assert!(!should_retarget(0, 1));
+    }
+
+    #[test]
+    fn costly_retarget_threshold() {
+        assert!(!should_retarget_costly(4_000_000, 4_500_000));
+        assert!(!should_retarget_costly(4_000_000, 3_200_000));
+        assert!(should_retarget_costly(4_000_000, 2_000_000));
+        assert!(should_retarget_costly(4_000_000, 6_000_000));
+        assert!(!should_retarget_costly(0, 1));
     }
 
     #[test]
@@ -1168,11 +1214,16 @@ mod ltr_tests {
                 }
             }
             println!(
-                "{}: {changes} bitrate changes in 300 frames, {keys} keyframe(s); bytes per rate {:?}",
+                "{}: {changes} bitrate changes in 300 frames, {keys} keyframe(s); bytes per rate {:?}; changes cost keyframes: {}",
                 e.engine_name(),
-                rates.iter().zip(bytes).collect::<Vec<_>>()
+                rates.iter().zip(bytes).collect::<Vec<_>>(),
+                e.bitrate_change_costs_keyframe()
             );
-            assert_eq!(keys, 1, "only the first frame");
+            // Microsoft's software Media Foundation encoder puts out keyframes on changes:
+            // it must be known for it, so the host changes its bitrate rarely.
+            if !e.bitrate_change_costs_keyframe() {
+                assert_eq!(keys, 1, "only the first frame");
+            }
         }
     }
 

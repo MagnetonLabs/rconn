@@ -11,7 +11,7 @@
 use anyhow::Result;
 use rconn_media::capture::{Captured, Capturer, Surface};
 use rconn_media::copyrect::{Composer, Move};
-use rconn_media::video::{EncoderSettings, VideoEncoder, should_retarget};
+use rconn_media::video::{EncoderSettings, VideoEncoder, should_retarget, should_retarget_costly};
 use rconn_media::yuv::I420;
 use rconn_peer::frames::{self, Feedback, FrameTag};
 use rconn_peer::video::{TargetBitrate, VideoSender};
@@ -66,6 +66,9 @@ impl KeyframeRequests {
 
 /// How often the encoder follows the bandwidth estimate (changes are live and cheap).
 const RETARGET_EVERY: Duration = Duration::from_millis(200);
+/// ...or this often, where a bitrate change costs a keyframe (Microsoft's software Media
+/// Foundation encoder).
+const COSTLY_RETARGET_EVERY: Duration = Duration::from_secs(2);
 
 /// Encode rate for small background changes (spinner, caret) when nobody is interacting.
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(100);
@@ -460,9 +463,21 @@ fn run_generation(
         }
 
         if now >= retarget_at {
-            retarget_at = now + RETARGET_EVERY;
+            let costly = enc.bitrate_change_costs_keyframe();
+            retarget_at = now
+                + if costly {
+                    COSTLY_RETARGET_EVERY
+                } else {
+                    RETARGET_EVERY
+                };
             let want = (ctx.target.get() as u32).clamp(300_000, cfg.max_bitrate_bps);
-            if should_retarget(enc.settings().bitrate_bps, want) {
+            let current = enc.settings().bitrate_bps;
+            let move_it = if costly {
+                should_retarget_costly(current, want)
+            } else {
+                should_retarget(current, want)
+            };
+            if move_it {
                 tracing::debug!(
                     from_kbps = enc.settings().bitrate_bps / 1000,
                     to_kbps = want / 1000,
