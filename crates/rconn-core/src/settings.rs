@@ -205,7 +205,8 @@ impl LoadedSettings {
     pub fn load(layers: SettingsLayers) -> Result<Self, LoadError> {
         let mut fig = Figment::from(Serialized::defaults(HostSettings::default()));
         let mut ignored_user_keys = Vec::new();
-        if let Some(p) = &layers.user_file {
+        // A settings file that doesn't exist yet (a fresh install) is an empty one.
+        if let Some(p) = layers.user_file.as_ref().filter(|p| p.exists()) {
             let mut value: serde_json::Value = Figment::from(Toml::file_exact(p))
                 .extract()
                 .map_err(Box::new)?;
@@ -221,7 +222,7 @@ impl LoadedSettings {
                 value,
             });
         }
-        if let Some(p) = &layers.system_file {
+        if let Some(p) = layers.system_file.as_ref().filter(|p| p.exists()) {
             fig = fig.merge(Toml::file_exact(p));
         }
         let mut policy_paths = Vec::new();
@@ -689,6 +690,30 @@ mod tests {
             classify_host("Apple Inc.", "VirtualMac2,1", true),
             HostKind::Vm
         );
+    }
+
+    #[test]
+    /// A fresh install has no host.toml yet: the first write creates it.
+    fn first_write_creates_a_missing_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("host.toml");
+        let layers = || SettingsLayers {
+            system_file: Some(file.clone()),
+            user_file: Some(dir.path().join("user.toml")),
+            ..Default::default()
+        };
+        assert!(LoadedSettings::load(layers()).is_ok());
+        write_setting(
+            layers(),
+            "server.url",
+            "wss://a/v1/ws",
+            Writer::Admin,
+            false,
+        )
+        .unwrap();
+        write_setting(layers(), "server.fingerprint", "", Writer::Admin, false).unwrap();
+        let loaded = LoadedSettings::load(layers()).unwrap();
+        assert_eq!(loaded.settings.server.unwrap().url, "wss://a/v1/ws");
     }
 
     #[test]
