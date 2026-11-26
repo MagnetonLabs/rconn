@@ -11,13 +11,13 @@ fn data_dir(session_active: bool) -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(
         d.path().join("host.toml"),
-        "[server]\nurl = \"wss://100.84.21.78:8443/v1/ws\"\nfingerprint = \"sha256:035c91a36ab00dc1ff0e752bdc6d5bbb2fbeb34a1bc48f7a067db16864b80a74\"\n",
+        "[server]\nurl = \"wss://192.0.2.10:8443/v1/ws\"\nfingerprint = \"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(d.path().join("identity")).unwrap();
     std::fs::write(
         d.path().join("identity/host.id"),
-        "1e5ede94-60e3-408a-9cc4-b1c92e0ca86b",
+        "3f2a9c1e-7b4d-4e8a-9c21-5d6f0a1b2c3d",
     )
     .unwrap();
     if session_active {

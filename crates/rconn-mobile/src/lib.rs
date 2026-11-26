@@ -106,7 +106,7 @@ fn init_logging() {
     });
 }
 
-/// Connect to the computer `computer_id` ("067 425 387") through the signaling server at
+/// Connect to the computer `computer_id` ("482 915 306") through the signaling server at
 /// `server_url` (`wss://…`), proving `password`. `fingerprint_pin` (`sha256:<hex>`) pins a
 /// self-hosted server's key; without it the server needs a publicly trusted certificate.
 #[uniffi::export]

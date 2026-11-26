@@ -75,13 +75,13 @@ mod tests {
 
     #[test]
     fn short_code_is_stable_9_digits_and_matches_loosely() {
-        let id = HostId(Uuid::parse_str("1e5ede94-60e3-408a-9cc4-b1c92e0ca86b").unwrap());
+        let id = HostId(Uuid::parse_str("3f2a9c1e-7b4d-4e8a-9c21-5d6f0a1b2c3d").unwrap());
         let code = id.short_code();
         assert_eq!(code.len(), 11);
         assert_eq!(code, id.short_code());
         assert!(id.matches(&code));
         assert!(id.matches(&code.replace(' ', "")));
-        assert!(id.matches("1e5ede94-60e3-408a-9cc4-b1c92e0ca86b"));
+        assert!(id.matches("3f2a9c1e-7b4d-4e8a-9c21-5d6f0a1b2c3d"));
         assert!(!id.matches("000 000 000"));
     }
 }

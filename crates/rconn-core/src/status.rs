@@ -57,7 +57,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("status.json");
         let s = HostStatus {
-            short_code: "067 425 387".into(),
+            short_code: "482 915 306".into(),
             online: true,
             updated: 100,
             ..Default::default()

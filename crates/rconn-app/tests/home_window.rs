@@ -23,7 +23,7 @@ fn sample() -> Home {
         Some("BUILD-BOX".into()),
     );
     let mut h = Home::new(p);
-    let me = id("1e5ede94-60e3-408a-9cc4-b1c92e0ca86b");
+    let me = id("3f2a9c1e-7b4d-4e8a-9c21-5d6f0a1b2c3d");
     h.now = 1_000;
     h.this = Some(HostStatus {
         host_id: me.to_string(),
@@ -149,7 +149,7 @@ fn no_account(password_set: bool) -> Home {
     let mut p = Profile::default();
     p.remember_code("987654321");
     let mut h = Home::new(p);
-    let me = id("1e5ede94-60e3-408a-9cc4-b1c92e0ca86b");
+    let me = id("3f2a9c1e-7b4d-4e8a-9c21-5d6f0a1b2c3d");
     h.now = 1_000;
     h.this = Some(HostStatus {
         host_id: me.to_string(),
@@ -181,12 +181,12 @@ fn no_server_means_the_public_one_and_guests_are_remembered_by_id() {
     assert_eq!(rconn_app::profile::tidy_code(" abc "), "abc");
     // Older app.json files (host_id only) still load.
     let old: Profile = serde_json::from_str(
-        r#"{"server":"","fingerprint":"","username":"","recent":[{"host_id":"1e5ede94-60e3-408a-9cc4-b1c92e0ca86b","label":"X"}]}"#,
+        r#"{"server":"","fingerprint":"","username":"","recent":[{"host_id":"3f2a9c1e-7b4d-4e8a-9c21-5d6f0a1b2c3d","label":"X"}]}"#,
     )
     .unwrap();
     assert_eq!(
         old.recent[0].code(),
-        id("1e5ede94-60e3-408a-9cc4-b1c92e0ca86b").short_code()
+        id("3f2a9c1e-7b4d-4e8a-9c21-5d6f0a1b2c3d").short_code()
     );
 }
 

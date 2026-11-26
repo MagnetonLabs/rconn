@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// What the user typed to connect without an account.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GuestLogin {
-    /// The computer's ID as typed ("067 425 387").
+    /// The computer's ID as typed ("482 915 306").
     pub id: String,
     pub password: String,
 }
