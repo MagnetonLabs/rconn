@@ -248,3 +248,44 @@ pre {
 @media (prefers-reduced-motion: no-preference) {
   html { scroll-behavior: smooth; }
 }
+
+/* Text pages: on wide screens the text keeps its readable width and a sticky column
+   beside it lists the page's sections, instead of leaving the right half empty. */
+.doc-aside { display: none; }
+@media (min-width: 64rem) {
+  .doc {
+    display: grid;
+    grid-template-columns: minmax(0, var(--measure)) minmax(13rem, 17rem);
+    justify-content: space-between;
+    column-gap: clamp(2.5rem, 6vw, 6rem);
+  }
+  .doc-aside {
+    display: block;
+    position: sticky;
+    top: 6rem;
+    align-self: start;
+    padding-left: 1.5rem;
+    border-left: 1px solid var(--rule);
+    font-size: var(--s-16);
+  }
+  .doc-aside-title {
+    margin: 0 0 0.75rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .doc-aside ol { list-style: none; margin: 0; padding: 0; }
+  .doc-aside li + li { margin-top: 0.55rem; }
+  .doc-aside a { color: inherit; text-decoration: none; }
+  .doc-aside a:hover, .doc-aside a:focus-visible { color: var(--link); text-decoration: underline; }
+  .doc-aside-box {
+    display: grid;
+    gap: 0.6rem;
+    margin-top: 2rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--rule);
+  }
+  .doc-aside .doc-aside-cta { color: var(--link); font-weight: 600; }
+}

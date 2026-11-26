@@ -1,0 +1,19 @@
+---
+/** Wide screens: a sticky column beside the text with this page's sections and the
+ *  next steps. Hidden on narrow screens, where the text uses the full width. */
+interface Props {
+  sections: { id: string; label: string }[];
+}
+const { sections } = Astro.props;
+---
+
+<aside class="doc-aside" aria-label="On this page">
+  <p class="doc-aside-title">On this page</p>
+  <ol>
+    {sections.map((s) => <li><a href={`#${s.id}`}>{s.label}</a></li>)}
+  </ol>
+  <div class="doc-aside-box">
+    <a class="doc-aside-cta" href="/download">Download Rconn</a>
+    <a href="https://github.com/MagnetonLabs/rconn">Source code on GitHub</a>
+  </div>
+</aside>

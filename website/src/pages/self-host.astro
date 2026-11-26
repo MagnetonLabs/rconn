@@ -1,5 +1,6 @@
 ---
 import Base from '../layouts/Base.astro';
+import DocAside from '../components/DocAside.astro';
 ---
 
 <Base
@@ -16,7 +17,7 @@ import Base from '../layouts/Base.astro';
   </div>
 
   <section class="band" aria-labelledby="need-title">
-    <div class="wrap"><div class="prose">
+    <div class="wrap doc"><div class="prose">
       <p class="draft-note" role="note">
         <strong>Preview.</strong> The install script and server image aren’t published at
         these addresses yet. The commands show how setup will work and may change before
@@ -30,7 +31,7 @@ import Base from '../layouts/Base.astro';
         <li>These ports open: TCP 443, UDP 3478 and UDP 49160–49260.</li>
       </ul>
 
-      <h2>Install</h2>
+      <h2 id="install">Install</h2>
       <p>On the server, run:</p>
       <pre><code>curl -fsSL https://rconn.app/install.sh \
   | sudo RCONN_HOSTNAME=rconn.example.com bash</code></pre>
@@ -44,14 +45,14 @@ import Base from '../layouts/Base.astro';
         <li>an admin login, shown once</li>
       </ul>
 
-      <h2>Point Rconn at it</h2>
+      <h2 id="point">Point Rconn at it</h2>
       <p>
         In Rconn, open the <strong>Server</strong> section and enter the server URL and the
         server pin. The pin lets each device check it’s talking to your server and not an
         impostor.
       </p>
 
-      <h2>Prefer Docker Compose?</h2>
+      <h2 id="compose">Prefer Docker Compose?</h2>
       <p>The installer writes a file like this to <code>/opt/rconn/compose.yaml</code>:</p>
       <pre><code>services:
   signaling:
@@ -74,7 +75,16 @@ volumes:
       </p>
       <pre><code>docker compose run --rm signaling init --hostname rconn.example.com
 docker compose up -d</code></pre>
-    </div></div>
+    </div>
+      <DocAside
+        sections={[
+        { id: 'need-title', label: "You’ll need" },
+        { id: 'install', label: "Install" },
+        { id: 'point', label: "Point Rconn at it" },
+        { id: 'compose', label: "Prefer Docker Compose?" },
+        ]}
+      />
+    </div>
   </section>
 </Base>
 

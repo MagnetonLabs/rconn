@@ -1,5 +1,6 @@
 ---
 import Base from '../layouts/Base.astro';
+import DocAside from '../components/DocAside.astro';
 import PeerDiagram from '../components/PeerDiagram.astro';
 import { version } from '../lib/releases';
 ---
@@ -50,7 +51,7 @@ import { version } from '../lib/releases';
   </section>
 
   <section class="band" aria-labelledby="steps-title">
-    <div class="wrap"><div class="prose">
+    <div class="wrap doc"><div class="prose">
       <h2 id="steps-title">What happens when someone connects</h2>
       <ol>
         <li>Their device asks the server for your computer by its ID.</li>
@@ -78,7 +79,7 @@ import { version } from '../lib/releases';
         </li>
       </ol>
 
-      <h2>Your password on your computer</h2>
+      <h2 id="password">Your password on your computer</h2>
       <ul>
         <li>
           Rconn stores a one-way check of the password (Argon2id), not the password itself,
@@ -92,7 +93,7 @@ import { version } from '../lib/releases';
         <li>A password session reaches only that one computer.</li>
       </ul>
 
-      <h2>What this doesn’t protect against</h2>
+      <h2 id="limits">What this doesn’t protect against</h2>
       <ul>
         <li>
           <strong>People you give the password to, or accept.</strong> Anyone with your ID and
@@ -120,7 +121,16 @@ import { version } from '../lib/releases';
           audit.
         </li>
       </ul>
-    </div></div>
+    </div>
+      <DocAside
+        sections={[
+        { id: 'server-title', label: "The server, in plain terms" },
+        { id: 'steps-title', label: "What happens when someone connects" },
+        { id: 'password', label: "Your password on your computer" },
+        { id: 'limits', label: "What this doesn’t protect against" },
+        ]}
+      />
+    </div>
   </section>
 </Base>
 
