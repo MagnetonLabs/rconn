@@ -131,7 +131,22 @@ impl Injector for PortalInjector {
 /// Capture one picture through the portal and move the pointer to the screen's middle.
 pub fn selftest() -> anyhow::Result<String> {
     use rconn_media::capture::Capturer as _;
-    let mut cap = rconn_media::capture::portal::PortalCapturer::new()?;
+    // The dialog may sit unanswered for a while: keep waiting (it is asked only once).
+    let asked = Instant::now();
+    let mut cap = loop {
+        match rconn_media::capture::portal::PortalCapturer::new() {
+            Ok(c) => break c,
+            Err(e)
+                if asked.elapsed() < Duration::from_secs(120)
+                    && e.to_string().contains("waiting for someone") =>
+            {
+                eprintln!(
+                    "waiting for the dialog at this computer: allow remote interaction, then Share"
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
     let mut picture = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while picture.is_none() && Instant::now() < deadline {
@@ -146,12 +161,17 @@ pub fn selftest() -> anyhow::Result<String> {
         .lease()
         .map(Lease::stream)
         .ok_or_else(|| anyhow::anyhow!("no portal session for input"))?;
+    anyhow::ensure!(
+        stream.can_control,
+        "captured {w}x{h}, but remote control was not allowed: turn on \"Allow Remote \
+         Interaction\" in the dialog"
+    );
     inj.pointer_move(0.5, 0.5);
     // Let the portal thread deliver the move before the session closes.
     std::thread::sleep(Duration::from_millis(500));
     Ok(format!(
-        "Wayland portal ok: captured {w}x{h} from PipeWire node {}, logical size {:?}; \
-         the pointer was moved to the middle of the screen (check that it did)",
+        "Wayland portal ok: captured {w}x{h} from PipeWire node {}, logical size {:?}, remote \
+         control allowed; the pointer was moved to the middle of the screen (check that it did)",
         stream.node_id, stream.size
     ))
 }

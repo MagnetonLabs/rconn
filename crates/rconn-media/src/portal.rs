@@ -63,6 +63,8 @@ pub struct StreamInfo {
     /// The stream's size in the compositor's logical coordinates (pointer positions use
     /// these), when the portal reports it.
     pub size: Option<(i32, i32)>,
+    /// The person allowed remote control (pointer and keyboard), not only viewing.
+    pub can_control: bool,
 }
 
 /// One input event for the portal (Linux evdev codes).
@@ -403,6 +405,7 @@ async fn open(
     let stream = StreamInfo {
         node_id: first.pipe_wire_node_id(),
         size: first.size(),
+        can_control: granted.contains(DeviceType::POINTER | DeviceType::KEYBOARD),
     };
     tracing::info!(
         generation,
