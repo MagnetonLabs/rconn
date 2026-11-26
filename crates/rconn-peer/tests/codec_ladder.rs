@@ -275,6 +275,106 @@ fn hevc_round_trips_and_is_compared_with_h264() {
     }
 }
 
+/// A lost HEVC frame on the production repair path: the viewer's frame ids show the gap
+/// (`frames::Integrity`), its loss report reaches the encoder as a repair request, and
+/// VideoToolbox (no long-term references wired) answers with a keyframe; the frames in
+/// between are skipped, never shown broken.
+#[test]
+fn a_lost_hevc_frame_is_repaired_with_a_keyframe() {
+    if !rconn_media::vt_encode::encoder_exists(VideoCodec::H265, true) {
+        eprintln!("no hardware HEVC encoder here; skipping");
+        return;
+    }
+    const LOST: usize = 30;
+    let lib = rconn_media::cisco::local_binary_path().expect("Cisco binary path");
+    let mut enc = VideoEncoder::new(
+        &lib,
+        EncoderSettings {
+            bitrate_bps: 2_000_000,
+            max_fps: FPS,
+            threads: 0,
+            slice_bytes: None,
+        },
+    )
+    .expect("encoder");
+    enc.set_codec(VideoCodec::H265);
+    assert!(!enc.supports_ltr(), "VideoToolbox: keyframe repair");
+    let mut dec = VideoDecoder::new(&lib).expect("decoder");
+    dec.set_codec(VideoCodec::H265).expect("HEVC decoder");
+    let mut rx = VideoReceiver::default();
+    rx.set_early_after_gaps(true); // a tagged stream, as the viewer sets it
+    let mut integrity = frames::Integrity::default();
+    let (mut feedback, mut seq) = (Vec::<frames::Feedback>::new(), 0u16);
+    let (mut shown, mut skipped, mut repaired_at) = (0, 0, None);
+    for k in 0..60 {
+        for f in std::mem::take(&mut feedback) {
+            if f.lost {
+                enc.request_ltr_recovery(f.decoded);
+            } else {
+                enc.ltr_acked(f.decoded);
+            }
+        }
+        let frame = desktop(k);
+        let Some(au) = enc.encode(&frame).expect("encode") else {
+            continue;
+        };
+        let info = enc.last_frame();
+        if info.key && k > LOST && repaired_at.is_none() {
+            repaired_at = Some(k);
+        }
+        let au = frames::tag(
+            VideoCodec::H265,
+            au,
+            &FrameTag {
+                id: info.id,
+                key: info.key,
+                recovers_from: info.recovers_from,
+                host_us: 0,
+            },
+        );
+        let mut packets = packetize(VideoCodec::H265, au, k as u32 * 3000, &mut seq);
+        if k == LOST {
+            packets.remove(0); // the frame never completes
+        }
+        for p in packets {
+            for au in rx.push(p) {
+                let (bits, tag) = frames::take(VideoCodec::H265, &au);
+                // What is left of the broken frame may come out without its first
+                // packet (and tag): skipped, as the viewer does.
+                let Some(tag) = tag else {
+                    assert_eq!(k, LOST, "only the broken frame lacks its tag");
+                    integrity.untagged();
+                    skipped += 1;
+                    continue;
+                };
+                if integrity.frame(&tag) == frames::Verdict::Skip {
+                    skipped += 1;
+                    continue;
+                }
+                let pic = dec.decode(&bits).expect("decode").expect("a picture");
+                if k > LOST {
+                    assert!(psnr(&frame.bgra, &pic.to_rgba()) > 25.0, "frame {k} intact");
+                }
+                shown += 1;
+            }
+        }
+        if let Some(f) = integrity.poll(Instant::now()) {
+            feedback.push(f);
+        }
+    }
+    let repaired_at = repaired_at.expect("a keyframe answered the loss");
+    println!(
+        "HEVC loss at frame {LOST}: keyframe at frame {repaired_at}, {skipped} frame(s) \
+         skipped, {shown} shown"
+    );
+    assert!(repaired_at <= LOST + 2, "repaired on the next frame or so");
+    assert!(skipped <= 3, "{skipped} skipped");
+    assert!(
+        (59..=60).contains(&(shown + skipped)),
+        "every other frame arrived"
+    );
+}
+
 /// AV1 as a viewer on Apple silicon with an AV1 decoder (M3 and later): a real-time
 /// screen-content stream (libaom, `aomenc --rt --tune-content=screen`: palette and intra
 /// block copy allowed) through RTP and the viewer's reassembly to VideoToolbox, bit for
