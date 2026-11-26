@@ -129,7 +129,13 @@ fn keyframe_on_request_and_after_bitrate_change() {
         &enc.encode(&synthetic(320, 240, 2)).unwrap().unwrap()
     ));
     enc.set_bitrate(1_000_000);
-    assert!(is_idr(
-        &enc.encode(&synthetic(320, 240, 3)).unwrap().unwrap()
-    ));
+    // openh264 is rebuilt for a new bitrate (a keyframe); VideoToolbox and Media
+    // Foundation change it live.
+    let rebuilt = enc.engine_name() == "openh264";
+    assert_eq!(
+        is_idr(&enc.encode(&synthetic(320, 240, 3)).unwrap().unwrap()),
+        rebuilt,
+        "{}",
+        enc.engine_name()
+    );
 }
