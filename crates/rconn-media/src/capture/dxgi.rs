@@ -69,9 +69,15 @@ pub struct DxgiCapturer {
     started: Instant,
     /// DXGI "access lost" count (logged sparingly).
     access_lost: u32,
+    /// Frames kept on the GPU (see [`gpu`]), when enabled.
+    gpu: Option<gpu::GpuState>,
     /// Move rectangles DXGI reported since the last `take_moves` (picture coordinates).
     moves: Vec<crate::copyrect::Move>,
 }
+
+/// Keeping frames on the GPU for a hardware encoder.
+#[path = "dxgi_gpu.rs"]
+mod gpu;
 
 /// With no first image from DXGI after this long, grab one through GDI instead.
 const FIRST_FRAME_FALLBACK: Duration = Duration::from_millis(500);
@@ -122,6 +128,7 @@ impl DxgiCapturer {
                     want_full: true,
                     started: Instant::now(),
                     access_lost: 0,
+                    gpu: None,
                     moves: Vec::new(),
                 });
             }
@@ -496,6 +503,19 @@ impl DxgiCapturer {
 }
 
 impl Capturer for DxgiCapturer {
+    /// Keep the picture on the GPU, when a hardware encoder can take it from there
+    /// ([`crate::video::VideoEncoder::wants_surfaces`] says so before this is asked).
+    fn use_surfaces(&mut self, max: (usize, usize)) -> bool {
+        self.use_gpu_surfaces(max)
+    }
+
+    fn next_surface(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<(super::Surface, Captured)>, CaptureError> {
+        self.next_gpu_surface(timeout)
+    }
+
     fn next_into(
         &mut self,
         timeout: Duration,

@@ -8,6 +8,8 @@ pub mod capture;
 pub mod cisco;
 pub mod codec;
 pub mod copyrect;
+#[cfg(windows)]
+pub mod d3d11;
 pub mod decode;
 pub mod h264;
 #[cfg(windows)]

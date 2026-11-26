@@ -184,6 +184,10 @@ pub struct VideoEncoder {
     /// Frames since the last long-term mark (Media Foundation).
     #[cfg_attr(not(windows), allow(dead_code))]
     since_mark: u32,
+    /// Windows: the D3D11 device of the surfaces being encoded; engines built while it is
+    /// set read textures on it ([`crate::mf::MfH264Encoder::new_d3d11`]).
+    #[cfg(windows)]
+    gpu: Option<crate::d3d11::GpuDevice>,
 }
 
 impl VideoEncoder {
@@ -228,10 +232,26 @@ impl VideoEncoder {
             last: FrameInfo::default(),
             repair: None,
             since_mark: 0,
+            #[cfg(windows)]
+            gpu: None,
         })
     }
 
     fn build(&mut self, width: usize, height: usize) -> Result<Engine, CodecError> {
+        #[cfg(windows)]
+        if let Some(gpu) = self.gpu.clone() {
+            // Surfaces in: only an encoder that reads textures will do.
+            let mf = crate::mf::MfH264Encoder::new_d3d11(
+                &gpu,
+                width as u32,
+                height as u32,
+                self.settings.max_fps.round().max(1.0) as u32,
+                self.settings.bitrate_bps,
+                crate::d3d11::software_texture_test(),
+            )?;
+            self.engine_name = format!("Media Foundation D3D11 ({})", mf.name());
+            return Ok(Engine::MediaFoundation(mf));
+        }
         #[cfg(target_os = "macos")]
         if !self.software_only {
             match crate::vt_encode::VtEncoder::new(width, height, &self.settings) {
@@ -522,32 +542,11 @@ impl VideoEncoder {
                 if force_key {
                     mf.force_keyframe();
                 }
-                // Long-term references: the keyframe into slot 0 (a keyframe empties
-                // them), then about once a second into a slot not holding the newest
-                // picture the viewer confirmed.
-                let slots = mf.ltr_slots();
-                if slots > 0 && repair.base.is_none() {
-                    let slot = if force_key || self.ledger.newest().is_none() {
-                        Some(0)
-                    } else if self.since_mark >= MF_LTR_PERIOD {
-                        Some(self.ledger.free_slot(slots))
-                    } else {
-                        None
-                    };
-                    if let Some(slot) = slot
-                        && mf.mark_ltr(slot)
-                    {
-                        repair.marked = Some(slot);
-                    }
-                }
+                mf_mark(mf, &self.ledger, self.since_mark, force_key, &mut repair);
                 yuv.write_nv12(&mut self.nv12, changed_rows);
                 let out = mf.encode(&self.nv12)?;
                 self.last_was_key = has_idr(&out);
-                // Where the encoder reports what it did, its word wins.
-                if let Some((m, u)) = mf.last_ltr_info() {
-                    repair.marked = m;
-                    repair.used = Some(u);
-                }
+                mf_report(mf, &mut repair);
                 out
             }
             #[cfg(target_os = "macos")]
@@ -565,9 +564,17 @@ impl VideoEncoder {
         Ok(self.finish(out, force_key, repair))
     }
 
-    /// Can this encoder take the capturer's GPU surfaces as they are (VideoToolbox)?
+    /// Can this encoder take the capturer's GPU surfaces as they are? macOS: VideoToolbox
+    /// can. Windows: is there a hardware encoder that may read D3D11 textures (and has the
+    /// texture path not failed lately)? Whether it really does is found out on the first
+    /// surface; if not, that capture generation ends and the next one uses memory.
     pub fn wants_surfaces(&self) -> bool {
-        cfg!(target_os = "macos") && !self.software_only
+        #[cfg(windows)]
+        return crate::d3d11::texture_path_allowed()
+            && (crate::d3d11::software_texture_test()
+                || crate::mf::MfH264Encoder::hardware_available());
+        #[cfg(not(windows))]
+        return cfg!(target_os = "macos") && !self.software_only;
     }
 
     /// Encode a captured GPU surface. VideoToolbox reads it where it is (no copy); a
@@ -614,8 +621,52 @@ impl VideoEncoder {
             self.yuv = Some(yuv);
             out
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        {
+            let out = self.encode_texture(surface, w, h);
+            if let Err(e) = &out {
+                crate::d3d11::texture_path_failed(&format!("encode: {e}"));
+            }
+            out
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
         match *surface {}
+    }
+
+    /// Windows: convert and encode the desktop texture on the GPU, at `w` x `h`.
+    #[cfg(windows)]
+    fn encode_texture(
+        &mut self,
+        surface: &crate::capture::Surface,
+        w: usize,
+        h: usize,
+    ) -> Result<Option<Vec<u8>>, CodecError> {
+        if self.gpu.as_ref().is_none_or(|g| !g.is(&surface.gpu)) {
+            // A new device (a new capture): encoders of the old one can't read it.
+            self.gpu = Some(surface.gpu.clone());
+            self.encoder = None;
+            self.spare = None;
+        }
+        self.ensure_engine(w, h)?;
+        let (force_key, mut repair) = self.begin_frame();
+        let out = match self.encoder.as_mut().expect("built above") {
+            Engine::MediaFoundation(mf) => {
+                if force_key {
+                    mf.force_keyframe();
+                }
+                mf_mark(mf, &self.ledger, self.since_mark, force_key, &mut repair);
+                let out = mf.encode_frame(&surface.frame)?;
+                mf_report(mf, &mut repair);
+                out
+            }
+            Engine::OpenH264(_) => {
+                return Err(CodecError::OpenH264(
+                    "openh264 can't encode GPU textures".into(),
+                ));
+            }
+        };
+        self.last_was_key = has_idr(&out);
+        Ok(self.finish(out, force_key, repair))
     }
 
     /// Make sure the engine encodes `w` x `h` pictures.
@@ -770,6 +821,45 @@ impl VideoEncoder {
     /// Was the last encoded frame a keyframe? (Keyframes are always slow and large.)
     pub fn last_was_key(&self) -> bool {
         self.last_was_key
+    }
+}
+
+/// Media Foundation long-term references, before a frame goes in: the keyframe into slot
+/// 0 (a keyframe empties them), then about once a second into a slot not holding the
+/// newest picture the viewer confirmed. Not on a repair frame.
+#[cfg(windows)]
+fn mf_mark(
+    mf: &mut crate::mf::MfH264Encoder,
+    ledger: &Ledger,
+    since_mark: u32,
+    force_key: bool,
+    repair: &mut Repair,
+) {
+    let slots = mf.ltr_slots();
+    if slots == 0 || repair.base.is_some() {
+        return;
+    }
+    let slot = if force_key || ledger.newest().is_none() {
+        Some(0)
+    } else if since_mark >= MF_LTR_PERIOD {
+        Some(ledger.free_slot(slots))
+    } else {
+        None
+    };
+    if let Some(slot) = slot
+        && mf.mark_ltr(slot)
+    {
+        repair.marked = Some(slot);
+    }
+}
+
+/// After a Media Foundation frame: where the encoder reports what it marked and
+/// predicted from, its word wins.
+#[cfg(windows)]
+fn mf_report(mf: &crate::mf::MfH264Encoder, repair: &mut Repair) {
+    if let Some((m, u)) = mf.last_ltr_info() {
+        repair.marked = m;
+        repair.used = Some(u);
     }
 }
 

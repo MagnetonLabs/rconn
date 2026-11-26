@@ -8,6 +8,7 @@ mod awake;
 mod cursor;
 mod display;
 mod files;
+mod gpu_selftest;
 mod hostkind;
 mod indicator;
 mod input;
@@ -46,14 +47,18 @@ struct Cli {
     /// it back, then exit. With --state-dir, the portal restore token there is used.
     #[arg(long, value_name = "WxH", conflicts_with = "selftest_input")]
     selftest_fit: Option<String>,
+    /// Windows: time N frames through the memory and the GPU capture -> encode paths
+    /// (a test window animates the screen meanwhile), print the numbers, then exit.
+    #[arg(long, value_name = "N", conflicts_with_all = ["selftest_input", "selftest_fit"])]
+    selftest_gpu: Option<usize>,
     /// Signaling WebSocket URL, e.g. wss://rconn.example.com/v1/ws
-    #[arg(long, env = "RCONN_SERVER", required_unless_present_any = ["selftest_input", "selftest_fit"])]
+    #[arg(long, env = "RCONN_SERVER", required_unless_present_any = ["selftest_input", "selftest_fit", "selftest_gpu"])]
     server: Option<String>,
     /// Server identity this host was enrolled for (bound into the auth proof).
     #[arg(
         long,
         env = "RCONN_SERVER_ID",
-        required_unless_present_any = ["selftest_input", "selftest_fit"]
+        required_unless_present_any = ["selftest_input", "selftest_fit", "selftest_gpu"]
     )]
     server_id: Option<String>,
     /// Pinned server key (`sha256:...` from `rconn-signaling init`). Omit for servers
@@ -69,7 +74,7 @@ struct Cli {
     #[arg(
         long,
         env = "RCONN_IDENTITY_DIR",
-        required_unless_present_any = ["selftest_input", "selftest_fit"]
+        required_unless_present_any = ["selftest_input", "selftest_fit", "selftest_gpu"]
     )]
     identity: Option<PathBuf>,
     /// Cisco openh264 library. Default: next to this executable.
@@ -160,6 +165,19 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.selftest_input {
         println!("{}", input::selftest()?);
+        return Ok(());
+    }
+    if let Some(n) = cli.selftest_gpu {
+        let openh264 = cli.openh264_path()?;
+        let (mw, mh) = cli
+            .max_size
+            .split_once('x')
+            .context("--max-size must look like 1920x1080")?;
+        let max = (mw.parse()?, mh.parse()?);
+        println!(
+            "{}",
+            tokio::task::spawn_blocking(move || gpu_selftest::run(n, &openh264, max)).await??
+        );
         return Ok(());
     }
     if let Some(size) = &cli.selftest_fit {

@@ -284,9 +284,10 @@ fn run_generation(
     // Frame ids run on from the previous capture; the viewer acknowledges by id.
     let first_id = ctx.next_id.load(Ordering::Relaxed);
     enc.start_frame_ids_at(first_id);
-    // A hardware encoder that reads the capturer's GPU surfaces (macOS VideoToolbox) gets
-    // them as they are: no CPU conversion, and no half-size motion frames (a CPU saving it
-    // doesn't need).
+    // A hardware encoder that reads the capturer's GPU surfaces (macOS VideoToolbox;
+    // Windows: a D3D11-aware Media Foundation encoder, fed by the GPU's video processor)
+    // gets them as they are: no CPU conversion, and no half-size motion frames (a CPU
+    // saving it doesn't need). Otherwise pictures are converted in memory, as before.
     let surfaces = enc.wants_surfaces() && cap.use_surfaces(cfg.max_size);
     let mut surface: Option<Surface> = None;
     let mut picture: Option<I420> = None;

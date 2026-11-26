@@ -30,11 +30,16 @@ pub mod x11;
 #[cfg(target_os = "macos")]
 pub use macos::Surface;
 
-/// A captured picture still on the GPU. Only macOS has them so far.
-#[cfg(not(target_os = "macos"))]
+/// A captured picture still on the GPU, converted and encoded there (Windows: the
+/// desktop as a D3D11 texture, for a D3D11-aware hardware encoder).
+#[cfg(windows)]
+pub use crate::d3d11::Surface;
+
+/// A captured picture still on the GPU. Only macOS and Windows have them so far.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub enum Surface {}
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 impl Surface {
     pub fn dimensions(&self) -> (usize, usize) {
         match *self {}
