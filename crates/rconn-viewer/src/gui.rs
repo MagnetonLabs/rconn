@@ -1223,21 +1223,36 @@ impl ViewerApp {
         }
     }
 
+    /// The toolbar's stats: a short first line (shown in the bar), then one line per
+    /// detail (shown in its drop-down).
     fn stats(&self, fps: f32, kbps: f32, times: StageMs) -> String {
+        let Some([w, h]) = self.frame_size else {
+            return "connecting…".into();
+        };
+        let rate = if kbps >= 1000.0 {
+            format!("{:.1} Mbps", kbps / 1000.0)
+        } else {
+            format!("{kbps:.0} kbps")
+        };
         // Per-frame time in each stage: host (capture to encoded), receive (first to
         // last packet), decode, upload.
-        let host = times
-            .host
-            .map_or(String::new(), |h| format!("host {h:.1} + "));
-        match self.frame_size {
-            Some([w, h]) => format!(
-                "{w}x{h}  ·  {fps:.0} fps  ·  {kbps:.0} kbps  ·  {host}receive {:.1} + decode {:.1} + upload {:.1} ms",
-                times.receive,
-                times.decode,
-                self.video.upload_ms()
-            ),
-            None => "connecting…".into(),
+        let upload = self.video.upload_ms();
+        let mut total = times.receive + times.decode + upload;
+        let mut lines = vec![
+            format!("{fps:.0} fps · {rate}"),
+            format!("Picture   {w} x {h}"),
+            format!("Frames    {fps:.0} per second"),
+            format!("Data      {rate}"),
+        ];
+        if let Some(host) = times.host {
+            total += host;
+            lines.push(format!("Host      {host:.1} ms"));
         }
+        lines.push(format!("Receive   {:.1} ms", times.receive));
+        lines.push(format!("Decode    {:.1} ms", times.decode));
+        lines.push(format!("Upload    {upload:.1} ms"));
+        lines.push(format!("Total     {total:.1} ms per frame"));
+        lines.join("\n")
     }
 
     /// The toolbar itself (docked in a window, floating in full screen).
@@ -1344,7 +1359,23 @@ impl ViewerApp {
                 .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
         }
         ui.separator();
-        ui.label(egui::RichText::new(stats).color(Color32::GRAY).monospace());
+        let mut lines = stats.lines();
+        let summary = lines.next().unwrap_or_default();
+        let details: Vec<&str> = lines.collect();
+        if details.is_empty() {
+            ui.label(egui::RichText::new(summary).color(Color32::GRAY));
+        } else {
+            ui.menu_button(
+                egui::RichText::new(format!("📶 {summary}")).color(Color32::GRAY),
+                |ui| {
+                    for line in &details {
+                        ui.label(egui::RichText::new(*line).monospace());
+                    }
+                },
+            )
+            .response
+            .on_hover_text("Connection details");
+        }
         ui.separator();
         let bye = egui::Button::new(egui::RichText::new("❌ Disconnect").color(Color32::WHITE))
             .fill(DANGER);
