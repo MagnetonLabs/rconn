@@ -10,15 +10,24 @@
 //!    video processor against the CPU conversion.
 //!
 //! Each path's output is decoded with openh264 and compared with the desktop.
+//!
+//! Linux (openh264 / va-upload / va-zerocopy): [`linux`].
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn run(
     _frames: usize,
     _openh264: &std::path::Path,
     _max: (usize, usize),
 ) -> anyhow::Result<String> {
-    anyhow::bail!("--selftest-gpu is for Windows hosts")
+    anyhow::bail!("--selftest-gpu is for Windows and Linux hosts")
 }
+
+#[cfg(target_os = "linux")]
+#[path = "gpu_selftest_linux.rs"]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub use linux::run;
 
 #[cfg(windows)]
 pub use imp::run;
