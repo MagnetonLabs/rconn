@@ -1,14 +1,18 @@
-//! Video over WebRTC: H.264 codec registration, send-side congestion control (GCC) with
-//! its estimate published for the encoder, and the H.264 track on each side.
+//! Video over WebRTC: H.264 codec registration, send-side congestion control ([`Bwe`])
+//! with its estimate published for the encoder, and the H.264 track on each side.
 
+use crate::bwe::{Bwe, PACING_FACTOR};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use rtc::interceptor::{BandwidthEstimator, EstimatorStats, Gcc, PacketReport, Registry};
+use rtc::interceptor::{
+    BandwidthEstimator, CongestionControlBuilder, EstimatorStats, PacerBuilder, PacketReport,
+    Registry, Slot, TwccReceiverBuilder, TwccSenderBuilder,
+};
 use rtc::media::Sample;
 use rtc::media::io::sample_builder::SampleBuilder;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::{
-    CongestionFeedback, configure_congestion_control, register_default_interceptors,
+    configure_twcc_receiver_only, register_default_interceptors,
 };
 use rtc::peer_connection::configuration::media_engine::{
     MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine,
@@ -38,6 +42,17 @@ pub const MIN_BITRATE_BPS: f64 = 300_000.0;
 /// control lowers it within a few round trips on a slow link.
 pub const START_BITRATE_BPS: f64 = 8_000_000.0;
 pub const MAX_BITRATE_BPS: f64 = 25_000_000.0;
+/// The encoder aims at this share of the estimate; the rest is room for retransmissions,
+/// sound and the encoder's own overshoot.
+pub const ENCODER_SHARE: f64 = 0.9;
+/// What sound takes of the estimate (Opus at its usual rate), bits/s.
+const AUDIO_BPS: f64 = 64_000.0;
+/// The most the pacer sends back-to-back, bits: four full packets. `rtc`'s default is
+/// 100 ms of the rate, a line-rate burst of ~125 KB at 10 Mb/s after any idle moment,
+/// which the bottleneck queues and the delay detector reads as congestion.
+pub const PACER_BURST_BITS: f64 = 4.0 * 1200.0 * 8.0;
+/// How often the viewer reports arrivals (`rtc`'s default is 100 ms).
+const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 
 pub const OPUS_PAYLOAD_TYPE: u8 = 111;
 
@@ -61,10 +76,12 @@ fn h264() -> RTCRtpCodec {
     }
 }
 
-/// Latest congestion-control estimate in bits/s, shared with the encoder loop.
+/// Latest congestion-control result, shared with the encoder loop: the encoder's target
+/// ([`Self::get`]) and the estimate it is derived from ([`Self::estimate`]), bits/s.
 #[derive(Clone)]
 pub struct TargetBitrate {
     value: Arc<AtomicU64>,
+    estimate: Arc<AtomicU64>,
     shield: Arc<Mutex<Option<Shield>>>,
 }
 
@@ -84,15 +101,28 @@ struct Shield {
 }
 
 impl TargetBitrate {
-    fn new(bps: f64) -> Self {
+    fn new(estimate: f64) -> Self {
         Self {
-            value: Arc::new(AtomicU64::new(bps.to_bits())),
+            value: Arc::new(AtomicU64::new(encoder_target(estimate).to_bits())),
+            estimate: Arc::new(AtomicU64::new(estimate.to_bits())),
             shield: Arc::default(),
         }
     }
 
+    /// What the encoder should aim at, bits/s.
     pub fn get(&self) -> f64 {
         f64::from_bits(self.value.load(Ordering::Relaxed))
+    }
+
+    /// The bandwidth estimate itself, bits/s (logs).
+    pub fn estimate(&self) -> f64 {
+        f64::from_bits(self.estimate.load(Ordering::Relaxed))
+    }
+
+    fn store(&self, estimate: f64) {
+        self.estimate.store(estimate.to_bits(), Ordering::Relaxed);
+        self.value
+            .store(encoder_target(estimate).to_bits(), Ordering::Relaxed);
     }
 
     /// The host is about to cause a burst on purpose (the screen changes size: a new
@@ -128,13 +158,68 @@ impl TargetBitrate {
     }
 }
 
-/// GCC wrapped so every estimate update is published to [`TargetBitrate`], and held up
-/// through a deliberate burst ([`TargetBitrate::shield`]).
+/// The encoder's share of an estimate.
+fn encoder_target(estimate: f64) -> f64 {
+    (estimate * ENCODER_SHARE - AUDIO_BPS).max(MIN_BITRATE_BPS)
+}
+
+/// The estimator wrapped so every update is published to [`TargetBitrate`], held up
+/// through a deliberate burst ([`TargetBitrate::shield`]), and the pacer runs at
+/// [`PACING_FACTOR`] x the estimate.
 struct Reporting<E: BandwidthEstimator> {
     inner: E,
     /// A fresh estimator starting at the given bits/s.
     restart: fn(f64) -> E,
     target: TargetBitrate,
+    drops: DropLog,
+}
+
+/// Logs large estimate drops and how long the estimate takes to come back: the measure
+/// for self-inflicted collapses (a drop by more than half, then the time to 90 %).
+#[derive(Default)]
+struct DropLog {
+    /// (when, estimate) over the last two seconds.
+    recent: VecDeque<(Instant, f64)>,
+    /// A drop in progress: the estimate before it, and when it happened.
+    open: Option<(f64, Instant)>,
+}
+
+impl DropLog {
+    fn note(&mut self, now: Instant, estimate: f64) {
+        if let Some((before, at)) = self.open {
+            if estimate >= 0.9 * before {
+                tracing::info!(
+                    to_kbps = (estimate / 1000.0) as u64,
+                    after_ms = now.saturating_duration_since(at).as_millis() as u64,
+                    "bandwidth estimate recovered to 90% of its level before the drop"
+                );
+                self.open = None;
+            }
+        } else if let Some(peak) = self.recent.iter().map(|&(_, e)| e).reduce(f64::max)
+            && estimate < 0.5 * peak
+        {
+            tracing::warn!(
+                from_kbps = (peak / 1000.0) as u64,
+                to_kbps = (estimate / 1000.0) as u64,
+                "bandwidth estimate dropped by more than half"
+            );
+            self.open = Some((peak, now));
+        }
+        if self
+            .recent
+            .back()
+            .is_none_or(|&(t, _)| now >= t + Duration::from_millis(50))
+        {
+            self.recent.push_back((now, estimate));
+        }
+        while self
+            .recent
+            .front()
+            .is_some_and(|&(t, _)| now.saturating_duration_since(t) > Duration::from_secs(2))
+        {
+            self.recent.pop_front();
+        }
+    }
 }
 
 impl<E: BandwidthEstimator> Reporting<E> {
@@ -152,9 +237,8 @@ impl<E: BandwidthEstimator> Reporting<E> {
                 *self.target.shield.lock().expect("shield") = None;
             }
         }
-        self.target
-            .value
-            .store(estimate.to_bits(), Ordering::Relaxed);
+        self.target.store(estimate);
+        self.drops.note(now, estimate);
     }
 }
 
@@ -163,8 +247,9 @@ impl<E: BandwidthEstimator> BandwidthEstimator for Reporting<E> {
         self.inner.on_reports(now, reports);
         self.publish(now);
     }
+    /// What the pacer is asked for.
     fn target_bitrate(&self) -> f64 {
-        self.target.get()
+        self.target.estimate() * PACING_FACTOR
     }
     fn handle_timeout(&mut self, now: Instant) {
         self.inner.handle_timeout(now);
@@ -178,7 +263,7 @@ impl<E: BandwidthEstimator> BandwidthEstimator for Reporting<E> {
     }
 }
 
-/// Media engine (H.264) and interceptors (NACK, reports, TWCC + GCC + pacer).
+/// Media engine (H.264) and interceptors (NACK, reports, TWCC + [`Bwe`] + pacer).
 pub fn media_stack() -> Result<(MediaEngine, Registry, TargetBitrate)> {
     let mut engine = MediaEngine::default();
     engine.register_codec(
@@ -196,16 +281,42 @@ pub fn media_stack() -> Result<(MediaEngine, Registry, TargetBitrate)> {
         RtpCodecKind::Audio,
     )?;
     let registry = register_default_interceptors(Registry::new(), &mut engine)?;
-    let gcc = |start| Gcc::new(start, MIN_BITRATE_BPS, MAX_BITRATE_BPS);
-    let inner = gcc(START_BITRATE_BPS);
+    let bwe = |start| Bwe::new(start, MIN_BITRATE_BPS, MAX_BITRATE_BPS);
+    let inner = bwe(START_BITRATE_BPS);
     let target = TargetBitrate::new(inner.target_bitrate());
     let estimator = Reporting {
         inner,
-        restart: gcc,
+        restart: bwe,
         target: target.clone(),
+        drops: DropLog::default(),
     };
-    let registry =
-        configure_congestion_control(registry, estimator, CongestionFeedback::Twcc, &mut engine)?;
+    let pacing = estimator.target_bitrate();
+    // What `configure_congestion_control` sets up, with the pacer and the feedback
+    // interval configured: the transport-wide CC feedback type and header extension in
+    // the media engine (registered by the receiver-only helper; its chain is not used),
+    // then send history, sequence numbers, pacer and arrival recorder.
+    configure_twcc_receiver_only(Registry::new(), &mut engine)?;
+    let registry = registry
+        .with(
+            Slot::CongestionControl,
+            CongestionControlBuilder::new(estimator).build(),
+        )
+        .with(Slot::TwccSender, TwccSenderBuilder::new().build())
+        .with(
+            Slot::Pacer,
+            // Start at the starting estimate, not `rtc`'s 1 Mb/s: the first keyframe goes
+            // out before any feedback.
+            PacerBuilder::new()
+                .with_target_bitrate(pacing)
+                .with_burst_bits(PACER_BURST_BITS)
+                .build(),
+        )
+        .with(
+            Slot::TwccReceiver,
+            TwccReceiverBuilder::new()
+                .with_interval(FEEDBACK_INTERVAL)
+                .build(),
+        );
     Ok((engine, registry, target))
 }
 
@@ -647,22 +758,28 @@ mod shield_tests {
             inner: Falls(8_000_000.0),
             restart: Falls,
             target: target.clone(),
+            drops: DropLog::default(),
         };
         target.shield(Duration::from_millis(500));
         let now = Instant::now();
         r.on_reports(now, &[]);
-        assert_eq!(target.get(), 8_000_000.0, "held during the window");
-        assert_eq!(r.target_bitrate(), 8_000_000.0, "the pacer sees the same");
+        assert_eq!(target.estimate(), 8_000_000.0, "held during the window");
+        assert_eq!(target.get(), encoder_target(8_000_000.0));
+        assert_eq!(
+            r.target_bitrate(),
+            8_000_000.0 * PACING_FACTOR,
+            "the pacer sees the same"
+        );
         // The window ends with the estimate still down: it restarts from before.
         r.handle_timeout(now + Duration::from_secs(1));
-        assert_eq!(target.get(), 8_000_000.0);
+        assert_eq!(target.estimate(), 8_000_000.0);
         assert_eq!(
             r.inner.0, 8_000_000.0,
             "estimator restarted at the old value"
         );
         // Afterwards congestion control is in charge again.
         r.on_reports(now + Duration::from_secs(2), &[]);
-        assert_eq!(target.get(), 1_000_000.0);
+        assert_eq!(target.estimate(), 1_000_000.0);
     }
 
     #[test]
@@ -672,9 +789,11 @@ mod shield_tests {
             inner: Falls(8_000_000.0),
             restart: Falls,
             target: target.clone(),
+            drops: DropLog::default(),
         };
         r.on_reports(Instant::now(), &[]);
-        assert_eq!(target.get(), 1_000_000.0);
+        assert_eq!(target.estimate(), 1_000_000.0);
+        assert_eq!(target.get(), encoder_target(1_000_000.0));
     }
 }
 

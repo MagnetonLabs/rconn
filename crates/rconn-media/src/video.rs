@@ -1,6 +1,9 @@
 //! H.264 encode/decode for screen content, on Cisco's openh264.
 
 use crate::codec::CodecError;
+use crate::h264::SyntaxTracker;
+pub use crate::recovery::FrameInfo;
+use crate::recovery::{Ledger, Sent};
 use crate::yuv::I420;
 use openh264::OpenH264API;
 use openh264::decoder::{Decoder, DecoderConfig};
@@ -104,12 +107,29 @@ impl Default for EncoderSettings {
 /// openh264), low complexity, keyframes only on request, frame skipping under pressure.
 /// The H.264 encoder doing the work.
 enum Engine {
-    OpenH264(Box<Encoder>),
+    OpenH264(Box<OpenH264>),
     /// Windows' built-in encoder: 3.5-7x faster than openh264 on a measured 8-core VM,
     /// and the GPU's encoder where a vendor registers one.
     #[cfg(windows)]
     MediaFoundation(crate::mf::MfH264Encoder),
 }
+
+/// An openh264 encoder and the rate it was last told.
+struct OpenH264 {
+    encoder: Encoder,
+    /// Bits/s last applied (at build, or live with [`crate::oh264::set_bitrate`]).
+    bps: u32,
+    /// Has encoded a frame: openh264 initializes on its first frame, and options set
+    /// before that are lost.
+    started: bool,
+    /// Built in long-term-reference mode (see [`VideoEncoder::set_long_term_refs`]).
+    ltr: bool,
+}
+
+/// Frames between long-term reference marks on Media Foundation (~1 s at 30 fps; openh264
+/// marks every 30 frames on its own).
+#[cfg(windows)]
+const MF_LTR_PERIOD: u32 = 30;
 
 pub struct VideoEncoder {
     api_path: std::path::PathBuf,
@@ -129,6 +149,18 @@ pub struct VideoEncoder {
     scale: f32,
     last_was_key: bool,
     force_key: bool,
+    /// openh264 in long-term-reference mode for engines built from now on.
+    openh264_ltr: bool,
+    /// Reads our own output: frame numbers and reference marks for loss repair.
+    syntax: SyntaxTracker,
+    ledger: Ledger,
+    /// Id of the next frame out.
+    next_id: u32,
+    last: FrameInfo,
+    /// A loss was reported after this frame: repair at the next encode.
+    repair: Option<u32>,
+    /// Frames since the last long-term mark (Media Foundation).
+    since_mark: u32,
 }
 
 impl VideoEncoder {
@@ -152,6 +184,13 @@ impl VideoEncoder {
             scale: 1.0,
             last_was_key: false,
             force_key: false,
+            openh264_ltr: std::env::var("RCONN_OPENH264_LTR").is_ok_and(|v| v == "1"),
+            syntax: SyntaxTracker::default(),
+            ledger: Ledger::default(),
+            next_id: 0,
+            last: FrameInfo::default(),
+            repair: None,
+            since_mark: 0,
         })
     }
 
@@ -171,16 +210,32 @@ impl VideoEncoder {
                 tracing::warn!(error = %e, "Media Foundation encoder unavailable; using openh264")
             }
         }
-        self.engine_name = "openh264".into();
-        Ok(Engine::OpenH264(Box::new(
-            self.build_openh264(width, height)?,
-        )))
+        self.engine_name = if self.openh264_ltr {
+            "openh264 (long-term references)".into()
+        } else {
+            "openh264".into()
+        };
+        Ok(Engine::OpenH264(Box::new(OpenH264 {
+            encoder: self.build_openh264(width, height)?,
+            bps: self.settings.bitrate_bps,
+            started: false,
+            ltr: self.openh264_ltr,
+        })))
     }
 
     fn build_openh264(&self, width: usize, height: usize) -> Result<Encoder, CodecError> {
         let api: OpenH264API = crate::codec::load_openh264(&self.api_path)?;
+        // Long-term references (loss repair without a keyframe) only work in openh264's
+        // camera mode: in screen mode it switches them off ("not supported yet"). Camera
+        // mode measured 3.7x faster per frame, ~25 % more bytes on scrolling and static
+        // text (see `ltr_tests`), so it is opt-in: `RCONN_OPENH264_LTR=1`.
+        let (usage, ltr) = if self.openh264_ltr {
+            (UsageType::CameraVideoRealTime, true)
+        } else {
+            (UsageType::ScreenContentRealTime, false)
+        };
         let cfg = EncoderConfig::new()
-            .usage_type(UsageType::ScreenContentRealTime)
+            .usage_type(usage)
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(self.settings.bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(self.settings.max_fps))
@@ -192,6 +247,9 @@ impl VideoEncoder {
             .adaptive_quantization(false)
             .background_detection(false)
             .skip_frames(true)
+            .long_term_reference(ltr)
+            // Camera mode would add IDRs of its own on big changes (scrolling).
+            .scene_change_detect(!ltr)
             // Keyframes come from RequestKeyframe/PLI, not a timer.
             .intra_frame_period(IntraFramePeriod::from_num_frames(0))
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
@@ -223,23 +281,112 @@ impl VideoEncoder {
         self.settings
     }
 
-    /// Change the target bitrate. Rebuilding costs one keyframe, so callers should only do
-    /// it on meaningful changes (see `should_retarget`).
+    /// Change the target bitrate, live on every engine: no restart, no keyframe. (Before
+    /// 0.1.6 openh264 was rebuilt for it, and every retarget cost a full-size IDR.)
     pub fn set_bitrate(&mut self, bps: u32) {
         if bps == self.settings.bitrate_bps {
             return;
         }
         self.settings.bitrate_bps = bps;
+        self.apply_bitrate();
+    }
+
+    /// Bring the current engine to the configured bitrate (also after switching to the
+    /// spare encoder, which may have an older one).
+    fn apply_bitrate(&mut self) {
+        let bps = self.settings.bitrate_bps;
         match &mut self.encoder {
+            Some(Engine::OpenH264(o)) if o.started && o.bps != bps => {
+                if crate::oh264::set_bitrate(&mut o.encoder, o.bps, bps) {
+                    o.bps = bps;
+                } else {
+                    tracing::warn!(bps, "openh264 refused a live bitrate change");
+                    o.bps = bps; // don't retry every frame; the next change tries again
+                }
+            }
             #[cfg(windows)]
             Some(Engine::MediaFoundation(mf)) => mf.set_bitrate(bps), // live, no keyframe
-            _ => self.encoder = None, // openh264: rebuilt lazily; the first frame out is an IDR
+            _ => {}
         }
     }
 
     /// Which encoder is in use ("Media Foundation (...)" or "openh264").
     pub fn engine_name(&self) -> &str {
         &self.engine_name
+    }
+
+    /// openh264 engines built from now on use long-term references (camera mode), so
+    /// losses can be repaired without a keyframe. Default: `RCONN_OPENH264_LTR=1`.
+    pub fn set_long_term_refs(&mut self, on: bool) {
+        self.openh264_ltr = on;
+    }
+
+    /// Can a reported loss be repaired without a keyframe ([`Self::request_ltr_recovery`])?
+    pub fn supports_ltr(&self) -> bool {
+        match &self.encoder {
+            Some(Engine::OpenH264(o)) => o.ltr,
+            #[cfg(windows)]
+            Some(Engine::MediaFoundation(mf)) => mf.ltr_slots() > 0,
+            None => self.openh264_ltr,
+        }
+    }
+
+    /// Frame ids continue from `id` (a new encoder within the same stream).
+    pub fn start_frame_ids_at(&mut self, id: u32) {
+        self.next_id = id;
+    }
+
+    /// The last frame put out by [`Self::encode_yuv`] / [`Self::encode`].
+    pub fn last_frame(&self) -> FrameInfo {
+        self.last
+    }
+
+    /// The viewer decoded every frame up to `id` with nothing missing: the long-term
+    /// references among them may be predicted from.
+    pub fn ltr_acked(&mut self, id: u32) {
+        for s in self.ledger.ack(id) {
+            // openh264 trusts an IDR on its own; later marks need the viewer's word, by
+            // the frame number of the picture marked (with delayed marking, an earlier one).
+            if let (Some(Engine::OpenH264(o)), Some(slice)) = (&mut self.encoder, s.slice)
+                && o.ltr
+                && !slice.idr
+                && let Some(marked) = slice.marks_long_term
+            {
+                crate::oh264::ltr_received(&mut o.encoder, slice.idr_pic_id, marked);
+            }
+        }
+    }
+
+    /// The viewer lost frames after `last_good`: the next frame repairs it by predicting
+    /// from a long-term reference the viewer has, or is an IDR if there is none.
+    pub fn request_ltr_recovery(&mut self, last_good: u32) {
+        self.repair = Some(last_good);
+    }
+
+    /// Plan the repair for the frame about to be encoded: `Some(base)` if it will predict
+    /// from long-term reference `base`, `None` if it must be a keyframe.
+    fn plan_repair(&mut self, last_good: u32) -> Option<Sent> {
+        self.ledger.loss_after(last_good);
+        let good = *self.ledger.get(last_good)?;
+        if good.instance != self.ledger.instance() {
+            return None; // from an encoder since replaced
+        }
+        let base = self.ledger.base_for(last_good)?;
+        match self.encoder.as_mut()? {
+            Engine::OpenH264(o) if o.ltr => {
+                let (good, newest) = (good.slice?, self.ledger.newest()?.slice?);
+                crate::oh264::ltr_recover(
+                    &mut o.encoder,
+                    good.idr_pic_id,
+                    good.frame_num,
+                    newest.frame_num,
+                );
+                Some(base)
+            }
+            #[cfg(windows)]
+            Engine::MediaFoundation(mf) => mf.use_ltr(base.ltr_slot?).then_some(base),
+            _ => None,
+        }
     }
 
     /// Encode one frame into an Annex-B access unit. `None` means the rate controller
@@ -290,35 +437,82 @@ impl VideoEncoder {
             self.encoder = Some(engine);
             self.dims = Some((w, h));
             self.nv12.clear(); // forces a full NV12 rewrite
-            // A kept encoder may still have an older bitrate.
-            #[cfg(windows)]
-            if let Some(Engine::MediaFoundation(mf)) = &mut self.encoder {
-                mf.set_bitrate(self.settings.bitrate_bps);
-            }
+            self.ledger.new_instance();
+            self.since_mark = 0;
         }
-        let force_key = std::mem::take(&mut self.force_key);
-        let out = match self.encoder.as_mut().expect("built above") {
-            Engine::OpenH264(encoder) => {
-                if force_key {
-                    encoder.force_intra_frame();
+        // A kept encoder may still have an older bitrate.
+        self.apply_bitrate();
+        let asked = self.repair.take();
+        let base = match asked {
+            Some(last_good) => {
+                let base = self.plan_repair(last_good);
+                if base.is_none() {
+                    self.force_key = true; // nothing to repair from
                 }
-                let bits = encoder
+                base
+            }
+            None => None,
+        };
+        let force_key = std::mem::take(&mut self.force_key);
+        // Media Foundation: the slot this frame was marked into, and the slots the encoder
+        // says it predicted from.
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let (mut marked, mut used): (Option<u8>, Option<u16>) = (None, None);
+        let out = match self.encoder.as_mut().expect("built above") {
+            Engine::OpenH264(o) => {
+                if force_key {
+                    o.encoder.force_intra_frame();
+                }
+                let bits = o
+                    .encoder
                     .encode(yuv)
                     .map_err(|e| CodecError::OpenH264(e.to_string()))?;
                 self.last_was_key = matches!(
                     bits.frame_type(),
                     openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
                 );
-                bits.to_vec()
+                let out = bits.to_vec();
+                if !o.started {
+                    o.started = true;
+                    // Set before the first frame, a live rate would have been lost.
+                    let bps = self.settings.bitrate_bps;
+                    if o.bps != bps && crate::oh264::set_bitrate(&mut o.encoder, o.bps, bps) {
+                        o.bps = bps;
+                    }
+                }
+                out
             }
             #[cfg(windows)]
             Engine::MediaFoundation(mf) => {
                 if force_key {
                     mf.force_keyframe();
                 }
+                // Long-term references: the keyframe into slot 0 (a keyframe empties
+                // them), then about once a second into a slot not holding the newest
+                // picture the viewer confirmed.
+                let slots = mf.ltr_slots();
+                if slots > 0 && base.is_none() {
+                    let slot = if force_key || self.ledger.newest().is_none() {
+                        Some(0)
+                    } else if self.since_mark >= MF_LTR_PERIOD {
+                        Some(self.ledger.free_slot(slots))
+                    } else {
+                        None
+                    };
+                    if let Some(slot) = slot
+                        && mf.mark_ltr(slot)
+                    {
+                        marked = Some(slot);
+                    }
+                }
                 yuv.write_nv12(&mut self.nv12, changed_rows);
                 let out = mf.encode(&self.nv12)?;
                 self.last_was_key = has_idr(&out);
+                // Where the encoder reports what it did, its word wins.
+                if let Some((m, u)) = mf.last_ltr_info() {
+                    marked = m;
+                    used = Some(u);
+                }
                 out
             }
         };
@@ -341,7 +535,67 @@ impl VideoEncoder {
             }
         }
         let out = with_headers(out, &mut self.headers);
-        Ok(if out.is_empty() { None } else { Some(out) })
+        if out.is_empty() {
+            if base.is_some() {
+                self.repair = asked; // the repair frame was skipped: again next frame
+            }
+            return Ok(None);
+        }
+        self.note_output(&out, base, marked, used);
+        Ok(Some(out))
+    }
+
+    /// Record a frame that went out: its id, what it references, for repairs to come.
+    fn note_output(
+        &mut self,
+        out: &[u8],
+        base: Option<Sent>,
+        marked: Option<u8>,
+        used: Option<u16>,
+    ) {
+        let slice = self.syntax.access_unit(out);
+        let key = self.last_was_key;
+        let ltr_slot = match &self.encoder {
+            Some(Engine::OpenH264(o)) if o.ltr => slice.and_then(|s| s.marks_long_term).map(|_| 0),
+            _ => marked,
+        };
+        let recovers_from = match (base, &self.encoder) {
+            (_, _) if key => None,
+            (None, _) => None,
+            // openh264 says in the bitstream whether it predicted from a long-term picture.
+            (Some(b), Some(Engine::OpenH264(_))) => {
+                slice.filter(|s| s.refs_long_term).map(|_| b.id)
+            }
+            // Media Foundation, where it reports the slots it used.
+            (Some(b), _) => {
+                let slot = b.ltr_slot.unwrap_or(0);
+                used.is_none_or(|u| u & (1 << slot) != 0).then_some(b.id)
+            }
+        };
+        if base.is_some() && !key && recovers_from.is_none() {
+            // The encoder did not honour the repair: the viewer still has a broken picture.
+            tracing::warn!(engine = %self.engine_name, "loss repair not taken; sending a keyframe");
+            self.force_key = true;
+        }
+        if marked.is_some() || key {
+            self.since_mark = 0;
+        } else {
+            self.since_mark += 1;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.ledger.record(Sent {
+            id,
+            instance: self.ledger.instance(),
+            key,
+            slice,
+            ltr_slot,
+        });
+        self.last = FrameInfo {
+            id,
+            key,
+            recovers_from,
+        };
     }
 
     /// Was the last encoded frame a keyframe? (Keyframes are always slow and large.)
@@ -427,11 +681,11 @@ fn with_headers(out: Vec<u8>, headers: &mut Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// Should a bandwidth estimate move the encoder? Only on a >25% change, so GCC jitter
-/// doesn't trigger a keyframe storm.
+/// Should a bandwidth estimate move the encoder? Changes are live (no keyframe) on every
+/// engine, so anything beyond estimator jitter (5 %) is followed.
 pub fn should_retarget(current_bps: u32, estimate_bps: u32) -> bool {
     let (c, e) = (f64::from(current_bps), f64::from(estimate_bps));
-    c > 0.0 && ((e - c).abs() / c) > 0.25
+    c > 0.0 && ((e - c).abs() / c) > 0.05
 }
 
 /// A decoded frame, RGBA.
@@ -607,7 +861,8 @@ mod tests {
 
     #[test]
     fn retarget_threshold() {
-        assert!(!should_retarget(4_000_000, 4_500_000));
+        assert!(!should_retarget(4_000_000, 4_150_000));
+        assert!(should_retarget(4_000_000, 4_500_000));
         assert!(should_retarget(4_000_000, 2_000_000));
         assert!(should_retarget(4_000_000, 6_000_000));
         assert!(!should_retarget(0, 1));
@@ -701,6 +956,216 @@ mod usage_bench {
             println!(
                 "{usage:?}: {:.1} ms/frame",
                 t.elapsed().as_secs_f64() * 1e3 / frames.len() as f64
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ltr_tests {
+    //! Rate changes and loss repair on openh264. `--nocapture` prints the numbers.
+    use super::*;
+
+    /// A text desktop: lines of glyph-like strokes; `typed` characters on line 20,
+    /// scrolled up by `scroll` x 7 px.
+    pub(crate) fn desktop(w: usize, h: usize, typed: usize, scroll: usize) -> Frame {
+        let mut bgra = vec![0u8; w * h * 4];
+        for (i, px) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = (i % w, i / w + scroll * 7);
+            let (line, col) = (y / 18, x / 9);
+            let in_text = (y % 18) > 3 && (y % 18) < 15 && (col * 7 + line * 13) % 11 != 0;
+            let glyph = ((x % 9) * 3 + (y % 18) * 5 + line + col) % 7 < 3;
+            let shown = line != 20 || col < typed;
+            let c = if in_text && glyph && shown { 30 } else { 245 };
+            *px = [c, c, c.saturating_sub((line % 3) as u8 * 20), 255];
+        }
+        Frame {
+            width: w,
+            height: h,
+            bgra,
+            captured_at: Instant::now(),
+        }
+    }
+
+    fn encoder(ltr: bool, bps: u32) -> Option<VideoEncoder> {
+        let lib = crate::cisco::local_binary_path()?;
+        let mut e = VideoEncoder::new(
+            &lib,
+            EncoderSettings {
+                bitrate_bps: bps,
+                ..EncoderSettings::default()
+            },
+        )
+        .ok()?;
+        e.set_long_term_refs(ltr);
+        Some(e)
+    }
+
+    /// Typing for 30 frames, scrolling for 30, then still.
+    fn content(k: usize) -> (usize, usize) {
+        match k % 90 {
+            k @ 0..30 => (k, 0),
+            k @ 30..60 => (30, k - 30),
+            _ => (30, 30),
+        }
+    }
+
+    /// Bitrate swings every half second for 10 s: one keyframe (the first frame), and
+    /// the output follows the target. Before 0.1.6 each change rebuilt openh264: one
+    /// full-size IDR per change.
+    #[test]
+    fn live_retarget_makes_no_keyframes() {
+        for ltr in [false, true] {
+            let Some(mut e) = encoder(ltr, 4_000_000) else {
+                return;
+            };
+            let rates = [8_000_000, 1_000_000, 6_000_000, 500_000, 4_000_000];
+            let (mut keys, mut changes) = (0, 0);
+            let mut bytes = [0usize; 5];
+            for k in 0..300 {
+                if k > 0 && k % 15 == 0 {
+                    e.set_bitrate(rates[(k / 15) % rates.len()]);
+                    changes += 1;
+                }
+                let (typed, scroll) = content(k);
+                if let Some(au) = e.encode(&desktop(1280, 800, typed, scroll)).unwrap() {
+                    keys += has_idr(&au) as u32;
+                    if k >= 15 {
+                        bytes[(k / 15) % rates.len()] += au.len();
+                    }
+                }
+            }
+            println!(
+                "{}: {changes} bitrate changes in 300 frames, {keys} keyframe(s); bytes per rate {:?}",
+                e.engine_name(),
+                rates.iter().zip(bytes).collect::<Vec<_>>()
+            );
+            assert_eq!(keys, 1, "only the first frame");
+        }
+    }
+
+    /// The viewer loses a frame; the encoder repairs from a long-term reference the
+    /// viewer acknowledged: no keyframe, and the viewer's picture is bit-exact with a
+    /// viewer that lost nothing, from the repair on.
+    #[test]
+    fn a_lost_frame_is_repaired_without_a_keyframe() {
+        let Some(mut e) = encoder(true, 2_000_000) else {
+            return;
+        };
+        let lib = crate::cisco::local_binary_path().unwrap();
+        let mut full = VideoDecoder::software(&lib).unwrap();
+        let mut lossy = VideoDecoder::software(&lib).unwrap();
+        e.start_frame_ids_at(1000);
+        // Lost frames, counted in frames put out (typing: every frame changes a little).
+        let losses = [50u32, 140, 230];
+        let (mut keys, mut repairs, mut compared, mut n) = (0, 0, 0, 0u32);
+        let mut broken = false;
+        let mut last_good = None;
+        let mut repair_bytes = Vec::new();
+        let (mut other_bytes, mut first_key) = (0, 0);
+        for k in 0..400 {
+            let Some(au) = e.encode(&desktop(640, 400, k % 70, k / 70)).unwrap() else {
+                continue;
+            };
+            n += 1;
+            let info = e.last_frame();
+            keys += info.key as u32;
+            if info.key {
+                first_key = au.len();
+            }
+            let a = full.decode(&au).unwrap();
+            if info.recovers_from.is_none() && !info.key {
+                other_bytes += au.len();
+            }
+            if losses.contains(&n) {
+                // Lost on the way: the viewer notices at the next frame and reports.
+                broken = true;
+                continue;
+            }
+            if broken {
+                if info.recovers_from.is_some() || info.key {
+                    broken = false;
+                    repairs += info.recovers_from.is_some() as u32;
+                    repair_bytes.push(au.len());
+                } else {
+                    // A frame built on the lost one: report, and don't decode it (a
+                    // decoder fed broken frames may refuse the repair too).
+                    e.request_ltr_recovery(last_good.unwrap());
+                    continue;
+                }
+            }
+            let b = lossy.decode(&au).unwrap();
+            if let (Some(a), Some(b)) = (a, b) {
+                assert!(a.rgba == b.rgba, "frame {k} differs after the repair");
+                compared += 1;
+            }
+            last_good = Some(info.id);
+            e.ltr_acked(info.id);
+        }
+        println!(
+            "{} losses: {repairs} repaired from long-term references ({repair_bytes:?} bytes; other frames {} bytes on average; the first keyframe {} bytes), {keys} keyframe(s), {compared} pictures identical",
+            losses.len(),
+            other_bytes / n as usize,
+            first_key
+        );
+        assert_eq!(keys, 1, "only the first frame was a keyframe");
+        assert_eq!(repairs, 3);
+        assert!(compared > 250);
+    }
+
+    /// Without long-term references (screen mode) a repair request is a keyframe.
+    #[test]
+    fn without_long_term_references_a_repair_is_a_keyframe() {
+        let Some(mut e) = encoder(false, 2_000_000) else {
+            return;
+        };
+        assert!(!e.supports_ltr());
+        for k in 0..10 {
+            e.encode(&desktop(320, 200, k, 0)).unwrap();
+            e.ltr_acked(e.last_frame().id);
+        }
+        e.request_ltr_recovery(e.last_frame().id - 2);
+        let mut key = false;
+        for k in 10..14 {
+            if e.encode(&desktop(320, 200, k, 0)).unwrap().is_some() {
+                key = e.last_frame().key;
+                break;
+            }
+        }
+        assert!(key);
+    }
+
+    /// Screen vs camera (long-term reference) mode on the same text desktop.
+    /// `cargo test --release -p rconn-media ltr_tests::compare -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn compare_screen_and_ltr_modes() {
+        for ltr in [false, true] {
+            let Some(mut e) = encoder(ltr, 4_000_000) else {
+                return;
+            };
+            let frames: Vec<Frame> = (0..90)
+                .map(|k| {
+                    let (t, s) = content(k);
+                    desktop(1280, 800, t, s)
+                })
+                .collect();
+            let mut bytes = [0usize; 3];
+            let t = Instant::now();
+            for (k, f) in frames.iter().enumerate() {
+                if let Some(au) = e.encode(f).unwrap() {
+                    if k > 0 {
+                        bytes[k / 30] += au.len();
+                    }
+                }
+            }
+            println!(
+                "{}: typing {} KB, scrolling {} KB, still {} KB (after the first keyframe), {:.1} ms/frame",
+                e.engine_name(),
+                bytes[0] / 1024,
+                bytes[1] / 1024,
+                bytes[2] / 1024,
+                t.elapsed().as_secs_f64() * 1e3 / 90.0
             );
         }
     }

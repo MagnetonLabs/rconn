@@ -11,6 +11,8 @@ publish.workspace = true
 # Types only. Loading Cisco's downloaded binary (libloading) is added per target below:
 # not on iOS, where the App Store forbids downloaded code and VideoToolbox decodes.
 openh264 = { version = "0.9", default-features = false }
+# Option ids and structs for the encoder options the openh264 crate does not wrap.
+openh264-sys2 = { version = "0.9.10", default-features = false }
 opus.workspace = true
 thiserror.workspace = true
 

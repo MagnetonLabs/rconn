@@ -14,18 +14,20 @@ use std::time::{Duration, Instant};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxQP, CODECAPI_AVLowLatencyMode,
-    ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
-    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoLTRBufferControl,
+    CODECAPI_AVEncVideoMarkLTRFrame, CODECAPI_AVEncVideoMaxQP, CODECAPI_AVEncVideoUseLTRFrame,
+    CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType,
+    IMFSample, IMFTransform, METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
     MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE,
     MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFMediaType_Video, MFSTARTUP_FULL, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_LowDelayVBR, eAVEncH264VProfile_Base,
+    MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_LongTermReferenceFrameInfo, MFStartup,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_LOCALMFT,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_LowDelayVBR,
+    eAVEncH264VProfile_Base,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::System::Variant::VARIANT;
@@ -56,7 +58,21 @@ pub struct MfH264Encoder {
     /// have asked for that we haven't given yet.
     events: Option<IMFMediaEventGenerator>,
     credits: u32,
+    /// Long-term reference slots the encoder accepted (0: no LTR support).
+    ltr_slots: u8,
+    /// The last output sample's `MFSampleExtension_LongTermReferenceFrameInfo`, if the
+    /// encoder sets it.
+    ltr_info: Option<u32>,
 }
+
+/// Long-term reference slots asked for: one confirmed by the viewer, one being marked.
+const LTR_SLOTS: u8 = 2;
+/// `CODECAPI_AVEncVideoLTRBufferControl`'s trust mode 1, "trust until": an LTR frame stays
+/// valid until the application marks another into its slot.
+const LTR_TRUST_UNTIL: u32 = 1 << 16;
+/// `CODECAPI_AVEncVideoUseLTRFrame`'s usage mode 1: predict *only* from the LTR frames in
+/// the bitmap (not from the short-term frames the viewer may have lost).
+const LTR_USE_ONLY: u32 = 1 << 16;
 
 impl MfH264Encoder {
     /// A low-latency H.264 encoder for `width` x `height` NV12 frames: the GPU's if it
@@ -174,6 +190,28 @@ impl MfH264Encoder {
                 // Same quality floor as the openh264 path: never blocky text.
                 let _ = codec.SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(32u32));
             }
+            // Long-term references for repairing losses without a keyframe (Windows 8.1+;
+            // optional for vendors' encoders, so asked for and checked, never assumed).
+            // `RCONN_ENCODER_LTR=0` turns it off for an encoder that misbehaves with it.
+            let ltr_slots = match &codec {
+                Some(_) if std::env::var("RCONN_ENCODER_LTR").is_ok_and(|v| v == "0") => 0,
+                Some(codec) => {
+                    let ok = codec
+                        .IsSupported(&CODECAPI_AVEncVideoLTRBufferControl)
+                        .is_ok()
+                        && codec
+                            .SetValue(
+                                &CODECAPI_AVEncVideoLTRBufferControl,
+                                &VARIANT::from(LTR_TRUST_UNTIL | u32::from(LTR_SLOTS)),
+                            )
+                            .is_ok()
+                        && codec.IsSupported(&CODECAPI_AVEncVideoMarkLTRFrame).is_ok()
+                        && codec.IsSupported(&CODECAPI_AVEncVideoUseLTRFrame).is_ok();
+                    if ok { LTR_SLOTS } else { 0 }
+                }
+                None => 0,
+            };
+            tracing::info!(encoder = %name, ltr_slots, "Media Foundation encoder opened");
 
             let size = (u64::from(width) << 32) | u64::from(height);
             let rate = (u64::from(fps) << 32) | 1;
@@ -229,6 +267,8 @@ impl MfH264Encoder {
                 provides_samples: info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0,
                 events,
                 credits: 0,
+                ltr_slots,
+                ltr_info: None,
             })
         }
     }
@@ -238,6 +278,41 @@ impl MfH264Encoder {
         if let Some(c) = &self.codec {
             let _ = unsafe { c.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32)) };
         }
+    }
+
+    /// Long-term reference slots usable with [`Self::mark_ltr`] / [`Self::use_ltr`]
+    /// (0: the encoder has no LTR support; repairs need a keyframe).
+    pub fn ltr_slots(&self) -> u8 {
+        self.ltr_slots
+    }
+
+    /// Make the next frame given to [`Self::encode`] the long-term reference in `slot`.
+    pub fn mark_ltr(&mut self, slot: u8) -> bool {
+        self.ltr_set(&CODECAPI_AVEncVideoMarkLTRFrame, u32::from(slot))
+    }
+
+    /// Predict the next frame only from the long-term reference in `slot` (a loss
+    /// repair: the viewer has that picture, maybe not the ones after it).
+    pub fn use_ltr(&mut self, slot: u8) -> bool {
+        self.ltr_set(&CODECAPI_AVEncVideoUseLTRFrame, LTR_USE_ONLY | (1 << slot))
+    }
+
+    fn ltr_set(&mut self, api: &windows::core::GUID, value: u32) -> bool {
+        match &self.codec {
+            Some(c) if self.ltr_slots > 0 => {
+                unsafe { c.SetValue(api, &VARIANT::from(value)) }.is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    /// What the encoder said about the last output's references, if it says:
+    /// (slot this frame was marked into, bitmap of the slots it predicted from).
+    pub fn last_ltr_info(&self) -> Option<(Option<u8>, u16)> {
+        self.ltr_info.map(|v| {
+            let marked = (v >> 16) as u16;
+            ((marked != 0xffff).then_some(marked as u8), v as u16)
+        })
     }
 
     /// Change the target bitrate on the fly (no restart, no keyframe).
@@ -373,6 +448,9 @@ impl MfH264Encoder {
             match r {
                 Ok(()) => {
                     if let Some(sample) = sample {
+                        self.ltr_info = sample
+                            .GetUINT32(&MFSampleExtension_LongTermReferenceFrameInfo)
+                            .ok();
                         let buf = sample.ConvertToContiguousBuffer().map_err(err)?;
                         let mut p = std::ptr::null_mut();
                         let mut len = 0u32;

@@ -7,12 +7,15 @@ pub mod capture;
 #[cfg(not(target_os = "ios"))]
 pub mod cisco;
 pub mod codec;
+pub mod h264;
 #[cfg(windows)]
 pub mod mf;
+mod oh264;
 #[cfg(all(windows, target_arch = "aarch64"))]
 mod opus_shim;
 #[cfg(target_os = "linux")]
 pub mod portal;
+pub mod recovery;
 pub mod video;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod vt;
