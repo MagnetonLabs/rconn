@@ -62,10 +62,28 @@ sign_id="${RCONN_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null
   | sed -n 's/.*\([0-9A-F]\{40\}\) "Developer ID Application.*/\1/p' | head -1)}"
 sign_id="${sign_id:--}"
 [ "$sign_id" = "-" ] && echo "warning: ad-hoc signing; macOS permissions reset on every update" >&2
-codesign --force --sign "$sign_id" --identifier app.rconn.tray "$helper"
-codesign --force --sign "$sign_id" --identifier app.rconn.viewer "$app/Contents/MacOS/rconn-viewer"
-codesign --force --sign "$sign_id" --identifier app.rconn.host-agent "$app/Contents/MacOS/rconn-host-agent"
-codesign --force --sign "$sign_id" "$app"
+# Notarization needs the hardened runtime and a secure timestamp on everything we sign.
+# The runtime refuses libraries signed by another team, so the programs that load Cisco's
+# openh264 (signed by Cisco) may load other teams' libraries; nothing else is relaxed.
+ents="$work/entitlements.plist"
+cat > "$ents" <<'ENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict>
+</plist>
+ENTS
+if [ "$sign_id" = "-" ]; then
+  sign() { codesign --force --sign - "$@"; }
+else
+  sign() { codesign --force --sign "$sign_id" --options runtime --timestamp "$@"; }
+fi
+sign --identifier app.rconn.tray "$helper"
+sign --identifier app.rconn.viewer --entitlements "$ents" "$app/Contents/MacOS/rconn-viewer"
+sign --identifier app.rconn.host-agent --entitlements "$ents" "$app/Contents/MacOS/rconn-host-agent"
+sign --entitlements "$ents" "$app"
 codesign --verify --strict "$app"
 for lib in "$stage"/libopenh264-*.dylib; do
   cmp -s "$lib" "$app/Contents/Resources/$(basename "$lib")" || { echo "openh264 was modified: $lib" >&2; exit 1; }
@@ -73,4 +91,15 @@ done
 ln -s /Applications "$work/dmg/Applications"
 rm -f "$out"
 hdiutil create -quiet -volname "Rconn $version" -srcfolder "$work/dmg" -fs HFS+ -format UDZO "$out"
+[ "$sign_id" = "-" ] || codesign --force --sign "$sign_id" --timestamp "$out"
+# Notarize with a notarytool keychain profile (`xcrun notarytool store-credentials`), so
+# macOS opens the downloaded app without warnings. Skipped when the profile isn't there.
+profile="${RCONN_NOTARY_PROFILE:-AC_PASSWORD}"
+if [ "$sign_id" != "-" ] && xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1; then
+  xcrun notarytool submit "$out" --keychain-profile "$profile" --wait >&2
+  xcrun stapler staple "$out" >&2
+  spctl --assess --type open --context context:primary-signature -v "$out" >&2
+else
+  echo "warning: not notarized (no notarytool profile \"$profile\")" >&2
+fi
 echo "$out"
