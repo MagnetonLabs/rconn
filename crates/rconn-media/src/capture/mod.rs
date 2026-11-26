@@ -87,6 +87,13 @@ pub trait Capturer: Send {
             "this capturer has no GPU surfaces".into(),
         ))
     }
+
+    /// Areas the OS says were moved (scrolled, dragged) in the pictures given out since
+    /// the last call, in picture coordinates (Windows: DXGI move rectangles). Hints only:
+    /// [`crate::copyrect::Composer`] checks them against the pixels.
+    fn take_moves(&mut self) -> Vec<crate::copyrect::Move> {
+        Vec::new()
+    }
 }
 
 /// What [`Capturer::next_into`] changed.

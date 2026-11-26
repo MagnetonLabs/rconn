@@ -33,6 +33,12 @@ use std::collections::HashMap;
 pub const TILE: usize = 16;
 /// Version of the instructions; sent in [`FrameOps`] and asked for by viewers.
 pub const VERSION: u16 = 1;
+/// Copy instructions are used unless `RCONN_COPY_RECTS=0` (host: not offered; viewer: not
+/// asked for).
+pub fn enabled() -> bool {
+    std::env::var("RCONN_COPY_RECTS").map_or(true, |v| v != "0" && v != "off")
+}
+
 /// A move must cover this many rows to be worth an instruction.
 const MIN_RUN: usize = 24;
 /// Rows of the new picture that must agree on a scroll distance before it is checked.
@@ -407,6 +413,9 @@ pub struct PrepareStats {
     /// Share of the picture moved by instructions instead.
     pub moved: f32,
     pub moves: usize,
+    /// The rows of the returned picture that differ from the one returned before (an
+    /// even range), `None` for "any": for [`crate::video::VideoEncoder::encode_yuv`].
+    pub rows: Option<(usize, usize)>,
 }
 
 impl Composer {
@@ -430,8 +439,13 @@ impl Composer {
 
     /// The picture to encode for screen picture `picture`. `hints` are moves the OS
     /// reported since the last prepared picture (checked before use: they may describe
-    /// several captures). Encode the result, then call [`Composer::sent`].
-    pub fn prepare<'a>(&'a mut self, picture: &'a I420, hints: &[Move]) -> &'a I420 {
+    /// several captures). Encode the result, then call [`Composer::sent`]. Also returns
+    /// [`Composer::last`].
+    pub fn prepare<'a>(
+        &'a mut self,
+        picture: &'a I420,
+        hints: &[Move],
+    ) -> (&'a I420, PrepareStats) {
         let (w, h) = picture.dimensions();
         if self.passthrough {
             self.prepared = Some((full_ops((w, h)), (0, h)));
@@ -439,7 +453,7 @@ impl Composer {
                 encoded: 1.0,
                 ..Default::default()
             };
-            return picture;
+            return (picture, self.last);
         }
         if self
             .canvas
@@ -460,7 +474,7 @@ impl Composer {
                 encoded: 1.0,
                 ..Default::default()
             };
-            return canvas;
+            return (canvas, self.last);
         }
         let diff = Diff::new(shown, picture);
         let Some(band) = diff.band else {
@@ -471,8 +485,11 @@ impl Composer {
                 },
                 (0, 0),
             ));
-            self.last = PrepareStats::default();
-            return canvas;
+            self.last = PrepareStats {
+                rows: Some((0, 0)),
+                ..Default::default()
+            };
+            return (canvas, self.last);
         };
         let moves = find_moves(shown, picture, &diff, hints);
         let regions = dirty_regions(shown, picture, &diff, &moves);
@@ -484,6 +501,13 @@ impl Composer {
             encoded: regions.iter().map(area).sum(),
             moved: moves.iter().map(|m| area(&m.to)).sum(),
             moves: moves.len(),
+            rows: Some(
+                regions
+                    .iter()
+                    .map(|r| (r.y, r.y + r.h))
+                    .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+                    .unwrap_or((0, 0)),
+            ),
         };
         self.prepared = Some((
             FrameOps {
@@ -494,7 +518,7 @@ impl Composer {
             },
             band,
         ));
-        canvas
+        (canvas, self.last)
     }
 
     /// The encoder turned the prepared picture into `au`: the access unit to send, with
@@ -918,20 +942,22 @@ fn dirty_regions(old: &I420, new: &I420, diff: &Diff, moves: &[Move]) -> Vec<Rec
     let cw = w / 2;
     let tiles_x = w.div_ceil(TILE);
     let mut tiles = vec![false; tiles_x * h.div_ceil(TILE)];
-    for (ty, dirty) in tiles.chunks_mut(tiles_x).enumerate() {
-        for y in ty * TILE..((ty + 1) * TILE).min(h) {
-            let Some(changed) = diff.rows[y] else {
+    for (ty, row_tiles) in tiles.chunks_mut(tiles_x).enumerate() {
+        let rows = ty * TILE..((ty + 1) * TILE).min(h);
+        for (y, changed) in rows.clone().zip(&diff.rows[rows]) {
+            let Some(changed) = *changed else {
                 continue;
             };
             for (a, b) in uncovered(moves, y, changed) {
-                for t in a / TILE..b.div_ceil(TILE) {
-                    if dirty[t] {
+                let span = a / TILE..b.div_ceil(TILE);
+                for (t, dirty) in span.clone().zip(&mut row_tiles[span]) {
+                    if *dirty {
                         continue;
                     }
                     let (x0, x1) = ((t * TILE).max(a), ((t + 1) * TILE).min(b));
                     let luma = new.y()[y * w + x0..y * w + x1] != old.y()[y * w + x0..y * w + x1];
                     let c = (y / 2) * cw + x0 / 2..(y / 2) * cw + x1.div_ceil(2);
-                    dirty[t] = luma
+                    *dirty = luma
                         || new.u()[c.clone()] != old.u()[c.clone()]
                         || new.v()[c.clone()] != old.v()[c];
                 }
@@ -1134,7 +1160,7 @@ mod tests {
         pic: &I420,
         hints: &[Move],
     ) -> (FrameOps, DecodedFrame) {
-        let canvas = composer.prepare(pic, hints);
+        let (canvas, _) = composer.prepare(pic, hints);
         let mut decoded = rgba(canvas);
         let au = composer.sent(pic, FAKE_AU.to_vec());
         let (rest, ops) = split(&au);
@@ -1310,7 +1336,7 @@ mod tests {
         composer.no_output(false);
         assert!(composer.is_passthrough());
         let pic = screen(&doc, 30);
-        let got = composer.prepare(&pic, &[]);
+        let (got, _) = composer.prepare(&pic, &[]);
         assert!(std::ptr::eq(got, &pic), "the screen itself is encoded");
         let au = composer.sent(&pic, FAKE_AU.to_vec());
         assert!(split(&au).1.is_none(), "the next picture says nothing...");
@@ -1406,6 +1432,85 @@ mod tests {
             c.compose(Some(&ops(2, false, vec![tile])), &mut frame(6)),
             Composed::Resync
         );
+    }
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let se: u64 = a
+            .iter()
+            .zip(b)
+            .map(|(p, q)| u64::from(p.abs_diff(*q)).pow(2))
+            .sum();
+        let mse = se as f64 / a.len() as f64;
+        if mse == 0.0 {
+            99.0
+        } else {
+            10.0 * (255.0f64 * 255.0 / mse).log10()
+        }
+    }
+
+    /// Host to viewer through openh264: scrolling arrives as moves plus small pictures,
+    /// the viewer's picture stays right, and a lost picture is noticed and repaired.
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn scrolling_through_a_real_encoder_and_decoder() {
+        use crate::video::{EncoderSettings, VideoDecoder, VideoEncoder};
+        let Some(lib) = crate::cisco::local_binary_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let settings = EncoderSettings {
+            bitrate_bps: 4_000_000,
+            ..Default::default()
+        };
+        let mut enc = VideoEncoder::new(&lib, settings).unwrap();
+        let mut dec = VideoDecoder::software(&lib).unwrap();
+        let mut composer = Composer::new();
+        let mut compositor = Compositor::new();
+        let doc = document(H + 600);
+        let (mut sent, mut moved, mut resynced) = (0usize, 0.0f32, false);
+        for i in 0..40usize {
+            let pic = screen(&doc, (i * 13).min(600));
+            if i == 25 {
+                composer.request_full(); // as a keyframe request after the loss does
+                enc.request_keyframe();
+            }
+            let (canvas, found) = composer.prepare(&pic, &[]);
+            let Some(au) = enc.encode_yuv(canvas, found.rows).unwrap() else {
+                composer.no_output(true);
+                continue;
+            };
+            moved += found.moved;
+            let au = composer.sent(&pic, au);
+            sent += au.len();
+            if i == 20 {
+                continue; // lost on the way
+            }
+            let (bits, ops) = split(&au);
+            let mut f = match dec.decode(&bits) {
+                Ok(f) => f.expect("a picture per access unit"),
+                Err(e) => {
+                    // What the viewer does on a decode error.
+                    assert!((21..25).contains(&i), "frame {i}: {e}");
+                    compositor.lost();
+                    resynced = true;
+                    continue;
+                }
+            };
+            let truth = rgba(&pic);
+            match compositor.compose(ops.as_ref(), &mut f) {
+                Composed::Show => {
+                    assert!(!(21..25).contains(&i), "frame {i}: shown after a loss");
+                    let q = psnr(&f.rgba, &truth.rgba);
+                    assert!(q > 30.0, "frame {i}: {q:.1} dB");
+                }
+                Composed::Resync => {
+                    assert!((21..25).contains(&i), "frame {i}: out of step");
+                    resynced = true;
+                }
+            }
+        }
+        assert!(resynced, "the loss was noticed");
+        assert!(moved / 40.0 > 0.5, "scrolls went as moves: {moved}");
+        assert!(sent < 40 * 30_000, "{sent} bytes");
     }
 
     #[test]

@@ -65,7 +65,15 @@ fn synthetic() -> Page {
         seed % n
     };
     let glyphs: Vec<[u16; 12]> = (0..64)
-        .map(|_| std::array::from_fn(|r| if r < 2 || r > 10 { 0 } else { rand(128) as u16 }))
+        .map(|_| {
+            std::array::from_fn(|r| {
+                if !(2..=10).contains(&r) {
+                    0
+                } else {
+                    rand(128) as u16
+                }
+            })
+        })
         .collect();
     for line in 0..ch / 20 {
         let (y0, mut x) = (line * 20 + 4, 40 + 32 * rand(4) as usize);
@@ -309,7 +317,7 @@ fn run(
                     Vec::new()
                 };
                 let t = Instant::now();
-                let canvas = composer.prepare(&pic, &given);
+                let (canvas, _) = composer.prepare(&pic, &given);
                 out.prepare_ms += t.elapsed().as_secs_f64() * 1e3;
                 save(canvas);
                 let au = enc.encode(canvas);
@@ -411,7 +419,7 @@ fn instructions_rebuild_every_scrolled_picture() {
             for (i, &offset) in offsets.iter().enumerate() {
                 render(&page, offset, &mut screen);
                 pic.fill_from_bgra(&screen, W);
-                let canvas = composer.prepare(&pic, &[]);
+                let (canvas, _) = composer.prepare(&pic, &[]);
                 let mut decoded = DecodedFrame {
                     width: W,
                     height: H,

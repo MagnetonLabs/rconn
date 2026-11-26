@@ -9,6 +9,7 @@ use bytes::BytesMut;
 use egui::{Color32, ColorImage, Pos2, Rect, Sense, TextureHandle, TextureOptions, Vec2};
 use rconn_core::ids::HostId;
 use rconn_core::protocol::{Control, DataMessage, InputEvent, MouseButton};
+use rconn_media::copyrect::{self, Composed, Compositor};
 use rconn_media::video::{DecodedFrame, VideoDecoder};
 use rconn_peer::rtc::{PeerEvent, PeerOptions};
 use rconn_peer::session::open_viewer_session;
@@ -566,6 +567,8 @@ async fn session(
         files_repaint,
     ));
     let guest = args.guest.is_some();
+    // Scrolls and window moves as copy instructions (see rconn_media::copyrect).
+    let copy_rects = rconn_media::copyrect::enabled();
     let dc_task = tokio::spawn(async move {
         let send = |dc: Arc<dyn webrtc::data_channel::DataChannel>, m: DataMessage| async move {
             if let Ok(b) = m.encode() {
@@ -586,6 +589,9 @@ async fn session(
                             let _ = allowed_tx.send(true);
                         }
                         send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
+                        if copy_rects {
+                            send(dc.clone(), DataMessage::Control(Control::CopyRects { version: rconn_media::copyrect::VERSION })).await;
+                        }
                     }
                     Some(DataChannelEvent::OnMessage(msg)) => match DataMessage::decode(&msg.data) {
                         Ok(DataMessage::Clipboard(text)) => clip.apply_remote(text),
@@ -620,6 +626,10 @@ async fn session(
                                             c.request_repaint();
                                         }
                                         send(dc.clone(), DataMessage::Control(Control::RequestKeyframe)).await;
+                                        // Guests: the host takes nothing before this point.
+                                        if copy_rects {
+                                            send(dc.clone(), DataMessage::Control(Control::CopyRects { version: rconn_media::copyrect::VERSION })).await;
+                                        }
                                     }
                                     rconn_peer::guest::Step::Refused(why) => {
                                         if let Some(tx) = refused_tx.take() {
@@ -700,6 +710,8 @@ async fn session(
 
     let mut rx = VideoReceiver::default();
     let mut dec = VideoDecoder::new(&args.openh264)?;
+    // Builds the picture from copy instructions, when the host sends them.
+    let mut compositor = Compositor::new();
     let (mut frames, mut bytes, mut since) = (0u32, 0usize, Instant::now());
     // Lost packets, decode errors, or video with no picture coming out of it: ask for a
     // fresh keyframe (throttled; each one costs the host a full-size encode).
@@ -725,11 +737,20 @@ async fn session(
             if rx.take_loss() {
                 tracing::warn!("video packets lost");
                 need.lost();
+                compositor.lost();
             }
             for au in aus {
                 bytes += au.len();
-                match dec.decode(&au) {
-                    Ok(Some(f)) => {
+                let (bits, ops) = copyrect::split(&au);
+                match dec.decode(&bits) {
+                    Ok(Some(mut f)) => {
+                        if compositor.compose(ops.as_ref(), &mut f) == Composed::Resync {
+                            // A picture (or its instructions) was missed: hold the last
+                            // picture until a whole one comes.
+                            tracing::debug!("copy instructions out of step; asking for a keyframe");
+                            need.lost();
+                            continue;
+                        }
                         frames += 1;
                         need.picture();
                         let mut s = shared.lock().expect("ui state");
@@ -742,6 +763,7 @@ async fn session(
                     Err(e) => {
                         tracing::debug!(error = %e, "decode error");
                         need.lost();
+                        compositor.lost();
                     }
                 }
             }
