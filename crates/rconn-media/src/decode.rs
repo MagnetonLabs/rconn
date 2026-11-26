@@ -16,6 +16,7 @@ use crate::codec::CodecError;
 use crate::sps::{Colour, SpsInfo};
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::formats::YUVSource;
+use rconn_core::codec::VideoCodec;
 use std::time::{Duration, Instant};
 
 /// How the planes of a [`DecodedFrame`] are laid out.
@@ -152,6 +153,10 @@ pub struct VideoDecoder {
     pictures: u64,
     /// The planes of the picture being decoded.
     buf: Vec<u8>,
+    /// The stream's codec ([`Self::set_codec`]); H.264 unless told otherwise.
+    codec: VideoCodec,
+    /// `RCONN_DECODER`, for engines made later.
+    choice: String,
 }
 
 enum DecEngine {
@@ -168,7 +173,8 @@ impl VideoDecoder {
         let engine = if choice == "openh264" {
             Self::openh264(openh264_path)?
         } else {
-            Self::platform(&choice).map_or_else(|| Self::openh264(openh264_path), Ok)?
+            Self::platform(VideoCodec::H264, &choice)
+                .map_or_else(|| Self::openh264(openh264_path), Ok)?
         };
         Ok(Self::with_engine(engine, openh264_path))
     }
@@ -189,31 +195,61 @@ impl VideoDecoder {
             info: None,
             pictures: 0,
             buf: Vec::new(),
+            codec: VideoCodec::H264,
+            choice: std::env::var("RCONN_DECODER").unwrap_or_default(),
         }
+    }
+
+    /// Decode `codec` from now on (the codec of the stream: `VideoReceiver::codec`). HEVC
+    /// and AV1 only have the platform's decoders (no software fallback); an error says
+    /// there is none.
+    pub fn set_codec(&mut self, codec: VideoCodec) -> Result<(), CodecError> {
+        if codec == self.codec {
+            return Ok(());
+        }
+        let engine = match codec {
+            VideoCodec::H264 => Self::platform(VideoCodec::H264, &self.choice)
+                .map_or_else(|| Self::openh264(&self.openh264_path), Ok)?,
+            _ => Self::platform(codec, &self.choice).ok_or_else(|| {
+                CodecError::OpenH264(format!("no {} decoder on this machine", codec.name()))
+            })?,
+        };
+        self.engine = engine;
+        self.codec = codec;
+        self.sps.clear();
+        self.info = None;
+        self.pictures = 0;
+        Ok(())
+    }
+
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
     }
 
     /// The platform's own decoder, if it has one that starts.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn platform(_choice: &str) -> Option<DecEngine> {
-        Some(DecEngine::VideoToolbox(crate::vt::VtDecoder::new()))
+    fn platform(codec: VideoCodec, _choice: &str) -> Option<DecEngine> {
+        Some(DecEngine::VideoToolbox(crate::vt::VtDecoder::for_codec(
+            codec,
+        )))
     }
 
     /// The platform's own decoder, if it has one that starts: Media Foundation on the
     /// GPU (on the CPU only when asked for: it is no faster than openh264 there).
     #[cfg(windows)]
-    fn platform(choice: &str) -> Option<DecEngine> {
+    fn platform(codec: VideoCodec, choice: &str) -> Option<DecEngine> {
         let hardware = choice != "mf-software";
-        match crate::mf_decode::MfH264Decoder::new(hardware) {
+        match crate::mf_decode::MfH264Decoder::new_codec(codec, hardware) {
             Ok(d) => Some(DecEngine::MediaFoundation(d)),
             Err(e) => {
-                tracing::info!(error = %e, "no GPU H.264 decoder; using openh264");
+                tracing::info!(error = %e, codec = codec.name(), "no GPU decoder");
                 None
             }
         }
     }
 
     #[cfg(not(any(windows, target_os = "macos", target_os = "ios")))]
-    fn platform(_choice: &str) -> Option<DecEngine> {
+    fn platform(_codec: VideoCodec, _choice: &str) -> Option<DecEngine> {
         None
     }
 
@@ -245,12 +281,12 @@ impl VideoDecoder {
     /// new session for it ([`crate::vt`]).
     pub fn decode(&mut self, annex_b: &[u8]) -> Result<Option<DecodedFrame>, CodecError> {
         let t0 = Instant::now();
-        if let Some(sps) = crate::video::sequence_header(annex_b)
+        if let Some(sps) = crate::video::sequence_header_of(self.codec, annex_b)
             && sps != self.sps.as_slice()
         {
             let restart = !self.sps.is_empty();
             self.sps = sps.to_vec();
-            self.info = crate::sps::parse(sps);
+            self.info = crate::video::sequence_info(self.codec, sps);
             if restart {
                 self.restart()?;
             }
@@ -289,7 +325,8 @@ impl VideoDecoder {
             #[cfg(windows)]
             DecEngine::MediaFoundation(d) => {
                 let hardware = d.is_hardware();
-                self.engine = match crate::mf_decode::MfH264Decoder::new(hardware) {
+                self.engine = match crate::mf_decode::MfH264Decoder::new_codec(self.codec, hardware)
+                {
                     Ok(d) => DecEngine::MediaFoundation(d),
                     Err(e) => {
                         tracing::warn!(error = %e, "Media Foundation decoder restart failed; using openh264");
@@ -318,6 +355,9 @@ impl VideoDecoder {
     /// stream. `false`: keep the engine.
     #[cfg(any(windows, target_os = "macos", target_os = "ios"))]
     fn fall_back(&mut self, e: &CodecError) -> Result<bool, CodecError> {
+        if self.codec != VideoCodec::H264 {
+            return Ok(false); // openh264 is H.264 only
+        }
         #[cfg(windows)]
         if self.pictures > 0 {
             return Ok(false);

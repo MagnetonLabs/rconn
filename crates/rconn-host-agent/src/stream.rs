@@ -283,6 +283,9 @@ fn run_generation(
             slice_bytes: None,
         },
     )?;
+    // The negotiated codec: H.264, or HEVC/AV1 on a hardware encoder (losses there are
+    // repaired with keyframes where the encoder has no long-term references).
+    enc.set_codec(cfg.codec);
     // Frame ids run on from the previous capture; the viewer acknowledges by id.
     let first_id = ctx.next_id.load(Ordering::Relaxed);
     enc.start_frame_ids_at(first_id);

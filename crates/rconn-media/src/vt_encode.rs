@@ -19,6 +19,7 @@ use crate::capture::Surface;
 use crate::video::EncoderSettings;
 use crate::yuv::I420;
 use openh264::formats::YUVSource;
+use rconn_core::codec::VideoCodec;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Mutex;
@@ -129,6 +130,14 @@ unsafe extern "C" {
         count: *mut usize,
         nal_header_len: *mut i32,
     ) -> OSStatus;
+    fn CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+        format: CFTypeRef,
+        index: usize,
+        set: *mut *const u8,
+        size: *mut usize,
+        count: *mut usize,
+        nal_header_len: *mut i32,
+    ) -> OSStatus;
 }
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -150,6 +159,7 @@ unsafe extern "C" {
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFTypeRef;
     static kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel: CFTypeRef;
     static kVTProfileLevel_H264_Baseline_AutoLevel: CFTypeRef;
+    static kVTProfileLevel_HEVC_Main_AutoLevel: CFTypeRef;
     fn VTCompressionSessionCreate(
         alloc: CFTypeRef,
         width: i32,
@@ -220,7 +230,6 @@ pub fn encoder_exists(codec: rconn_core::codec::VideoCodec, hardware: bool) -> b
     }
 }
 
-const kCMVideoCodecType_H264: u32 = u32::from_be_bytes(*b"avc1");
 const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = u32::from_be_bytes(*b"420v");
 const kCFNumberSInt32Type: isize = 3;
 const kCFNumberFloat64Type: isize = 6;
@@ -279,9 +288,12 @@ struct Output {
     /// Set by every callback.
     done: bool,
     status: OSStatus,
-    /// Annex-B, with SPS/PPS in front of keyframes; empty if the frame was dropped.
+    /// Annex-B, with the parameter sets (H.264 SPS/PPS, HEVC VPS/SPS/PPS) in front of
+    /// keyframes; empty if the frame was dropped.
     annex_b: Vec<u8>,
     key: bool,
+    /// The session encodes HEVC (kept across frames).
+    hevc: bool,
 }
 
 /// Encoded frame, written by the output callback (on a VideoToolbox thread, while
@@ -311,7 +323,8 @@ extern "C" fn on_output(
     unsafe {
         out.key = is_sync(sample);
         if out.key {
-            append_parameter_sets(sample, &mut out.annex_b);
+            let hevc = out.hevc;
+            append_parameter_sets(sample, hevc, &mut out.annex_b);
         }
         append_annex_b(sample, &mut out.annex_b);
     }
@@ -331,8 +344,13 @@ unsafe fn is_sync(sample: CFTypeRef) -> bool {
     }
 }
 
-/// SPS and PPS from the sample's format description, each behind a start code.
-unsafe fn append_parameter_sets(sample: CFTypeRef, out: &mut Vec<u8>) {
+/// The parameter sets from the sample's format description, each behind a start code.
+unsafe fn append_parameter_sets(sample: CFTypeRef, hevc: bool, out: &mut Vec<u8>) {
+    let get = if hevc {
+        CMVideoFormatDescriptionGetHEVCParameterSetAtIndex
+    } else {
+        CMVideoFormatDescriptionGetH264ParameterSetAtIndex
+    };
     // SAFETY: the format description belongs to `sample`; the parameter set pointers it
     // returns stay valid while it does.
     unsafe {
@@ -341,19 +359,11 @@ unsafe fn append_parameter_sets(sample: CFTypeRef, out: &mut Vec<u8>) {
             return;
         }
         let (mut set, mut size, mut count, mut header) = (ptr::null(), 0usize, 0usize, 0i32);
-        if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            format,
-            0,
-            &mut set,
-            &mut size,
-            &mut count,
-            &mut header,
-        ) != 0
-        {
+        if get(format, 0, &mut set, &mut size, &mut count, &mut header) != 0 {
             return;
         }
         for i in 0..count {
-            if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            if get(
                 format,
                 i,
                 &mut set,
@@ -426,6 +436,7 @@ pub struct VtEncoder {
     bitrate_bps: u32,
     name: String,
     hardware: bool,
+    codec: VideoCodec,
 }
 
 // SAFETY: the session and buffers are used only through `&mut self`; VideoToolbox
@@ -433,11 +444,19 @@ pub struct VtEncoder {
 unsafe impl Send for VtEncoder {}
 
 impl VtEncoder {
-    /// A session for `width` x `height` (even) pictures.
-    pub fn new(width: usize, height: usize, settings: &EncoderSettings) -> Result<Self, String> {
+    /// A `codec` session (H.264 or HEVC) for `width` x `height` (even) pictures.
+    pub fn new(
+        codec: VideoCodec,
+        width: usize,
+        height: usize,
+        settings: &EncoderSettings,
+    ) -> Result<Self, String> {
+        if codec == VideoCodec::Av1 {
+            return Err("VideoToolbox has no AV1 encoder".into());
+        }
         let mut errors = Vec::new();
         for tier in [Tier::HardwareLowLatency, Tier::LowLatency, Tier::Plain] {
-            match Self::with_tier(width, height, settings, tier) {
+            match Self::with_tier(codec, width, height, settings, tier) {
                 Ok(e) => return Ok(e),
                 Err(e) => errors.push(format!("{tier:?}: {e}")),
             }
@@ -446,6 +465,7 @@ impl VtEncoder {
     }
 
     fn with_tier(
+        codec: VideoCodec,
         width: usize,
         height: usize,
         settings: &EncoderSettings,
@@ -477,13 +497,16 @@ impl VtEncoder {
                 (kCVPixelBufferHeightKey, h.0),
                 (kCVPixelBufferIOSurfacePropertiesKey, iosurface.0),
             ]);
-            let output = Box::new(Mutex::new(Output::default()));
+            let output = Box::new(Mutex::new(Output {
+                hevc: codec == VideoCodec::H265,
+                ..Output::default()
+            }));
             let mut session: CFTypeRef = ptr::null();
             let st = VTCompressionSessionCreate(
                 ptr::null(),
                 width as i32,
                 height as i32,
-                kCMVideoCodecType_H264,
+                crate::vt::codec_type(codec),
                 spec.0,
                 source.0,
                 ptr::null(),
@@ -507,6 +530,7 @@ impl VtEncoder {
                 bitrate_bps: 0,
                 name: String::new(),
                 hardware: false,
+                codec,
             };
             enc.configure(settings)?;
             // The low-latency encoder does not answer "using hardware?"; the first tier
@@ -517,7 +541,12 @@ impl VtEncoder {
             };
             enc.hardware = hardware == Some(true);
             enc.name = format!(
-                "VideoToolbox ({})",
+                "VideoToolbox{} ({})",
+                if codec == VideoCodec::H264 {
+                    ""
+                } else {
+                    " HEVC"
+                },
                 [
                     hardware.map(|h| if h { "hardware" } else { "software" }),
                     (!matches!(tier, Tier::Plain)).then_some("low latency"),
@@ -545,9 +574,16 @@ impl VtEncoder {
                 f,
                 "AllowFrameReordering",
             )?;
+            // HEVC: Main (8-bit 4:2:0), what every HEVC decoder has.
+            if self.codec == VideoCodec::H265 {
+                self.require(
+                    kVTCompressionPropertyKey_ProfileLevel,
+                    kVTProfileLevel_HEVC_Main_AutoLevel,
+                    "ProfileLevel",
+                )?;
             // Constrained Baseline is what the session description offers
             // (profile-level-id 42e01f) and what openh264 sends; every viewer decodes it.
-            if self.set(
+            } else if self.set(
                 kVTCompressionPropertyKey_ProfileLevel,
                 kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
             ) != 0
@@ -579,7 +615,7 @@ impl VtEncoder {
                 kVTCompressionPropertyKey_YCbCrMatrix,
                 kCVImageBufferYCbCrMatrix_ITU_R_601_4,
             );
-            if let Some(n) = s.slice_bytes {
+            if let Some(n) = s.slice_bytes.filter(|_| self.codec == VideoCodec::H264) {
                 let n = Cf::number_i32(n.min(i32::MAX as u32) as i32);
                 self.set(kVTCompressionPropertyKey_MaxH264SliceBytes, n.0);
             }
@@ -710,7 +746,11 @@ impl VtEncoder {
             flags: 1, // valid
             epoch: 0,
         };
-        *self.output.lock().unwrap_or_else(|e| e.into_inner()) = Output::default();
+        let hevc = self.codec == VideoCodec::H265;
+        *self.output.lock().unwrap_or_else(|e| e.into_inner()) = Output {
+            hevc,
+            ..Output::default()
+        };
         let props = if key { self.force_key.0 } else { ptr::null() };
         // SAFETY: valid session and pixel buffer (retained by VideoToolbox while in use);
         // we wait for the frame before returning.

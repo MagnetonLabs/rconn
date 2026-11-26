@@ -7,6 +7,7 @@
 
 #![allow(unsafe_code, non_upper_case_globals)]
 
+use rconn_core::codec::VideoCodec;
 use std::ffi::c_void;
 use std::ptr;
 
@@ -59,6 +60,14 @@ unsafe extern "C" {
         value_cb: *const Opaque,
     ) -> CFTypeRef;
     fn CFNumberCreate(alloc: CFTypeRef, kind: isize, value: *const c_void) -> CFTypeRef;
+    fn CFDataCreate(alloc: CFTypeRef, bytes: *const u8, len: isize) -> CFTypeRef;
+    fn CFStringCreateWithBytes(
+        alloc: CFTypeRef,
+        bytes: *const u8,
+        len: isize,
+        encoding: u32,
+        external: u8,
+    ) -> CFTypeRef;
     fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
     fn CFRelease(cf: CFTypeRef);
 }
@@ -84,6 +93,24 @@ unsafe extern "C" {
         nal_length_size: i32,
         out: *mut CFTypeRef,
     ) -> OSStatus;
+    fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+        alloc: CFTypeRef,
+        count: usize,
+        sets: *const *const u8,
+        sizes: *const usize,
+        nal_length_size: i32,
+        extensions: CFTypeRef,
+        out: *mut CFTypeRef,
+    ) -> OSStatus;
+    fn CMVideoFormatDescriptionCreate(
+        alloc: CFTypeRef,
+        codec: u32,
+        width: i32,
+        height: i32,
+        extensions: CFTypeRef,
+        out: *mut CFTypeRef,
+    ) -> OSStatus;
+    static kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: CFTypeRef;
     fn CMBlockBufferCreateWithMemoryBlock(
         alloc: CFTypeRef,
         memory: *mut c_void,
@@ -138,8 +165,7 @@ pub(crate) const kCMVideoCodecType_HEVC: u32 = u32::from_be_bytes(*b"hvc1");
 pub(crate) const kCMVideoCodecType_AV1: u32 = u32::from_be_bytes(*b"av01");
 
 /// The Core Media codec type of `codec`.
-pub(crate) fn codec_type(codec: rconn_core::codec::VideoCodec) -> u32 {
-    use rconn_core::codec::VideoCodec;
+pub(crate) fn codec_type(codec: VideoCodec) -> u32 {
     match codec {
         VideoCodec::H264 => kCMVideoCodecType_H264,
         VideoCodec::H265 => kCMVideoCodecType_HEVC,
@@ -149,7 +175,7 @@ pub(crate) fn codec_type(codec: rconn_core::codec::VideoCodec) -> u32 {
 
 /// Does this machine have a hardware decoder for `codec`? (HEVC: Macs from 2017 and all
 /// Apple silicon; AV1: M3, A17 Pro and later.)
-pub fn hardware_decodes(codec: rconn_core::codec::VideoCodec) -> bool {
+pub fn hardware_decodes(codec: VideoCodec) -> bool {
     // SAFETY: a plain query.
     unsafe { VTIsHardwareDecodeSupported(codec_type(codec)) != 0 }
 }
@@ -190,10 +216,13 @@ extern "C" fn on_output(
 }
 
 pub struct VtDecoder {
-    sps: Vec<u8>,
-    pps: Vec<u8>,
+    codec: VideoCodec,
+    /// The stream headers the session was made for: H.264 SPS, PPS; HEVC VPS, SPS, PPS;
+    /// the AV1 sequence header OBU.
+    sets: Vec<Vec<u8>>,
     format: Option<Cf>,
     session: Option<Cf>,
+    /// The sample handed to VideoToolbox: length-prefixed NAL units, or AV1 OBUs.
     avcc: Vec<u8>,
 }
 
@@ -208,46 +237,102 @@ impl Default for VtDecoder {
 }
 
 impl VtDecoder {
-    /// The session is created at the first SPS/PPS.
+    /// An H.264 decoder; the session is created at the first SPS/PPS.
     pub fn new() -> Self {
+        Self::for_codec(VideoCodec::H264)
+    }
+
+    /// A `codec` decoder; the session is created at the first stream headers.
+    pub fn for_codec(codec: VideoCodec) -> Self {
         Self {
-            sps: Vec::new(),
-            pps: Vec::new(),
+            codec,
+            sets: Vec::new(),
             format: None,
             session: None,
             avcc: Vec::new(),
         }
     }
 
-    /// Decode one Annex-B access unit into tight NV12 planes in `nv12`. Returns the
-    /// picture size, or `None` if this unit held no picture.
+    /// Split an access unit into its stream headers (all of them, or none) and the
+    /// sample VideoToolbox decodes (`self.avcc`).
+    fn take_apart(&mut self, au: &[u8]) -> Option<Vec<Vec<u8>>> {
+        self.avcc.clear();
+        match self.codec {
+            VideoCodec::H264 | VideoCodec::H265 => {
+                let hevc = self.codec == VideoCodec::H265;
+                // H.264: SPS 7, PPS 8. HEVC: VPS 32, SPS 33, PPS 34.
+                let mut sets: [Option<&[u8]>; 3] = [None; 3];
+                for nal in crate::video::nal_units(au) {
+                    let (kind, picture) = if hevc {
+                        let t = (nal[0] >> 1) & 0x3f;
+                        (
+                            t.checked_sub(32).filter(|&i| i < 3),
+                            t < 32 && nal.len() > 2,
+                        )
+                    } else {
+                        let t = nal[0] & 0x1f;
+                        (
+                            t.checked_sub(6).filter(|&i| (1..3).contains(&i)),
+                            (1..=5).contains(&t),
+                        )
+                    };
+                    if let Some(i) = kind {
+                        sets[usize::from(i)] = Some(nal);
+                    } else if picture {
+                        self.avcc
+                            .extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                        self.avcc.extend_from_slice(nal);
+                    }
+                }
+                let want = if hevc { &sets[..] } else { &sets[1..] };
+                want.iter()
+                    .map(|s| s.map(<[u8]>::to_vec))
+                    .collect::<Option<Vec<_>>>()
+            }
+            VideoCodec::Av1 => {
+                // The sample is the temporal unit without temporal delimiters, padding
+                // or our own metadata (AV1 in ISOBMFF); the sequence header stays in it.
+                let mut header = None;
+                for u in rconn_core::codec::units(VideoCodec::Av1, au) {
+                    let obu = &au[u.start..u.end];
+                    match rconn_core::codec::obu::kind(obu[0]) {
+                        rconn_core::codec::obu::SEQUENCE_HEADER => header = Some(obu.to_vec()),
+                        rconn_core::codec::obu::TEMPORAL_DELIMITER
+                        | rconn_core::codec::obu::PADDING => continue,
+                        _ => {}
+                    }
+                    self.avcc.extend_from_slice(obu);
+                }
+                header.map(|h| vec![h])
+            }
+        }
+    }
+
+    /// Decode one access unit (Annex-B; AV1: OBUs) into tight NV12 planes in `nv12`.
+    /// Returns the picture size, or `None` if this unit held no picture.
     pub fn decode(
         &mut self,
         annex_b: &[u8],
         nv12: &mut Vec<u8>,
     ) -> Result<Option<(usize, usize)>, String> {
-        let (mut sps, mut pps) = (None, None);
-        self.avcc.clear();
-        for nal in crate::video::nal_units(annex_b) {
-            match nal[0] & 0x1f {
-                7 => sps = Some(nal),
-                8 => pps = Some(nal),
-                1..=5 => {
-                    self.avcc
-                        .extend_from_slice(&(nal.len() as u32).to_be_bytes());
-                    self.avcc.extend_from_slice(nal);
-                }
-                _ => {}
-            }
-        }
-        if let (Some(s), Some(p)) = (sps, pps)
-            && (s != self.sps.as_slice() || p != self.pps.as_slice() || self.session.is_none())
+        if let Some(sets) = self.take_apart(annex_b)
+            && (sets != self.sets || self.session.is_none())
         {
-            self.sps = s.to_vec();
-            self.pps = p.to_vec();
+            self.sets = sets;
             self.open()?;
         }
-        if self.avcc.is_empty() {
+        let pictures = match self.codec {
+            VideoCodec::Av1 => rconn_core::codec::units(VideoCodec::Av1, &self.avcc)
+                .iter()
+                .any(|u| {
+                    rconn_core::codec::kind(VideoCodec::Av1, &self.avcc, u)
+                        != rconn_core::codec::UnitKind::Other
+                        && rconn_core::codec::kind(VideoCodec::Av1, &self.avcc, u)
+                            != rconn_core::codec::UnitKind::UserData
+                }),
+            _ => !self.avcc.is_empty(),
+        };
+        if !pictures {
             return Ok(None);
         }
         let (Some(session), Some(format)) = (&self.session, &self.format) else {
@@ -315,29 +400,47 @@ impl VtDecoder {
         Ok(Some(copy_nv12(&image, nv12)))
     }
 
+    /// A format description for the stream headers in `self.sets` (owned by the caller).
+    fn format_description(&self) -> Result<CFTypeRef, String> {
+        let sets: Vec<*const u8> = self.sets.iter().map(|s| s.as_ptr()).collect();
+        let sizes: Vec<usize> = self.sets.iter().map(Vec::len).collect();
+        let mut format: CFTypeRef = ptr::null();
+        // SAFETY: the parameter sets outlive the calls, which copy them.
+        let st = unsafe {
+            match self.codec {
+                VideoCodec::H264 => CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    ptr::null(),
+                    sets.len(),
+                    sets.as_ptr(),
+                    sizes.as_ptr(),
+                    4,
+                    &mut format,
+                ),
+                VideoCodec::H265 => CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    ptr::null(),
+                    sets.len(),
+                    sets.as_ptr(),
+                    sizes.as_ptr(),
+                    4,
+                    ptr::null(),
+                    &mut format,
+                ),
+                VideoCodec::Av1 => return av1_format(&self.sets[0]),
+            }
+        };
+        if st != 0 {
+            return Err(format!("{} format description: {st}", self.codec.name()));
+        }
+        Ok(format)
+    }
+
     fn open(&mut self) -> Result<(), String> {
         self.session = None;
         self.format = None;
         // SAFETY: plain CoreFoundation/CoreMedia/VideoToolbox calls with valid pointers;
         // every created object is owned by a `Cf`.
         unsafe {
-            let sets = [self.sps.as_ptr(), self.pps.as_ptr()];
-            let sizes = [self.sps.len(), self.pps.len()];
-            let mut format: CFTypeRef = ptr::null();
-            let st = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                ptr::null(),
-                2,
-                sets.as_ptr(),
-                sizes.as_ptr(),
-                4,
-                &mut format,
-            );
-            if st != 0 {
-                return Err(format!(
-                    "CMVideoFormatDescriptionCreateFromH264ParameterSets: {st}"
-                ));
-            }
-            let format = Cf(format);
+            let format = Cf(self.format_description()?);
 
             let spec_keys = [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder];
             let spec_values = [kCFBooleanTrue];
@@ -399,6 +502,86 @@ impl Drop for VtDecoder {
             // SAFETY: valid session; released by `Cf` afterwards.
             unsafe { VTDecompressionSessionInvalidate(s.0) }
         }
+    }
+}
+
+/// The `av1C` box (AV1 codec configuration record) for a sequence header OBU.
+fn av1c(obu: &[u8]) -> Option<(Vec<u8>, (usize, usize))> {
+    let (_, payload) = rconn_core::codec::obu_parts(obu)?;
+    let s = crate::sps::parse_av1(&obu[payload])?;
+    let mut b = vec![
+        0x81, // marker, version 1
+        (s.profile << 5) | (s.level & 0x1f),
+        (s.tier << 7)
+            | (u8::from(s.high_bitdepth) << 6)
+            | (u8::from(s.twelve_bit) << 5)
+            | (u8::from(s.mono) << 4)
+            | (u8::from(s.subsampling.0) << 3)
+            | (u8::from(s.subsampling.1) << 2)
+            | (s.chroma_position & 3),
+        0, // no initial presentation delay
+    ];
+    // configOBUs: the sequence header, with its size field.
+    if obu[0] & 0x02 != 0 {
+        b.extend_from_slice(obu);
+    } else {
+        b.push(obu[0] | 0x02);
+        let header = if obu[0] & 0x04 != 0 { 2 } else { 1 };
+        b.extend_from_slice(&obu[1..header]);
+        rconn_core::codec::put_leb128((obu.len() - header) as u64, &mut b);
+        b.extend_from_slice(&obu[header..]);
+    }
+    Some((b, (s.info.width, s.info.height)))
+}
+
+/// An AV1 format description (owned by the caller) from a sequence header OBU.
+fn av1_format(obu: &[u8]) -> Result<CFTypeRef, String> {
+    let (record, (w, h)) = av1c(obu).ok_or("unreadable AV1 sequence header")?;
+    const UTF8: u32 = 0x0800_0100;
+    // SAFETY: plain CoreFoundation/CoreMedia calls; every object made here is owned by a
+    // `Cf` (the description, returned, by the caller).
+    unsafe {
+        let data = Cf(CFDataCreate(
+            ptr::null(),
+            record.as_ptr(),
+            record.len() as isize,
+        ));
+        let key = Cf(CFStringCreateWithBytes(
+            ptr::null(),
+            b"av1C".as_ptr(),
+            4,
+            UTF8,
+            0,
+        ));
+        let atoms = Cf(CFDictionaryCreate(
+            ptr::null(),
+            [key.0].as_ptr(),
+            [data.0].as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        ));
+        let ext = Cf(CFDictionaryCreate(
+            ptr::null(),
+            [kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms].as_ptr(),
+            [atoms.0].as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        ));
+        let mut format: CFTypeRef = ptr::null();
+        let st = CMVideoFormatDescriptionCreate(
+            ptr::null(),
+            kCMVideoCodecType_AV1,
+            w as i32,
+            h as i32,
+            ext.0,
+            &mut format,
+        );
+        if st != 0 {
+            return Err(format!("AV1 format description: {st}"));
+        }
+        Ok(format)
     }
 }
 

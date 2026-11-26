@@ -17,7 +17,7 @@ pub use rconn_core::codec::VideoCodec;
 use std::sync::OnceLock;
 
 /// Codecs whose whole path (encode, decode, packetization, side data) this build has.
-const BUILT: &[VideoCodec] = &[];
+const BUILT: &[VideoCodec] = &[VideoCodec::H265];
 
 /// Codecs besides H.264 this machine decodes.
 pub fn decodable() -> Vec<VideoCodec> {

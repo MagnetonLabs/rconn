@@ -773,6 +773,11 @@ async fn session(
                 compositor.lost();
             }
             let codec = rx.codec();
+            if dec.codec() != codec {
+                // The host's choice from what this viewer offered (see `caps`).
+                tracing::info!(codec = codec.name(), "video codec");
+                dec.set_codec(codec)?;
+            }
             for au in aus {
                 bytes += au.len();
                 let (au, tag) = rconn_peer::frames::take(codec, &au);

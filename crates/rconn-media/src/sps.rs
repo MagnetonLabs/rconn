@@ -179,6 +179,360 @@ fn vui(r: &mut Bits<'_>, colour: &mut Colour) -> Option<()> {
     Some(())
 }
 
+/// The matrix of a `matrix_coefficients` code (H.264, H.265 and AV1 share them).
+fn matrix_of(code: u32) -> Matrix {
+    match code {
+        1 => Matrix::Bt709,
+        9 | 10 => Matrix::Bt2020,
+        _ => Matrix::Bt601, // 5, 6 (BT.601), 2 (unspecified), others
+    }
+}
+
+/// Parse an HEVC SPS NAL unit (two-byte header first): the picture size after the
+/// conformance window, and the VUI's colour signalling.
+pub fn parse_hevc(nal: &[u8]) -> Option<SpsInfo> {
+    if (nal.first()? >> 1) & 0x3f != 33 {
+        return None;
+    }
+    let rbsp = unescape(nal.get(2..)?);
+    let mut r = Bits::new(&rbsp);
+    r.bits(4)?; // sps_video_parameter_set_id
+    let max_sub_layers_minus1 = r.bits(3)?;
+    r.flag()?; // sps_temporal_id_nesting_flag
+    profile_tier_level(&mut r, max_sub_layers_minus1)?;
+    r.ue()?; // sps_seq_parameter_set_id
+    let chroma_format_idc = r.ue()?;
+    let mut separate_planes = false;
+    if chroma_format_idc == 3 {
+        separate_planes = r.flag()?;
+    }
+    let (mut width, mut height) = (r.ue()? as usize, r.ue()? as usize);
+    if r.flag()? {
+        // conformance_window_flag: offsets in chroma units
+        let (cx, cy) = match if separate_planes {
+            0
+        } else {
+            chroma_format_idc
+        } {
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        let (left, right, top, bottom) = (r.ue()?, r.ue()?, r.ue()?, r.ue()?);
+        width = width.checked_sub(cx * (left + right) as usize)?;
+        height = height.checked_sub(cy * (top + bottom) as usize)?;
+    }
+    let mut colour = Colour::default();
+    // A header we can't follow to its VUI still gives the size (default colours).
+    let _ = hevc_vui(&mut r, max_sub_layers_minus1, &mut colour);
+    Some(SpsInfo {
+        width,
+        height,
+        colour,
+    })
+}
+
+/// `profile_tier_level(1, max_sub_layers_minus1)`: skipped.
+fn profile_tier_level(r: &mut Bits<'_>, max_sub_layers_minus1: u32) -> Option<()> {
+    // Profile space, tier and idc (8 bits), compatibility flags (32), source flags (4),
+    // reserved/constraint bits (43), inbld (1), level (8): 96 bits.
+    for _ in 0..3 {
+        r.bits(32)?;
+    }
+    let mut present = Vec::new();
+    for _ in 0..max_sub_layers_minus1 {
+        present.push((r.flag()?, r.flag()?)); // sub-layer profile, level present
+    }
+    if max_sub_layers_minus1 > 0 {
+        for _ in max_sub_layers_minus1..8 {
+            r.bits(2)?; // reserved_zero_2bits
+        }
+    }
+    for (profile, level) in present {
+        if profile {
+            r.bits(32)?;
+            r.bits(32)?;
+            r.bits(24)?;
+        }
+        if level {
+            r.bits(8)?;
+        }
+    }
+    Some(())
+}
+
+/// The rest of an HEVC SPS up to the VUI's colour description.
+fn hevc_vui(r: &mut Bits<'_>, max_sub_layers_minus1: u32, colour: &mut Colour) -> Option<()> {
+    r.ue()?; // bit_depth_luma_minus8
+    r.ue()?; // bit_depth_chroma_minus8
+    let log2_max_poc_lsb = r.ue()? + 4;
+    let all_sub_layers = r.flag()?;
+    let first = if all_sub_layers {
+        0
+    } else {
+        max_sub_layers_minus1
+    };
+    for _ in first..=max_sub_layers_minus1 {
+        r.ue()?; // max_dec_pic_buffering_minus1
+        r.ue()?; // max_num_reorder_pics
+        r.ue()?; // max_latency_increase_plus1
+    }
+    for _ in 0..6 {
+        r.ue()?; // min luma coding block size .. max transform hierarchy depth intra
+    }
+    if r.flag()? {
+        // scaling_list_enabled_flag
+        if r.flag()? {
+            skip_hevc_scaling_lists(r)?;
+        }
+    }
+    r.flag()?; // amp_enabled_flag
+    r.flag()?; // sample_adaptive_offset_enabled_flag
+    if r.flag()? {
+        // pcm_enabled_flag
+        r.bits(8)?; // pcm sample bit depths
+        r.ue()?;
+        r.ue()?;
+        r.flag()?;
+    }
+    let sets = r.ue()?;
+    if sets > 64 {
+        return None;
+    }
+    let mut deltas: Vec<u32> = Vec::new(); // NumDeltaPocs of each set
+    for idx in 0..sets {
+        let predicted = idx != 0 && r.flag()?;
+        let n = if predicted {
+            // From the set just before (idx == num_short_term_ref_pic_sets only in
+            // slice headers, never here).
+            r.flag()?; // delta_rps_sign
+            r.ue()?; // abs_delta_rps_minus1
+            let reference = *deltas.last()?;
+            let mut n = 0;
+            for _ in 0..=reference {
+                let used = r.flag()?;
+                let used_delta = used || r.flag()?;
+                n += u32::from(used_delta);
+            }
+            n
+        } else {
+            let (neg, pos) = (r.ue()?, r.ue()?);
+            if neg + pos > 32 {
+                return None;
+            }
+            for _ in 0..neg + pos {
+                r.ue()?; // delta_poc_minus1
+                r.flag()?; // used_by_curr_pic
+            }
+            neg + pos
+        };
+        deltas.push(n);
+    }
+    if r.flag()? {
+        // long_term_ref_pics_present_flag
+        for _ in 0..r.ue()? {
+            r.bits(log2_max_poc_lsb)?;
+            r.flag()?;
+        }
+    }
+    r.flag()?; // sps_temporal_mvp_enabled_flag
+    r.flag()?; // strong_intra_smoothing_enabled_flag
+    if !r.flag()? {
+        return Some(()); // no VUI
+    }
+    if r.flag()? && r.bits(8)? == 255 {
+        r.bits(32)?; // sar
+    }
+    if r.flag()? {
+        r.flag()?; // overscan_appropriate_flag
+    }
+    if r.flag()? {
+        r.bits(3)?; // video_format
+        colour.full_range = r.flag()?;
+        if r.flag()? {
+            r.bits(16)?; // colour_primaries, transfer_characteristics
+            colour.matrix = matrix_of(r.bits(8)?);
+        }
+    }
+    Some(())
+}
+
+fn skip_hevc_scaling_lists(r: &mut Bits<'_>) -> Option<()> {
+    for size in 0..4 {
+        let step = if size == 3 { 3 } else { 1 };
+        for _ in (0..6).step_by(step) {
+            if !r.flag()? {
+                r.ue()?; // scaling_list_pred_matrix_id_delta
+            } else {
+                let n = 64.min(1 << (4 + (size << 1)));
+                if size > 1 {
+                    r.se()?; // scaling_list_dc_coef_minus8
+                }
+                for _ in 0..n {
+                    r.se()?;
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// What the viewer needs from an AV1 sequence header OBU, and the `av1C` box fields a
+/// decoder description needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Av1Sequence {
+    pub info: SpsInfo,
+    pub profile: u8,
+    pub level: u8,
+    pub tier: u8,
+    pub high_bitdepth: bool,
+    pub twelve_bit: bool,
+    pub mono: bool,
+    pub subsampling: (bool, bool),
+    pub chroma_position: u8,
+    /// `reduced_still_picture_header`: frame headers then have no `frame_type`.
+    pub reduced_still_picture: bool,
+}
+
+/// Parse an AV1 sequence header OBU's payload (after the OBU header and size).
+pub fn parse_av1(payload: &[u8]) -> Option<Av1Sequence> {
+    let mut r = Bits::new(payload);
+    let profile = r.bits(3)? as u8;
+    r.flag()?; // still_picture
+    let reduced = r.flag()?;
+    let (mut level, mut tier) = (0u8, 0u8);
+    if reduced {
+        level = r.bits(5)? as u8;
+    } else {
+        let timing = r.flag()?;
+        let mut decoder_model = false;
+        let mut buffer_delay_len = 0;
+        if timing {
+            r.bits(32)?; // num_units_in_display_tick
+            r.bits(32)?; // time_scale
+            if r.flag()? {
+                // equal_picture_interval: num_ticks_per_picture_minus_1 (uvlc)
+                let mut zeros = 0;
+                while !r.flag()? {
+                    zeros += 1;
+                    if zeros >= 32 {
+                        return None;
+                    }
+                }
+                r.bits(zeros)?;
+            }
+            decoder_model = r.flag()?;
+            if decoder_model {
+                buffer_delay_len = r.bits(5)? + 1;
+                r.bits(32)?; // num_units_in_decoding_tick
+                r.bits(5)?; // buffer_removal_time_length_minus_1
+                r.bits(5)?; // frame_presentation_time_length_minus_1
+            }
+        }
+        let display_delay = r.flag()?;
+        let points = r.bits(5)? + 1;
+        for i in 0..points {
+            r.bits(12)?; // operating_point_idc
+            let l = r.bits(5)? as u8;
+            let t = if l > 7 { r.bits(1)? as u8 } else { 0 };
+            if i == 0 {
+                (level, tier) = (l, t);
+            }
+            if decoder_model && r.flag()? {
+                r.bits(buffer_delay_len)?; // decoder_buffer_delay
+                r.bits(buffer_delay_len)?; // encoder_buffer_delay
+                r.flag()?; // low_delay_mode_flag
+            }
+            if display_delay && r.flag()? {
+                r.bits(4)?;
+            }
+        }
+    }
+    let (wb, hb) = (r.bits(4)? + 1, r.bits(4)? + 1);
+    let width = r.bits(wb)? as usize + 1;
+    let height = r.bits(hb)? as usize + 1;
+    if !reduced && r.flag()? {
+        // frame_id_numbers_present_flag
+        r.bits(4)?;
+        r.bits(3)?;
+    }
+    r.flag()?; // use_128x128_superblock
+    r.flag()?; // enable_filter_intra
+    r.flag()?; // enable_intra_edge_filter
+    if !reduced {
+        r.flag()?; // enable_interintra_compound
+        r.flag()?; // enable_masked_compound
+        r.flag()?; // enable_warped_motion
+        r.flag()?; // enable_dual_filter
+        let order_hint = r.flag()?;
+        if order_hint {
+            r.flag()?; // enable_jnt_comp
+            r.flag()?; // enable_ref_frame_mvs
+        }
+        let screen_tools = if r.flag()? { 2 } else { r.bits(1)? };
+        if screen_tools > 0 && !r.flag()? {
+            r.bits(1)?; // seq_force_integer_mv
+        }
+        if order_hint {
+            r.bits(3)?; // order_hint_bits_minus_1
+        }
+    }
+    r.flag()?; // enable_superres
+    r.flag()?; // enable_cdef
+    r.flag()?; // enable_restoration
+    // color_config()
+    let high_bitdepth = r.flag()?;
+    let twelve_bit = profile == 2 && high_bitdepth && r.flag()?;
+    let mono = profile != 1 && r.flag()?;
+    let (mut primaries, mut transfer, mut matrix) = (2, 2, 2);
+    if r.flag()? {
+        primaries = r.bits(8)?;
+        transfer = r.bits(8)?;
+        matrix = r.bits(8)?;
+    }
+    let mut colour = Colour {
+        matrix: matrix_of(matrix),
+        full_range: false,
+    };
+    let (mut subsampling, mut chroma_position) = ((true, true), 0u8);
+    if mono {
+        colour.full_range = r.flag()?;
+    } else if primaries == 1 && transfer == 13 && matrix == 0 {
+        colour.full_range = true; // sRGB: 4:4:4
+        subsampling = (false, false);
+    } else {
+        colour.full_range = r.flag()?;
+        subsampling = match profile {
+            0 => (true, true),
+            1 => (false, false),
+            _ if high_bitdepth && twelve_bit => {
+                let x = r.flag()?;
+                (x, x && r.flag()?)
+            }
+            _ => (true, false),
+        };
+        if subsampling == (true, true) {
+            chroma_position = r.bits(2)? as u8;
+        }
+    }
+    Some(Av1Sequence {
+        info: SpsInfo {
+            width,
+            height,
+            colour,
+        },
+        profile,
+        level,
+        tier,
+        high_bitdepth,
+        twelve_bit,
+        mono,
+        subsampling,
+        chroma_position,
+        reduced_still_picture: reduced,
+    })
+}
+
 /// Remove emulation-prevention bytes (`00 00 03` -> `00 00`).
 fn unescape(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());

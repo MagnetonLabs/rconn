@@ -1,4 +1,6 @@
-//! H.264 encode/decode for screen content, on Cisco's openh264.
+//! Screen-content encode/decode: H.264 on the platform encoder or Cisco's openh264, and
+//! HEVC/AV1 on the operating system's hardware encoders where the session negotiated
+//! them ([`crate::caps`]).
 
 use crate::codec::CodecError;
 use crate::h264::SyntaxTracker;
@@ -10,6 +12,7 @@ use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
     SpsPpsStrategy, UsageType,
 };
+pub use rconn_core::codec::VideoCodec;
 use std::time::Instant;
 
 /// A captured frame: tightly packed BGRA, `width * 4` bytes per row.
@@ -188,6 +191,8 @@ pub struct VideoEncoder {
     /// set read textures on it ([`crate::mf::MfH264Encoder::new_d3d11`]).
     #[cfg(windows)]
     gpu: Option<crate::d3d11::GpuDevice>,
+    /// What the encoder makes: H.264 (any engine) or HEVC/AV1 (the OS's encoders only).
+    codec: VideoCodec,
 }
 
 impl VideoEncoder {
@@ -234,14 +239,34 @@ impl VideoEncoder {
             since_mark: 0,
             #[cfg(windows)]
             gpu: None,
+            codec: VideoCodec::H264,
         })
     }
 
+    /// Encode `codec` from now on (the session's, see [`crate::caps`]): H.264 on any
+    /// engine, HEVC and AV1 only on the operating system's encoders (VideoToolbox, Media
+    /// Foundation), never in software here. The next frame is a keyframe.
+    pub fn set_codec(&mut self, codec: VideoCodec) {
+        if codec != self.codec {
+            self.codec = codec;
+            self.encoder = None;
+            self.spare = None;
+            self.headers.clear();
+            self.force_key = true;
+        }
+    }
+
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
+    }
+
     fn build(&mut self, width: usize, height: usize) -> Result<Engine, CodecError> {
+        let codec = self.codec;
         #[cfg(windows)]
         if let Some(gpu) = self.gpu.clone() {
             // Surfaces in: only an encoder that reads textures will do.
-            let mf = crate::mf::MfH264Encoder::new_d3d11(
+            let mf = crate::mf::MfH264Encoder::new_d3d11_codec(
+                codec,
                 &gpu,
                 width as u32,
                 height as u32,
@@ -252,9 +277,12 @@ impl VideoEncoder {
             self.engine_name = format!("Media Foundation D3D11 ({})", mf.name());
             return Ok(Engine::MediaFoundation(mf));
         }
+        if codec != VideoCodec::H264 {
+            return self.build_os_encoder(width, height);
+        }
         #[cfg(target_os = "macos")]
         if !self.software_only {
-            match crate::vt_encode::VtEncoder::new(width, height, &self.settings) {
+            match crate::vt_encode::VtEncoder::new(codec, width, height, &self.settings) {
                 Ok(vt) => {
                     self.engine_name = vt.name().to_owned();
                     return Ok(Engine::VideoToolbox(Box::new(vt)));
@@ -291,6 +319,40 @@ impl VideoEncoder {
             started: false,
             ltr: self.openh264_ltr,
         })))
+    }
+
+    /// HEVC or AV1: the operating system's encoder or nothing (there is no software
+    /// fallback for them; the session's codec can't change, so a failure here ends the
+    /// capture generation, and the next one tries again).
+    fn build_os_encoder(&mut self, width: usize, height: usize) -> Result<Engine, CodecError> {
+        let codec = self.codec;
+        #[cfg(target_os = "macos")]
+        {
+            let vt = crate::vt_encode::VtEncoder::new(codec, width, height, &self.settings)
+                .map_err(CodecError::VideoToolbox)?;
+            self.engine_name = vt.name().to_owned();
+            Ok(Engine::VideoToolbox(Box::new(vt)))
+        }
+        #[cfg(windows)]
+        {
+            let mf = crate::mf::MfH264Encoder::new_codec(
+                codec,
+                width as u32,
+                height as u32,
+                self.settings.max_fps.round().max(1.0) as u32,
+                self.settings.bitrate_bps,
+            )?;
+            self.engine_name = format!("Media Foundation ({})", mf.name());
+            Ok(Engine::MediaFoundation(mf))
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            let _ = (width, height);
+            Err(CodecError::OpenH264(format!(
+                "no {} encoder on this platform",
+                codec.name()
+            )))
+        }
     }
 
     fn build_openh264(&self, width: usize, height: usize) -> Result<Encoder, CodecError> {
@@ -545,7 +607,7 @@ impl VideoEncoder {
                 mf_mark(mf, &self.ledger, self.since_mark, force_key, &mut repair);
                 yuv.write_nv12(&mut self.nv12, changed_rows);
                 let out = mf.encode(&self.nv12)?;
-                self.last_was_key = has_idr(&out);
+                self.last_was_key = is_keyframe(self.codec, &out);
                 mf_report(mf, &mut repair);
                 out
             }
@@ -572,7 +634,7 @@ impl VideoEncoder {
         #[cfg(windows)]
         return crate::d3d11::texture_path_allowed()
             && (crate::d3d11::software_texture_test()
-                || crate::mf::MfH264Encoder::hardware_available());
+                || crate::mf::encoder_exists(self.codec, true));
         #[cfg(not(windows))]
         return cfg!(target_os = "macos") && !self.software_only;
     }
@@ -665,7 +727,7 @@ impl VideoEncoder {
                 ));
             }
         };
-        self.last_was_key = has_idr(&out);
+        self.last_was_key = is_keyframe(self.codec, &out);
         Ok(self.finish(out, force_key, repair))
     }
 
@@ -719,7 +781,7 @@ impl VideoEncoder {
         self.encoder = None;
         self.spare = None;
         self.force_key |= force_key;
-        if self.vt_failures >= 3 {
+        if self.vt_failures >= 3 && self.codec == VideoCodec::H264 {
             tracing::warn!(error, "VideoToolbox keeps failing; using openh264");
             self.software_only = true;
         } else {
@@ -748,7 +810,7 @@ impl VideoEncoder {
                 self.encoder = None;
             }
         }
-        let out = with_headers(out, &mut self.headers);
+        let out = with_headers_of(self.codec, out, &mut self.headers);
         if out.is_empty() {
             if repair.base.is_some() {
                 self.repair = repair.asked; // the repair frame was skipped: again next frame
@@ -761,7 +823,9 @@ impl VideoEncoder {
 
     /// Record a frame that went out: its id, what it references, for repairs to come.
     fn note_output(&mut self, out: &[u8], repair: &Repair) {
-        let slice = self.syntax.access_unit(out);
+        let slice = (self.codec == VideoCodec::H264)
+            .then(|| self.syntax.access_unit(out))
+            .flatten();
         let key = self.last_was_key;
         let ltr_slot = match &self.encoder {
             Some(Engine::OpenH264(o)) if o.ltr => slice.and_then(|s| s.marks_long_term).map(|_| 0),
@@ -927,17 +991,113 @@ fn parameter_sets(annex_b: &[u8]) -> Option<Vec<u8>> {
 /// sends, and put them in front of any keyframe that comes without them. A decoder that
 /// lost its place, or a stream that switched encoders (and picture size), can only start
 /// again from a keyframe it can read on its own.
+/// (H.264; [`with_headers_of`] for any codec.)
+#[cfg(test)]
 fn with_headers(out: Vec<u8>, headers: &mut Vec<u8>) -> Vec<u8> {
-    if let Some(h) = parameter_sets(&out) {
+    with_headers_of(VideoCodec::H264, out, headers)
+}
+
+/// The type of an HEVC NAL unit (two-byte header).
+fn hevc_type(nal: &[u8]) -> u8 {
+    (nal[0] >> 1) & 0x3f
+}
+
+/// The OBUs of an AV1 temporal unit: (type, whole OBU, payload).
+fn obus(au: &[u8]) -> impl Iterator<Item = (u8, &[u8], &[u8])> {
+    rconn_core::codec::units(VideoCodec::Av1, au)
+        .into_iter()
+        .filter_map(move |u| {
+            let obu = &au[u.start..u.end];
+            let (_, payload) = rconn_core::codec::obu_parts(obu)?;
+            Some((rconn_core::codec::obu::kind(obu[0]), obu, &obu[payload]))
+        })
+}
+
+/// Can a decoder start at this access unit? H.264: an IDR slice; HEVC: an IRAP picture
+/// (IDR, CRA, BLA); AV1: a key frame (a frame header with `frame_type` KEY_FRAME, not
+/// one showing an existing frame).
+pub fn is_keyframe(codec: VideoCodec, au: &[u8]) -> bool {
+    use rconn_core::codec::obu;
+    match codec {
+        VideoCodec::H264 => has_idr(au),
+        VideoCodec::H265 => {
+            nal_units(au).any(|n| n.len() >= 2 && (16..=21).contains(&hevc_type(n)))
+        }
+        VideoCodec::Av1 => obus(au).any(|(t, _, p)| {
+            matches!(t, obu::FRAME | obu::FRAME_HEADER)
+                && p.first()
+                    .is_some_and(|b| b & 0x80 == 0 && (b >> 5) & 3 == 0)
+        }),
+    }
+}
+
+/// The stream's sequence header in `au`, if any: H.264 and HEVC, the SPS NAL unit
+/// (without start code); AV1, the sequence header OBU's payload.
+pub fn sequence_header_of(codec: VideoCodec, au: &[u8]) -> Option<&[u8]> {
+    match codec {
+        VideoCodec::H264 => sequence_header(au),
+        VideoCodec::H265 => nal_units(au).find(|n| n.len() >= 2 && hevc_type(n) == 33),
+        VideoCodec::Av1 => obus(au)
+            .find(|(t, _, _)| *t == rconn_core::codec::obu::SEQUENCE_HEADER)
+            .map(|(_, _, p)| p),
+    }
+}
+
+/// What a sequence header says about the pictures (size, colours).
+pub fn sequence_info(codec: VideoCodec, header: &[u8]) -> Option<crate::sps::SpsInfo> {
+    match codec {
+        VideoCodec::H264 => crate::sps::parse(header),
+        VideoCodec::H265 => crate::sps::parse_hevc(header),
+        VideoCodec::Av1 => crate::sps::parse_av1(header).map(|s| s.info),
+    }
+}
+
+/// The stream headers of `au` (start codes included) if it carries all of them: H.264
+/// SPS + PPS, HEVC VPS + SPS + PPS, the AV1 sequence header OBU.
+fn headers_of(codec: VideoCodec, au: &[u8]) -> Option<Vec<u8>> {
+    match codec {
+        VideoCodec::H264 => parameter_sets(au),
+        VideoCodec::H265 => {
+            let mut out = Vec::new();
+            let mut seen = [false; 3];
+            for nal in nal_units(au).filter(|n| n.len() >= 2) {
+                let t = hevc_type(nal);
+                if !(32..=34).contains(&t) {
+                    continue;
+                }
+                seen[usize::from(t - 32)] = true;
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.extend_from_slice(nal);
+            }
+            (seen == [true; 3]).then_some(out)
+        }
+        VideoCodec::Av1 => obus(au)
+            .find(|(t, _, _)| *t == rconn_core::codec::obu::SEQUENCE_HEADER)
+            .map(|(_, obu, _)| obu.to_vec()),
+    }
+}
+
+/// [`with_headers`] for any codec. AV1's sequence header goes after a temporal
+/// delimiter, if the unit starts with one.
+fn with_headers_of(codec: VideoCodec, out: Vec<u8>, headers: &mut Vec<u8>) -> Vec<u8> {
+    if let Some(h) = headers_of(codec, &out) {
         *headers = h;
         return out;
     }
-    if !headers.is_empty() && has_idr(&out) {
-        let mut v = headers.clone();
-        v.extend_from_slice(&out);
-        return v;
+    if headers.is_empty() || !is_keyframe(codec, &out) {
+        return out;
     }
-    out
+    let at = match codec {
+        VideoCodec::Av1 => obus(&out)
+            .next()
+            .filter(|(t, _, _)| *t == rconn_core::codec::obu::TEMPORAL_DELIMITER)
+            .map_or(0, |(_, obu, _)| obu.len()),
+        _ => 0,
+    };
+    let mut v = out[..at].to_vec();
+    v.extend_from_slice(headers);
+    v.extend_from_slice(&out[at..]);
+    v
 }
 
 /// Should a bandwidth estimate move the encoder? Changes are live (no keyframe) on every
