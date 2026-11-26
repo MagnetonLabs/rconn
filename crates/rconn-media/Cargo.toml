@@ -52,6 +52,9 @@ ashpd = { version = "0.14.3", default-features = false, features = ["tokio", "re
 pipewire = "0.10.1"
 futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
+# VA-API (GPU H.264 encode, DMA-BUF conversion): libva is opened at run time, so the
+# package keeps working on machines without it.
+libloading = "0.8"
 
 [lints]
 workspace = true

@@ -114,6 +114,10 @@ enum Engine {
     /// can also take the capturer's GPU surfaces without a copy.
     #[cfg(target_os = "macos")]
     VideoToolbox(Box<crate::vt_encode::VtEncoder>),
+    /// The GPU's encoder through VA-API (Intel/AMD on Linux): uploaded pictures, or the
+    /// Wayland screen's DMA-BUFs converted on the GPU.
+    #[cfg(target_os = "linux")]
+    VaApi(Box<crate::vaapi::VaH264Encoder>),
 }
 
 /// An openh264 encoder and the rate it was last told.
@@ -164,9 +168,9 @@ pub struct VideoEncoder {
     scale: f32,
     last_was_key: bool,
     force_key: bool,
-    /// macOS: openh264 rather than VideoToolbox, as asked for (`RCONN_ENCODER=openh264`,
-    /// [`VideoEncoder::software`]) or because VideoToolbox failed.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// macOS/Linux: openh264 rather than VideoToolbox/VA-API, as asked for
+    /// (`RCONN_ENCODER=openh264`, [`VideoEncoder::software`]) or because the other failed.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     software_only: bool,
     /// VideoToolbox failures in a row.
     #[cfg(target_os = "macos")]
@@ -191,8 +195,8 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    /// Cisco's openh264 rather than VideoToolbox (comparisons, tests).
-    #[cfg(target_os = "macos")]
+    /// Cisco's openh264 rather than VideoToolbox / VA-API (comparisons, tests).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn software(
         openh264_path: &std::path::Path,
         settings: EncoderSettings,
@@ -263,6 +267,22 @@ impl VideoEncoder {
                     tracing::warn!(error = %e, "VideoToolbox encoder unavailable; using openh264");
                     self.software_only = true;
                 }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !self.software_only && crate::vaapi::encoder_allowed() {
+            match crate::vaapi::VaH264Encoder::new(
+                width as u32,
+                height as u32,
+                self.settings.max_fps.round().max(1.0) as u32,
+                self.settings.bitrate_bps,
+                Some(&self.api_path),
+            ) {
+                Ok(va) => {
+                    self.engine_name = format!("VA-API ({})", va.name());
+                    return Ok(Engine::VaApi(Box::new(va)));
+                }
+                Err(e) => crate::vaapi::encoder_failed(&e.to_string()),
             }
         }
         #[cfg(windows)]
@@ -377,6 +397,8 @@ impl VideoEncoder {
             Some(Engine::MediaFoundation(mf)) => mf.set_bitrate(bps), // live, no keyframe
             #[cfg(target_os = "macos")]
             Some(Engine::VideoToolbox(vt)) => vt.set_bitrate(bps), // live, no keyframe
+            #[cfg(target_os = "linux")]
+            Some(Engine::VaApi(va)) => va.set_bitrate(bps), // live, no keyframe
             _ => {}
         }
     }
@@ -394,6 +416,8 @@ impl VideoEncoder {
 
     /// Can a reported loss be repaired without a keyframe ([`Self::request_ltr_recovery`])?
     /// VideoToolbox: not yet (its LTR properties are not wired; repairs are keyframes).
+    /// VA-API: no (the driver writes the slice headers, and with them the reference
+    /// marking; repairs are keyframes).
     pub fn supports_ltr(&self) -> bool {
         match &self.encoder {
             Some(Engine::OpenH264(o)) => o.ltr,
@@ -401,6 +425,8 @@ impl VideoEncoder {
             Some(Engine::MediaFoundation(mf)) => mf.ltr_slots() > 0,
             #[cfg(target_os = "macos")]
             Some(Engine::VideoToolbox(_)) => false,
+            #[cfg(target_os = "linux")]
+            Some(Engine::VaApi(_)) => false,
             None => self.openh264_ltr,
         }
     }
@@ -559,6 +585,24 @@ impl VideoEncoder {
                     return self.encode_yuv(yuv, None);
                 }
             },
+            #[cfg(target_os = "linux")]
+            Engine::VaApi(va) => {
+                // A cleared copy (new engine) is rewritten whole, and so is the GPU's.
+                let rows = changed_rows.filter(|_| !self.nv12.is_empty());
+                yuv.write_nv12(&mut self.nv12, changed_rows);
+                match va.encode_nv12(&self.nv12, rows, force_key) {
+                    Ok(out) => {
+                        self.last_was_key = has_idr(&out);
+                        out
+                    }
+                    Err(e) => {
+                        // openh264 takes over (for a while) and gets the whole picture.
+                        self.va_failed(&e.to_string(), force_key);
+                        self.repair = self.repair.or(repair.asked);
+                        return self.encode_yuv(yuv, None);
+                    }
+                }
+            }
         };
         let _ = changed_rows; // only the NV12 paths can use it
         Ok(self.finish(out, force_key, repair))
@@ -573,7 +617,11 @@ impl VideoEncoder {
         return crate::d3d11::texture_path_allowed()
             && (crate::d3d11::software_texture_test()
                 || crate::mf::MfH264Encoder::hardware_available());
-        #[cfg(not(windows))]
+        // Linux: a VA-API encoder and video processor, and the DMA-BUF path not failed
+        // lately (the capturer then asks the compositor for DMA-BUFs).
+        #[cfg(target_os = "linux")]
+        return !self.software_only && crate::vaapi::zero_copy_allowed();
+        #[cfg(not(any(windows, target_os = "linux")))]
         return cfg!(target_os = "macos") && !self.software_only;
     }
 
@@ -629,8 +677,67 @@ impl VideoEncoder {
             }
             out
         }
-        #[cfg(not(any(target_os = "macos", windows)))]
+        #[cfg(target_os = "linux")]
+        {
+            let out = self.encode_dmabuf(surface, w, h);
+            if let Err(e) = &out {
+                crate::vaapi::zero_copy_failed(&format!("encode: {e}"));
+            }
+            out
+        }
+        #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
         match *surface {}
+    }
+
+    /// Linux: convert the screen's DMA-BUF to NV12 on the GPU and encode it there, at
+    /// `w` x `h`.
+    #[cfg(target_os = "linux")]
+    fn encode_dmabuf(
+        &mut self,
+        surface: &crate::capture::Surface,
+        w: usize,
+        h: usize,
+    ) -> Result<Option<Vec<u8>>, CodecError> {
+        self.ensure_engine(w, h)?;
+        let (force_key, repair) = self.begin_frame();
+        let out = match self.encoder.as_mut().expect("built above") {
+            Engine::VaApi(va) => match va.encode_dmabuf(&surface.frame, force_key) {
+                Ok(out) => out,
+                Err(e) => {
+                    // This capture ends; the next one goes through memory.
+                    self.va_failed(&e.to_string(), force_key);
+                    return Err(e);
+                }
+            },
+            Engine::OpenH264(_) => {
+                return Err(CodecError::VaApi(
+                    "openh264 can't encode DMA-BUF screens".into(),
+                ));
+            }
+        };
+        self.last_was_key = has_idr(&out);
+        Ok(self.finish(out, force_key, repair))
+    }
+
+    /// VA-API failed to encode: drop its engines so the next frame builds openh264 (VA-API
+    /// is retried after a while, [`crate::vaapi::encoder_failed`]).
+    #[cfg(target_os = "linux")]
+    fn va_failed(&mut self, error: &str, force_key: bool) {
+        tracing::warn!(error, "VA-API encode failed; using openh264");
+        crate::vaapi::encoder_failed(error);
+        self.encoder = None;
+        self.spare = None;
+        self.nv12.clear();
+        self.force_key |= force_key;
+    }
+
+    /// Linux: where the last VA-API frame's time went (`None` on openh264).
+    #[cfg(target_os = "linux")]
+    pub fn gpu_stages(&self) -> Option<crate::vaapi::Stages> {
+        match &self.encoder {
+            Some(Engine::VaApi(va)) => Some(va.stages()),
+            _ => None,
+        }
     }
 
     /// Windows: convert and encode the desktop texture on the GPU, at `w` x `h`.

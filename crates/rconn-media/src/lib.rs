@@ -11,6 +11,8 @@ pub mod copyrect;
 #[cfg(windows)]
 pub mod d3d11;
 pub mod decode;
+#[cfg(target_os = "linux")]
+pub mod dmabuf;
 pub mod h264;
 #[cfg(windows)]
 pub mod mf;
@@ -23,6 +25,8 @@ mod opus_shim;
 pub mod portal;
 pub mod recovery;
 pub mod sps;
+#[cfg(target_os = "linux")]
+pub mod vaapi;
 pub mod video;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod vt;
