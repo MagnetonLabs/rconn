@@ -8,6 +8,7 @@ mod keymap;
 mod oidc_login;
 mod playback;
 mod prefs;
+mod video_render;
 mod watch;
 
 use anyhow::{Result, bail};

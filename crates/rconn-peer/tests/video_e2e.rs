@@ -174,7 +174,8 @@ async fn run() {
     assert!(decoded >= 100, "expected most of 120 frames, got {decoded}");
     // Bottom-right corner is static gradient: (255*639/640, 255*359/360, 80) in RGB order.
     let i = ((H - 1) * W + (W - 1)) * 4;
-    let px = &last.rgba[i..i + 3];
+    let rgba = last.to_rgba();
+    let px = &rgba[i..i + 3];
     let want = [80u8, 254, 254]; // R=80, G=y-gradient, B=x-gradient (source was BGRA)
     for (got, want) in px.iter().zip(want) {
         assert!(
