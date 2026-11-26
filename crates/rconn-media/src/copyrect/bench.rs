@@ -342,7 +342,7 @@ fn run(
             let (bits, ops) = split(au);
             if let Some(mut f) = dec.decode(&bits).unwrap() {
                 match compositor.compose(ops.as_ref(), &mut f) {
-                    Composed::Show => shown = Some(f.rgba),
+                    Composed::Show => shown = Some(f.to_rgba()),
                     Composed::Resync => out.resyncs += 1,
                 }
             }
@@ -423,14 +423,11 @@ fn instructions_rebuild_every_scrolled_picture() {
                 let mut decoded = DecodedFrame {
                     width: W,
                     height: H,
-                    rgba: vec![0; W * H * 4],
+                    layout: crate::video::PixelLayout::I420,
+                    data: [canvas.y(), canvas.u(), canvas.v()].concat(),
+                    colour: Default::default(),
+                    decode_time: Default::default(),
                 };
-                crate::yuv::i420_to_rgba(
-                    (canvas.y(), canvas.u(), canvas.v()),
-                    canvas.strides(),
-                    (W, H),
-                    &mut decoded.rgba,
-                );
                 let au = composer.sent(&pic, vec![0, 0, 0, 1, 0x65, 0x88]);
                 let ops = split(&au).1.unwrap();
                 if std::env::var_os("RCONN_SCROLL_TRACE").is_some()
@@ -439,7 +436,7 @@ fn instructions_rebuild_every_scrolled_picture() {
                     eprintln!("{} {name} {i}: {ops:?}", page.name);
                 }
                 assert_eq!(compositor.compose(Some(&ops), &mut decoded), Composed::Show);
-                let q = psnr(&screen, &decoded.rgba);
+                let q = psnr(&screen, &decoded.to_rgba());
                 assert!(
                     q > 30.0,
                     "{} {name} frame {i} (offset {offset}): {q:.1} dB, {ops:?}",

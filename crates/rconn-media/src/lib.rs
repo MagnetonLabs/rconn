@@ -8,12 +8,16 @@ pub mod capture;
 pub mod cisco;
 pub mod codec;
 pub mod copyrect;
+pub mod decode;
 #[cfg(windows)]
 pub mod mf;
+#[cfg(windows)]
+pub mod mf_decode;
 #[cfg(all(windows, target_arch = "aarch64"))]
 mod opus_shim;
 #[cfg(target_os = "linux")]
 pub mod portal;
+pub mod sps;
 pub mod video;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod vt;

@@ -3,12 +3,10 @@
 use crate::codec::CodecError;
 use crate::yuv::I420;
 use openh264::OpenH264API;
-use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
     SpsPpsStrategy, UsageType,
 };
-use openh264::formats::YUVSource;
 use std::time::Instant;
 
 /// A captured frame: tightly packed BGRA, `width * 4` bytes per row.
@@ -584,135 +582,7 @@ pub fn should_retarget(current_bps: u32, estimate_bps: u32) -> bool {
     c > 0.0 && ((e - c).abs() / c) > 0.25
 }
 
-/// A decoded frame, RGBA.
-pub struct DecodedFrame {
-    pub width: usize,
-    pub height: usize,
-    pub rgba: Vec<u8>,
-}
-
-/// H.264 decoder: Apple's hardware decoder (VideoToolbox) where available, Cisco's
-/// openh264 otherwise. `RCONN_DECODER=openh264` forces software, for comparisons.
-pub struct VideoDecoder {
-    engine: DecEngine,
-    /// For a fresh software decoder per stream, or falling back to software if the
-    /// hardware decoder refuses a stream.
-    openh264_path: std::path::PathBuf,
-    /// The sequence header (SPS) of the stream being decoded.
-    sps: Vec<u8>,
-}
-
-enum DecEngine {
-    OpenH264(Box<Decoder>),
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    VideoToolbox(crate::vt::VtDecoder),
-}
-
-impl VideoDecoder {
-    pub fn new(openh264_path: &std::path::Path) -> Result<Self, CodecError> {
-        let software = std::env::var("RCONN_DECODER").is_ok_and(|v| v == "openh264");
-        let engine = if cfg!(any(target_os = "macos", target_os = "ios")) && !software {
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            {
-                DecEngine::VideoToolbox(crate::vt::VtDecoder::new())
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            unreachable!()
-        } else {
-            Self::openh264(openh264_path)?
-        };
-        Ok(Self {
-            engine,
-            openh264_path: openh264_path.to_owned(),
-            sps: Vec::new(),
-        })
-    }
-
-    /// Cisco's openh264 on every platform (comparisons, tests).
-    pub fn software(openh264_path: &std::path::Path) -> Result<Self, CodecError> {
-        Ok(Self {
-            engine: Self::openh264(openh264_path)?,
-            openh264_path: openh264_path.to_owned(),
-            sps: Vec::new(),
-        })
-    }
-
-    fn openh264(path: &std::path::Path) -> Result<DecEngine, CodecError> {
-        let api = crate::codec::load_openh264(path)?;
-        let decoder = Decoder::with_api_config(api, DecoderConfig::new())
-            .map_err(|e| CodecError::OpenH264(e.to_string()))?;
-        Ok(DecEngine::OpenH264(Box::new(decoder)))
-    }
-
-    pub fn engine_name(&self) -> &'static str {
-        match self.engine {
-            DecEngine::OpenH264(_) => "openh264 (software)",
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            DecEngine::VideoToolbox(_) => "VideoToolbox (hardware)",
-        }
-    }
-
-    /// Decode one Annex-B access unit. `None` until the decoder has a full picture.
-    ///
-    /// A new sequence header (the host restarted its encoder: a new screen size, a new
-    /// capture after a desktop switch) gets a fresh software decoder, so nothing of the
-    /// old stream (its size, its reference pictures, a header replaced half-way) can keep
-    /// the new one from showing. VideoToolbox opens a new session for it ([`crate::vt`]).
-    pub fn decode(&mut self, annex_b: &[u8]) -> Result<Option<DecodedFrame>, CodecError> {
-        if let Some(sps) = sequence_header(annex_b)
-            && sps != self.sps.as_slice()
-        {
-            let restart = !self.sps.is_empty();
-            self.sps = sps.to_vec();
-            if restart && matches!(self.engine, DecEngine::OpenH264(_)) {
-                self.engine = Self::openh264(&self.openh264_path)?;
-            }
-        }
-        match &mut self.engine {
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            DecEngine::VideoToolbox(vt) => {
-                let mut rgba = Vec::new();
-                match vt.decode(annex_b, &mut rgba) {
-                    Ok(Some((width, height))) => Ok(Some(DecodedFrame {
-                        width,
-                        height,
-                        rgba,
-                    })),
-                    Ok(None) => Ok(None),
-                    Err(e) if e.starts_with("VTDecompressionSessionCreate") => {
-                        // No hardware decoder for this stream: software from here on.
-                        tracing::warn!(error = %e, "hardware decoder unavailable; using openh264");
-                        self.engine = Self::openh264(&self.openh264_path)?;
-                        self.decode(annex_b)
-                    }
-                    Err(e) => Err(CodecError::VideoToolbox(e)),
-                }
-            }
-            DecEngine::OpenH264(decoder) => {
-                let Some(yuv) = decoder
-                    .decode(annex_b)
-                    .map_err(|e| CodecError::OpenH264(e.to_string()))?
-                else {
-                    return Ok(None);
-                };
-                let (width, height) = yuv.dimensions();
-                let mut rgba = vec![0u8; width * height * 4];
-                // Our conversion uses every core (openh264's uses one: ~20 ms at 2992x1878).
-                crate::yuv::i420_to_rgba(
-                    (yuv.y(), yuv.u(), yuv.v()),
-                    yuv.strides(),
-                    (width, height),
-                    &mut rgba,
-                );
-                Ok(Some(DecodedFrame {
-                    width,
-                    height,
-                    rgba,
-                }))
-            }
-        }
-    }
-}
+pub use crate::decode::{DecodedFrame, PixelLayout, VideoDecoder};
 
 #[cfg(test)]
 mod tests {
@@ -929,19 +799,19 @@ mod hardware_decode {
         assert_eq!(a.len(), aus.len(), "every unit gives a picture");
         for (x, y) in a.iter().zip(&b) {
             assert_eq!((x.width, x.height), (y.width, y.height));
-            let diff: u64 = x
-                .rgba
+            let (xr, yr) = (x.to_rgba(), y.to_rgba());
+            let diff: u64 = xr
                 .iter()
-                .zip(&y.rgba)
+                .zip(&yr)
                 .map(|(p, q)| u64::from(p.abs_diff(*q)))
                 .sum();
-            let mean = diff as f64 / x.rgba.len() as f64;
+            let mean = diff as f64 / xr.len() as f64;
             if mean >= 3.0 {
                 for i in [0usize, 1001, 50_000, 2_000_000] {
                     println!(
                         "px {i}: hw {:?} sw {:?}",
-                        &x.rgba[i * 4..i * 4 + 4],
-                        &y.rgba[i * 4..i * 4 + 4]
+                        &xr[i * 4..i * 4 + 4],
+                        &yr[i * 4..i * 4 + 4]
                     );
                 }
             }

@@ -23,7 +23,7 @@
 //! Only viewers that ask for it get this stream (`Control::CopyRects`); others get plain
 //! pictures. Measured on rendered text scrolling at 1920x1080: see `scroll_bench`.
 
-use crate::video::DecodedFrame;
+use crate::video::{DecodedFrame, PixelLayout};
 use crate::yuv::{I420, Rect};
 use openh264::formats::YUVSource;
 use std::borrow::Cow;
@@ -972,10 +972,16 @@ fn dirty_regions(old: &I420, new: &I420, diff: &Diff, moves: &[Move]) -> Vec<Rec
 // ---------------------------------------------------------------------------
 
 /// The viewer's picture, built from decoded canvases and their [`FrameOps`].
+///
+/// Kept as full-resolution Y, Cb and Cr planes: a move by an odd distance then moves
+/// colour exactly with its pixels (4:2:0 chroma can't be moved by half a sample), and
+/// nothing depends on the stream's colour space. Each shown picture is handed on as I420
+/// (top-left chroma sample of each 2x2 block: where nothing moved, exactly the decoded
+/// picture).
 #[derive(Default)]
 pub struct Compositor {
-    /// RGBA, `dims.0 * 4` bytes per row.
-    surface: Vec<u8>,
+    /// Y, Cb, Cr at full resolution, `dims.0` bytes per row each.
+    planes: [Vec<u8>; 3],
     dims: (usize, usize),
     /// Sequence number of the last picture applied; `None` while out of step.
     seq: Option<u32>,
@@ -991,6 +997,16 @@ pub enum Composed {
     /// Out of step with the host: keep showing the previous picture and ask for a
     /// keyframe.
     Resync,
+}
+
+/// Chroma sample (Cb, Cr) at chroma position `(cx, cy)` of a decoded picture.
+fn chroma_at(f: &DecodedFrame, cx: usize, cy: usize) -> (u8, u8) {
+    let cw = f.chroma_size().0;
+    let i = cy * cw + cx;
+    match f.layout {
+        PixelLayout::Nv12 => (f.chroma1()[2 * i], f.chroma1()[2 * i + 1]),
+        PixelLayout::I420 => (f.chroma1()[i], f.chroma2()[i]),
+    }
 }
 
 impl Compositor {
@@ -1020,63 +1036,99 @@ impl Compositor {
             return Composed::Show;
         };
         self.active = true;
-        if frame.rgba.len() != dims.0 * dims.1 * 4 || ops.size != dims {
+        let (w, h) = dims;
+        let (cw, ch) = frame.chroma_size();
+        let chroma_len = 2 * cw * ch;
+        if ops.size != dims
+            || !w.is_multiple_of(2)
+            || !h.is_multiple_of(2)
+            || frame.data.len() < w * h + chroma_len
+        {
             self.seq = None;
             return Composed::Resync;
         }
         if ops.full {
-            self.surface.clear();
-            self.surface.extend_from_slice(&frame.rgba);
+            for p in &mut self.planes {
+                p.clear();
+                p.resize(w * h, 0);
+            }
             self.dims = dims;
+            self.take(frame, whole(w, h));
             self.seq = Some(ops.seq);
-            return Composed::Show;
+            return Composed::Show; // the decoded picture is the picture
         }
-        let in_step = self.seq.is_some_and(|s| ops.seq == s.wrapping_add(1))
-            && self.dims == dims
-            && ops.size == dims;
-        if !in_step || !apply(&mut self.surface, &frame.rgba, dims, ops) {
+        let in_step = self.seq.is_some_and(|s| ops.seq == s.wrapping_add(1)) && self.dims == dims;
+        if !in_step || !self.apply(frame, ops) {
             self.seq = None;
             return Composed::Resync;
         }
         self.seq = Some(ops.seq);
-        frame.rgba.copy_from_slice(&self.surface);
+        // Hand the picture on as I420.
+        let mut data = Vec::with_capacity(w * h * 3 / 2);
+        data.extend_from_slice(&self.planes[0]);
+        for plane in &self.planes[1..] {
+            for row in plane.chunks_exact(w).step_by(2) {
+                data.extend(row.iter().step_by(2));
+            }
+        }
+        frame.data = data;
+        frame.layout = PixelLayout::I420;
         Composed::Show
+    }
+
+    /// Copy rectangle `r` (even coordinates) of decoded `frame` into the planes.
+    fn take(&mut self, frame: &DecodedFrame, r: Rect) {
+        let w = self.dims.0;
+        let [y, cb, cr] = &mut self.planes;
+        for row in r.y..r.y + r.h {
+            let o = row * w + r.x;
+            y[o..o + r.w].copy_from_slice(&frame.y()[o..o + r.w]);
+            for x in (r.x..r.x + r.w).step_by(2) {
+                let (u, v) = chroma_at(frame, x / 2, row / 2);
+                let i = row * w + x;
+                cb[i..i + 2].fill(u);
+                cr[i..i + 2].fill(v);
+            }
+        }
+    }
+
+    /// Apply `ops` to the planes with pixels from `frame`. `false`, and nothing changed,
+    /// if an instruction doesn't fit the picture.
+    fn apply(&mut self, frame: &DecodedFrame, ops: &FrameOps) -> bool {
+        let (w, h) = self.dims;
+        let fits = |r: &Rect| r.w > 0 && r.h > 0 && r.x + r.w <= w && r.y + r.h <= h;
+        let even = |r: &Rect| [r.x, r.y, r.w, r.h].iter().all(|v| v.is_multiple_of(2));
+        if !ops.moves.iter().all(|m| fits(&m.to) && fits(&m.src()))
+            || !ops.regions.iter().all(|r| fits(r) && even(r))
+        {
+            return false;
+        }
+        for m in &ops.moves {
+            for plane in &mut self.planes {
+                move_rect(plane, w, m);
+            }
+        }
+        for r in &ops.regions {
+            self.take(frame, *r);
+        }
+        true
     }
 }
 
-/// Apply `ops` to RGBA `surface` with pixels from `decoded` (same size). `false`, and
-/// nothing changed, if an instruction doesn't fit the picture.
-fn apply(surface: &mut [u8], decoded: &[u8], (w, h): (usize, usize), ops: &FrameOps) -> bool {
-    let fits = |r: &Rect| r.w > 0 && r.h > 0 && r.x + r.w <= w && r.y + r.h <= h;
-    if surface.len() != w * h * 4
-        || decoded.len() != surface.len()
-        || !ops.moves.iter().all(|m| fits(&m.to) && fits(&m.src()))
-        || !ops.regions.iter().all(fits)
-    {
-        return false;
+/// Apply move `m` to one plane (`w` bytes per row), as `memmove` does: overlapping source
+/// and destination are fine.
+fn move_rect(plane: &mut [u8], w: usize, m: &Move) {
+    let mut copy_row = |i: usize| {
+        let s = (m.from_y + i) * w + m.from_x;
+        let d = (m.to.y + i) * w + m.to.x;
+        plane.copy_within(s..s + m.to.w, d);
+    };
+    // Never read a row already written.
+    if m.to.y > m.from_y {
+        (0..m.to.h).rev().for_each(&mut copy_row);
+    } else {
+        (0..m.to.h).for_each(&mut copy_row);
     }
-    let stride = w * 4;
-    for m in &ops.moves {
-        let n = m.to.w * 4;
-        let mut copy_row = |i: usize| {
-            let s = (m.from_y + i) * stride + m.from_x * 4;
-            let d = (m.to.y + i) * stride + m.to.x * 4;
-            surface.copy_within(s..s + n, d);
-        };
-        // Overlapping source and destination: never read a row already written.
-        if m.to.y > m.from_y {
-            (0..m.to.h).rev().for_each(&mut copy_row);
-        } else {
-            (0..m.to.h).for_each(&mut copy_row);
-        }
-    }
-    for r in &ops.regions {
-        for y in r.y..r.y + r.h {
-            let o = y * stride + r.x * 4;
-            surface[o..o + r.w * 4].copy_from_slice(&decoded[o..o + r.w * 4]);
-        }
-    }
-    true
 }
 
 #[cfg(all(test, not(target_os = "ios")))]
@@ -1134,19 +1186,20 @@ mod tests {
         pic
     }
 
-    fn rgba(pic: &I420) -> DecodedFrame {
+    /// `pic` as a decoder would give it (I420 planes).
+    fn decoded(pic: &I420) -> DecodedFrame {
         let (w, h) = pic.dimensions();
-        let mut rgba = vec![0u8; w * h * 4];
-        crate::yuv::i420_to_rgba(
-            (pic.y(), pic.u(), pic.v()),
-            pic.strides(),
-            (w, h),
-            &mut rgba,
-        );
+        let mut data = Vec::with_capacity(w * h * 3 / 2);
+        for plane in [pic.y(), pic.u(), pic.v()] {
+            data.extend_from_slice(plane);
+        }
         DecodedFrame {
             width: w,
             height: h,
-            rgba,
+            layout: PixelLayout::I420,
+            data,
+            colour: Default::default(),
+            decode_time: Default::default(),
         }
     }
 
@@ -1161,7 +1214,7 @@ mod tests {
         hints: &[Move],
     ) -> (FrameOps, DecodedFrame) {
         let (canvas, _) = composer.prepare(pic, hints);
-        let mut decoded = rgba(canvas);
+        let mut decoded = decoded(canvas);
         let au = composer.sent(pic, FAKE_AU.to_vec());
         let (rest, ops) = split(&au);
         assert_eq!(&rest[..], &FAKE_AU, "SEI taken out");
@@ -1248,19 +1301,19 @@ mod tests {
             );
             // The panel never changes: nothing of it moves.
             assert!(ops.moves.iter().all(|m| m.to.x >= 120 && m.from_x >= 120));
-            let truth = rgba(&pic);
+            let truth = decoded(&pic);
             if !odd {
                 assert!(
-                    shown.rgba == truth.rgba,
+                    shown.data == truth.data,
                     "scrolled by {dy}: picture differs"
                 );
             } else {
                 // Odd distances move whole pixels whose 4:2:0 chroma was paired
                 // differently: right, but not bit-identical to a fresh conversion.
                 let off = shown
-                    .rgba
+                    .to_rgba()
                     .iter()
-                    .zip(&truth.rgba)
+                    .zip(&truth.to_rgba())
                     .filter(|(a, b)| a.abs_diff(**b) > 60)
                     .count();
                 assert!(off < W * H / 50, "scrolled by {dy}: {off} bytes off");
@@ -1301,12 +1354,12 @@ mod tests {
         stream(&mut composer, &mut compositor, &base, &[]);
         let (ops, shown) = stream(&mut composer, &mut compositor, &moved, &[hint]);
         assert_eq!(ops.moves, vec![hint]);
-        assert!(shown.rgba == rgba(&moved).rgba);
+        assert!(shown.data == decoded(&moved).data);
         assert!(composer.last().encoded < 0.1, "{:?}", composer.last());
         // A stale hint (nothing moved that way) is dropped, not trusted.
         let (ops, shown) = stream(&mut composer, &mut compositor, &base, &[hint]);
         assert!(ops.moves.iter().all(|m| *m != hint), "{ops:?}");
-        assert!(shown.rgba == rgba(&base).rgba);
+        assert!(shown.data == decoded(&base).data);
     }
 
     #[test]
@@ -1323,7 +1376,7 @@ mod tests {
         assert_eq!(ops.seq, 2, "no gap: the dropped picture was never numbered");
         assert!(!ops.moves.is_empty(), "{ops:?}");
         assert!(ops.moves.iter().all(|m| m.offset() == (0, -50)), "{ops:?}");
-        assert!(shown.rgba == rgba(&pic).rgba);
+        assert!(shown.data == decoded(&pic).data);
     }
 
     #[test]
@@ -1340,7 +1393,7 @@ mod tests {
         assert!(std::ptr::eq(got, &pic), "the screen itself is encoded");
         let au = composer.sent(&pic, FAKE_AU.to_vec());
         assert!(split(&au).1.is_none(), "the next picture says nothing...");
-        let mut f = rgba(&pic);
+        let mut f = decoded(&pic);
         assert_eq!(compositor.compose(None, &mut f), Composed::Resync);
         let _ = composer.prepare(&pic, &[]);
         let au = composer.sent(&pic, FAKE_AU.to_vec());
@@ -1369,7 +1422,10 @@ mod tests {
         let frame = |v: u8| DecodedFrame {
             width: 32,
             height: 32,
-            rgba: vec![v; 32 * 32 * 4],
+            layout: PixelLayout::I420,
+            data: vec![v; 32 * 32 * 3 / 2],
+            colour: Default::default(),
+            decode_time: Default::default(),
         };
         let ops = |seq, full, regions: Vec<Rect>| FrameOps {
             seq,
@@ -1398,11 +1454,7 @@ mod tests {
             c.compose(Some(&ops(8, false, vec![tile])), &mut f),
             Composed::Show
         );
-        assert_eq!(
-            (f.rgba[0], f.rgba[16 * 4]),
-            (1, 2),
-            "only the region is new"
-        );
+        assert_eq!((f.data[0], f.data[16]), (1, 2), "only the region is new");
         // Picture 9 was lost.
         let mut f = frame(3);
         assert_eq!(
@@ -1495,11 +1547,11 @@ mod tests {
                     continue;
                 }
             };
-            let truth = rgba(&pic);
+            let truth = decoded(&pic);
             match compositor.compose(ops.as_ref(), &mut f) {
                 Composed::Show => {
                     assert!(!(21..25).contains(&i), "frame {i}: shown after a loss");
-                    let q = psnr(&f.rgba, &truth.rgba);
+                    let q = psnr(&f.to_rgba(), &truth.to_rgba());
                     assert!(q > 30.0, "frame {i}: {q:.1} dB");
                 }
                 Composed::Resync => {
@@ -1515,28 +1567,29 @@ mod tests {
 
     #[test]
     fn moves_overlapping_themselves_copy_like_memmove() {
-        let (w, h) = (8, 8);
-        let mut surface: Vec<u8> = (0..w * h * 4).map(|i| (i / 4) as u8).collect();
-        let before = surface.clone();
-        let decoded = vec![0u8; w * h * 4];
-        let down = FrameOps {
-            moves: vec![Move {
-                from_x: 1,
-                from_y: 1,
+        let w = 8;
+        let mut plane: Vec<u8> = (0..w * 8).map(|i| i as u8).collect();
+        let before = plane.clone();
+        for (from, to) in [((1, 1), (2, 3)), ((2, 3), (1, 1))] {
+            let m = Move {
+                from_x: from.0,
+                from_y: from.1,
                 to: Rect {
-                    x: 2,
-                    y: 3,
+                    x: to.0,
+                    y: to.1,
                     w: 5,
                     h: 5,
                 },
-            }],
-            ..Default::default()
-        };
-        assert!(apply(&mut surface, &decoded, (w, h), &down));
-        for y in 0..5 {
-            for x in 0..5 {
-                let px = |s: &[u8], x: usize, y: usize| s[(y * w + x) * 4];
-                assert_eq!(px(&surface, x + 2, y + 3), px(&before, x + 1, y + 1));
+            };
+            plane.copy_from_slice(&before);
+            move_rect(&mut plane, w, &m);
+            for y in 0..5 {
+                for x in 0..5 {
+                    assert_eq!(
+                        plane[(y + to.1) * w + x + to.0],
+                        before[(y + from.1) * w + x + from.0]
+                    );
+                }
             }
         }
     }

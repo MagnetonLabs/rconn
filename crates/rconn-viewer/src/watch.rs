@@ -291,7 +291,7 @@ pub(crate) fn save_png(path: &Path, f: &DecodedFrame) -> Result<()> {
     );
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
-    enc.write_header()?.write_image_data(&f.rgba)?;
+    enc.write_header()?.write_image_data(&f.to_rgba())?;
     Ok(())
 }
 

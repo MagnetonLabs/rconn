@@ -86,7 +86,7 @@ fn encode_decode_preserves_the_picture() {
         }
         if let Some(out) = dec.decode(&au).unwrap() {
             assert_eq!((out.width, out.height), (w, h));
-            worst = worst.min(psnr(&frame.bgra, &out.rgba));
+            worst = worst.min(psnr(&frame.bgra, &out.to_rgba()));
             decoded += 1;
         }
     }
