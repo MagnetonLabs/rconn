@@ -9,7 +9,7 @@ use crate::rtc::{CandidateSink, Peer, PeerEvent, PeerOptions, apply_remote};
 use crate::signaling::{SignalingClient, SignalingTx};
 use crate::video::{AudioSender, TargetBitrate, VideoSender};
 use anyhow::{Result, bail};
-use rconn_core::ids::{HostId, SessionId};
+use rconn_core::ids::{HostId, OperatorId, SessionId};
 use rconn_core::protocol::{
     ClientMessage, DATA_CHANNEL_PROTOCOL, SdpType, ServerMessage, SessionPolicy, SignalPayload,
 };
@@ -150,6 +150,9 @@ pub async fn open_viewer_session(
 /// One accepted session, as the host agent sees it.
 pub struct HostSession {
     pub session_id: SessionId,
+    /// Who asked (a guest's id is temporary). With the host's owner, decides whether the
+    /// session may skip the access password.
+    pub operator_id: OperatorId,
     pub policy: SessionPolicy,
     /// The screen track. Write encoded access units here.
     pub video: VideoSender,
@@ -175,7 +178,7 @@ pub async fn run_host(
 ) -> Result<()> {
     let ice = sig.ice_servers.clone();
     let (tx, mut rx) = sig.split();
-    let mut pending: Option<(SessionId, SessionPolicy)> = None;
+    let mut pending: Option<(SessionId, OperatorId, SessionPolicy)> = None;
     // Candidates that arrived before the offer they belong to (see open_viewer_session).
     let mut early: Vec<(SessionId, SignalPayload)> = Vec::new();
     let mut current: Option<(SessionId, Peer)> = None;
@@ -191,7 +194,7 @@ pub async fn run_host(
                 if let Some((_, old)) = current.take() {
                     let _ = old.pc.close().await;
                 }
-                pending = Some((session_id, policy));
+                pending = Some((session_id, operator_id, policy));
                 early.clear();
             }
             ServerMessage::Signal {
@@ -202,7 +205,8 @@ pub async fn run_host(
                         sdp,
                     },
             } => {
-                let Some((sid, policy)) = pending.take().filter(|(sid, _)| *sid == session_id)
+                let Some((sid, operator_id, policy)) =
+                    pending.take().filter(|(sid, _, _)| *sid == session_id)
                 else {
                     tracing::warn!(%session_id, "offer for a session we were not told about");
                     continue;
@@ -252,6 +256,7 @@ pub async fn run_host(
                 });
                 on_session(HostSession {
                     session_id: sid,
+                    operator_id,
                     policy,
                     video,
                     audio,
@@ -269,7 +274,10 @@ pub async fn run_host(
                     if let Err(e) = peer.apply_remote(payload).await {
                         tracing::warn!(error = %e, "could not apply remote signal");
                     }
-                } else if pending.as_ref().is_some_and(|(sid, _)| *sid == session_id) {
+                } else if pending
+                    .as_ref()
+                    .is_some_and(|(sid, _, _)| *sid == session_id)
+                {
                     early.push((session_id, payload));
                 }
             }

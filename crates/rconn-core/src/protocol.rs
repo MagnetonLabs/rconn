@@ -76,6 +76,15 @@ pub enum ClientMessage {
         /// Ed25519 SubjectPublicKeyInfo, DER.
         public_key_der: Vec<u8>,
     },
+    /// First message from a computer with no account that wants an ID (like AnyDesk): the
+    /// server issues an id and a certificate for this public key, owned by nobody. Such a
+    /// host only ever accepts sessions that know its access password. Answered with
+    /// [`ServerMessage::HostEnrolled`] (or an error), then the socket closes.
+    EnrollAnonymous {
+        protocol_version: u16,
+        /// Ed25519 SubjectPublicKeyInfo, DER.
+        public_key_der: Vec<u8>,
+    },
     /// Operator asks which of the org's hosts are online. Answered with [`ServerMessage::Hosts`].
     ListHosts,
     /// Operator asks to open a session to a host.

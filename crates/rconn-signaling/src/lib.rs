@@ -6,6 +6,7 @@ pub mod audit;
 pub mod auth;
 pub mod fleet_auth;
 pub mod oidc;
+pub mod public;
 pub mod reload;
 pub mod store;
 pub mod turn_relay;
@@ -14,17 +15,21 @@ use audit::{AuditEvent, AuditSink, AuthRole, NoAudit};
 use auth::{Authenticator, HostIdentity, HostProofInput, OperatorIdentity};
 use axum::Router;
 use axum::extract::State;
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::{Extensions, HeaderMap, HeaderName};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use rconn_core::PROTOCOL_VERSION;
 use rconn_core::ids::{HostId, SessionId};
+use rconn_core::owner::{HostOwner, owner_admits};
 use rconn_core::protocol::{
     CHALLENGE_LEN, ClientMessage, EndReason, ErrorCode, SERVER_CAPABILITIES, ServerMessage,
     SignalPayload,
 };
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -49,11 +54,22 @@ struct Inner {
     registry: Mutex<Registry>,
     /// The org's fleet CA, when this server may enroll hosts itself.
     enroller: std::sync::OnceLock<(rconn_core::ids::OrgId, rconn_core::fleet::FleetCa)>,
+    /// Hosts without an account (public CA), when this server has one.
+    public: std::sync::OnceLock<public::PublicHosts>,
+    /// Behind a proxy: the header carrying the client's address (its last entry is used).
+    client_ip_header: std::sync::OnceLock<HeaderName>,
+}
+
+struct OnlineHost {
+    identity: HostIdentity,
+    tx: Outbox,
+    /// Who may connect without the access password (and sees it in their list).
+    owner: Option<HostOwner>,
 }
 
 #[derive(Default)]
 struct Registry {
-    hosts: HashMap<HostId, (HostIdentity, Outbox)>,
+    hosts: HashMap<HostId, OnlineHost>,
     labels: HashMap<HostId, String>,
     sessions: HashMap<SessionId, SessionEntry>,
     /// Recent access-password requests per computer (rate limit).
@@ -83,6 +99,8 @@ impl AppState {
                 audit,
                 registry: Mutex::default(),
                 enroller: std::sync::OnceLock::new(),
+                public: std::sync::OnceLock::new(),
+                client_ip_header: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -93,6 +111,28 @@ impl AppState {
         let _ = self.inner.enroller.set((org, ca));
     }
 
+    /// Accept hosts certified by this public CA (owned by nobody, unless the registry says
+    /// otherwise) and, if its limits allow, enroll new ones without an account. The
+    /// authenticator must also trust the CA (`FleetAuthenticator::with_org_ca`).
+    pub fn allow_public_hosts(&self, hosts: public::PublicHosts) {
+        let _ = self.inner.public.set(hosts);
+    }
+
+    /// Read the client's address from this header (e.g. `x-forwarded-for` behind Caddy):
+    /// its last entry, the one the proxy itself added. Only set behind a proxy that
+    /// always writes it, or clients could pick their own address.
+    pub fn trust_client_ip_header(&self, name: HeaderName) {
+        let _ = self.inner.client_ip_header.set(name);
+    }
+
+    /// The owner of a host that just authenticated.
+    fn owner_of(&self, h: &HostIdentity) -> Option<HostOwner> {
+        match self.inner.public.get() {
+            Some(p) if p.org_id() == h.org_id => p.owner(h.host_id),
+            _ => Some(HostOwner::Org { org_id: h.org_id }),
+        }
+    }
+
     fn audit(&self, event: AuditEvent) {
         self.inner.audit.record(event);
     }
@@ -101,12 +141,12 @@ impl AppState {
     /// end with `Revoked`. Its next reconnect is refused by the authenticator.
     pub async fn evict_host(&self, host_id: HostId) {
         let mut reg = self.inner.registry.lock().await;
-        if let Some((h, tx)) = reg.hosts.remove(&host_id) {
+        if let Some(h) = reg.hosts.remove(&host_id) {
             self.audit(AuditEvent::HostOffline {
-                org_id: h.org_id,
+                org_id: h.identity.org_id,
                 host_id,
             });
-            let _ = tx.send(ServerMessage::Error {
+            let _ = h.tx.send(ServerMessage::Error {
                 code: ErrorCode::Forbidden,
                 message: "host revoked".into(),
             });
@@ -137,10 +177,45 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    extensions: Extensions,
+) -> impl IntoResponse {
+    let source = client_ip(&state, &headers, &extensions);
     ws.max_frame_size(MAX_FRAME_BYTES)
         .max_message_size(MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state))
+        .on_upgrade(move |socket| handle_socket(socket, state, source))
+}
+
+/// The client's address: from the trusted proxy header if configured, else the socket's
+/// peer (needs `into_make_service_with_connect_info::<SocketAddr>`).
+fn client_ip(state: &AppState, headers: &HeaderMap, extensions: &Extensions) -> Option<IpAddr> {
+    if let Some(name) = state.inner.client_ip_header.get() {
+        // Several headers or a comma list: the proxy appends, so the last entry is its own.
+        let last = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .rfind(|v| !v.is_empty());
+        if let Some(ip) = last.and_then(|v| v.parse().ok()) {
+            return Some(ip);
+        }
+    }
+    extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(a)| a.ip())
+}
+
+/// Unix seconds now.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Who is on the other end of a socket, once authenticated.
@@ -168,7 +243,7 @@ enum Phase {
     Ready(Peer),
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, source: Option<IpAddr>) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
@@ -226,7 +301,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 continue;
             }
         };
-        match step(&state, &tx, phase, msg).await {
+        match step(&state, &tx, phase, msg, source).await {
             Next::Continue(next) => phase = next,
             // Fatal (auth failure, protocol violation): keep the phase so cleanup still runs.
             Next::Close(last) => {
@@ -249,7 +324,13 @@ enum Next {
 }
 
 /// Advance one connection by one message.
-async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -> Next {
+async fn step(
+    state: &AppState,
+    tx: &Outbox,
+    phase: Phase,
+    msg: ClientMessage,
+    source: Option<IpAddr>,
+) -> Next {
     let auth = &state.inner.auth;
     match (phase, msg) {
         (
@@ -306,16 +387,18 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
             match auth.verify_host(proof).await {
                 Ok(identity) => {
                     let ice_servers = auth.ice_servers(identity.org_id).await;
-                    // A host reconnecting replaces its previous socket.
-                    state
-                        .inner
-                        .registry
-                        .lock()
-                        .await
-                        .hosts
-                        .insert(host_id, (identity, tx.clone()));
+                    let owner = state.owner_of(&identity);
                     {
                         let mut reg = state.inner.registry.lock().await;
+                        // A host reconnecting replaces its previous socket.
+                        reg.hosts.insert(
+                            host_id,
+                            OnlineHost {
+                                identity,
+                                tx: tx.clone(),
+                                owner,
+                            },
+                        );
                         match label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
                             Some(l) => reg.labels.insert(host_id, l.chars().take(64).collect()),
                             None => reg.labels.remove(&host_id),
@@ -326,7 +409,7 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
                         host_id,
                     });
                     let _ = tx.send(welcome(identity.org_id, ice_servers));
-                    tracing::info!(%host_id, org = %identity.org_id, "host online");
+                    tracing::info!(%host_id, org = %identity.org_id, owned = owner.is_some(), "host online");
                     Next::Continue(Phase::Ready(Peer::Host(identity)))
                 }
                 Err(e) => {
@@ -445,7 +528,7 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
         (Phase::Ready(Peer::Operator(op)), ClientMessage::EnrollHost { public_key_der }) => {
             let issued = match state.inner.enroller.get() {
                 Some((org, ca)) if *org == op.org_id => {
-                    let host_id = HostId::new();
+                    let host_id = state.fresh_host_id().await;
                     ca.issue_host_cert_for_public_key(host_id, &public_key_der)
                         .map(|cert| (host_id, cert))
                         .map_err(|_| "not a valid Ed25519 public key")
@@ -472,13 +555,14 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
         }
         (Phase::Ready(Peer::Operator(op)), ClientMessage::ListHosts) => {
             let reg = state.inner.registry.lock().await;
+            // Only hosts this operator owns: never anyone's account-less computer.
             let mut hosts: Vec<_> = reg
                 .hosts
                 .values()
-                .filter(|(h, _)| h.org_id == op.org_id)
-                .map(|(h, _)| rconn_core::protocol::HostInfo {
-                    host_id: h.host_id,
-                    label: reg.labels.get(&h.host_id).cloned(),
+                .filter(|h| owner_admits(h.owner, op.org_id, op.operator_id))
+                .map(|h| rconn_core::protocol::HostInfo {
+                    host_id: h.identity.host_id,
+                    label: reg.labels.get(&h.identity.host_id).cloned(),
                 })
                 .collect();
             hosts.sort_by(|a, b| a.label.cmp(&b.label));
@@ -488,6 +572,18 @@ async fn step(state: &AppState, tx: &Outbox, phase: Phase, msg: ClientMessage) -
         (Phase::Ready(Peer::Operator(op)), ClientMessage::RequestSession { host_id }) => {
             request_session(state, tx, op, host_id, false).await;
             Next::Continue(Phase::Ready(Peer::Operator(op)))
+        }
+        (
+            Phase::New,
+            ClientMessage::EnrollAnonymous {
+                protocol_version,
+                public_key_der,
+            },
+        ) => {
+            if check_version(tx, protocol_version) {
+                enroll_anonymous(state, tx, source, &public_key_der).await;
+            }
+            Next::Close(Phase::New)
         }
         (
             Phase::New,
@@ -564,13 +660,15 @@ async fn guest_hello(state: &AppState, tx: &Outbox, typed: &str) -> Next {
         Next::Close(Phase::New)
     };
     let mut reg = state.inner.registry.lock().await;
-    let Some(host) = reg
+    let mut found = reg
         .hosts
         .values()
-        .map(|(h, _)| *h)
-        .find(|h| h.host_id.matches(typed))
-    else {
-        return refuse("unknown or offline ID");
+        .map(|h| h.identity)
+        .filter(|h| h.host_id.matches(typed));
+    let (Some(host), None) = (found.next(), found.next()) else {
+        // Two computers sharing a short code (org hosts aren't checked for uniqueness):
+        // refuse rather than guess, so a password is never tried on the wrong computer.
+        return refuse("unknown, offline or ambiguous ID");
     };
     let now = std::time::Instant::now();
     let recent = reg.guest_requests.entry(host.host_id).or_default();
@@ -610,6 +708,77 @@ async fn guest_hello(state: &AppState, tx: &Outbox, typed: &str) -> Next {
     }))
 }
 
+/// A computer without an account asks for an ID.
+async fn enroll_anonymous(
+    state: &AppState,
+    tx: &Outbox,
+    source: Option<IpAddr>,
+    public_key_der: &[u8],
+) {
+    let Some(public) = state.inner.public.get() else {
+        state.audit(AuditEvent::AnonymousEnrollRefused {
+            source,
+            reason: "disabled".into(),
+        });
+        return send_err(
+            tx,
+            ErrorCode::Forbidden,
+            public::Refusal::Disabled.message().into(),
+        );
+    };
+    let online: std::collections::HashSet<u32> = state
+        .inner
+        .registry
+        .lock()
+        .await
+        .hosts
+        .keys()
+        .map(|h| public::short_code_number(*h))
+        .collect();
+    match public.enroll(source, public_key_der, |c| online.contains(&c)) {
+        Ok((host_id, cert_pem)) => {
+            state.audit(AuditEvent::AnonymousEnrolled {
+                org_id: public.org_id(),
+                host_id,
+                source,
+            });
+            tracing::info!(%host_id, ?source, "computer enrolled without an account");
+            let _ = tx.send(ServerMessage::HostEnrolled { host_id, cert_pem });
+        }
+        Err(why) => {
+            state.audit(AuditEvent::AnonymousEnrollRefused {
+                source,
+                reason: format!("{why:?}"),
+            });
+            let code = match why {
+                public::Refusal::BadKey => ErrorCode::BadRequest,
+                public::Refusal::Internal => ErrorCode::Internal,
+                _ => ErrorCode::Forbidden,
+            };
+            send_err(tx, code, why.message().into());
+        }
+    }
+}
+
+impl AppState {
+    /// A new host id whose short code no known host uses.
+    async fn fresh_host_id(&self) -> HostId {
+        let reg = self.inner.registry.lock().await;
+        loop {
+            let id = HostId::new();
+            let code = public::short_code_number(id);
+            let taken = self.inner.public.get().is_some_and(|p| p.code_taken(code))
+                || reg
+                    .hosts
+                    .keys()
+                    .any(|h| public::short_code_number(*h) == code);
+            if !taken {
+                return id;
+            }
+        }
+    }
+}
+
 async fn request_session(
     state: &AppState,
     tx: &Outbox,
@@ -618,13 +787,28 @@ async fn request_session(
     guest: bool,
 ) {
     let mut reg = state.inner.registry.lock().await;
-    // Same answer for "offline" and "other org", so operators can't probe other tenants.
+    // A session without the access password only for the host's owner; guests (who must
+    // know the password) only for the one computer they typed. Same answer for "offline",
+    // "other org" and "not yours", so nobody can probe for computers.
     let Some((host, host_tx)) = reg
         .hosts
         .get(&host_id)
-        .filter(|(h, _)| h.org_id == op.org_id)
-        .cloned()
+        .filter(|h| {
+            if guest {
+                h.identity.org_id == op.org_id
+            } else {
+                owner_admits(h.owner, op.org_id, op.operator_id)
+            }
+        })
+        .map(|h| (h.identity, h.tx.clone()))
     else {
+        if !guest {
+            state.audit(AuditEvent::SessionRefused {
+                host_id,
+                operator_id: op.operator_id,
+                reason: "not the host's owner (or offline)".into(),
+            });
+        }
         send_err(tx, ErrorCode::NotFound, "host not found or offline".into());
         return;
     };
@@ -725,7 +909,7 @@ async fn disconnect(state: &AppState, peer: Peer, tx: &Outbox) {
         if reg
             .hosts
             .get(&h.host_id)
-            .is_some_and(|(_, t)| t.same_channel(tx))
+            .is_some_and(|o| o.tx.same_channel(tx))
         {
             reg.hosts.remove(&h.host_id);
             state.audit(AuditEvent::HostOffline {

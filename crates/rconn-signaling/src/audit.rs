@@ -9,6 +9,7 @@ use rconn_core::protocol::EndReason;
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -59,6 +60,24 @@ pub enum AuditEvent {
         org_id: OrgId,
         host_id: HostId,
         operator_id: OperatorId,
+    },
+    /// A computer without an account got an ID (owned by nobody).
+    AnonymousEnrolled {
+        org_id: OrgId,
+        host_id: HostId,
+        source: Option<IpAddr>,
+    },
+    /// An account-less enrollment refused (disabled, rate limit, bad key).
+    AnonymousEnrollRefused {
+        source: Option<IpAddr>,
+        reason: String,
+    },
+    /// A signed-in operator asked for a session to a host they don't own (or that is
+    /// offline). Hosts owned by nobody always need their access password.
+    SessionRefused {
+        host_id: HostId,
+        operator_id: OperatorId,
+        reason: String,
     },
 }
 

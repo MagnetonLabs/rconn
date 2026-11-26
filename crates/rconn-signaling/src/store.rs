@@ -5,6 +5,9 @@
 //! <data-dir>/ca.key.pem      fleet CA private key (0600)
 //! <data-dir>/operators.json  { "<sha256(token) hex>": "<operator id>" }
 //! <data-dir>/revoked.json    [ "<host id>", ... ]
+//! <data-dir>/public-ca.pem, public-ca.key.pem   CA for computers without an account
+//! <data-dir>/public-hosts.jsonl                 their registry (id, owner)
+//! <data-dir>/relay-usage.json                   built-in relay's bytes this month
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -71,6 +74,26 @@ impl DataDir {
             fs::read_to_string(self.p("ca.pem")).context("reading ca.pem (run `init` first?)")?;
         let key = fs::read_to_string(self.p("ca.key.pem")).context("reading ca.key.pem")?;
         Ok(FleetCa::from_pem(&cert, &key)?)
+    }
+
+    /// The CA for computers that enroll without an account (a separate org no operator
+    /// belongs to). Created on first use when `create`; otherwise `None` if absent.
+    pub fn public_ca(&self, create: bool) -> Result<Option<FleetCa>> {
+        let (cert, key) = (self.p("public-ca.pem"), self.p("public-ca.key.pem"));
+        if cert.exists() {
+            let ca = FleetCa::from_pem(
+                &fs::read_to_string(&cert).context("reading public-ca.pem")?,
+                &fs::read_to_string(&key).context("reading public-ca.key.pem")?,
+            )?;
+            return Ok(Some(ca));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let ca = FleetCa::generate(rconn_core::ids::OrgId::new())?;
+        write_private(&key, ca.key_pem())?;
+        fs::write(&cert, ca.cert_pem())?;
+        Ok(Some(ca))
     }
 
     pub fn operators(&self) -> Result<BTreeMap<String, OperatorId>> {
@@ -205,6 +228,16 @@ mod tests {
             !ops.keys().any(|k| k == &token),
             "plaintext token must not be stored"
         );
+
+        assert!(store.public_ca(false).unwrap().is_none());
+        let public = store.public_ca(true).unwrap().unwrap();
+        assert_ne!(
+            public.org_id(),
+            ca.org_id(),
+            "its own org, never the operators'"
+        );
+        let again = store.public_ca(false).unwrap().unwrap();
+        assert_eq!(again.org_id(), public.org_id());
 
         let h = HostId::new();
         store.revoke(h).unwrap();

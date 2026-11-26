@@ -7,8 +7,9 @@ use rconn_core::ids::HostId;
 use rconn_core::protocol::IceServer;
 use rconn_signaling::auth::OperatorIdentity;
 use rconn_signaling::fleet_auth::FleetAuthenticator;
+use rconn_signaling::public::{EnrollLimits, PublicHosts};
 use rconn_signaling::store::{DataDir, unhex32, write_private};
-use rconn_signaling::turn_relay::{TurnConfig, TurnMinter, TurnRelay};
+use rconn_signaling::turn_relay::{RelayUsage, TurnConfig, TurnMinter, TurnRelay};
 use rconn_signaling::{AppState, router};
 use std::fs;
 use std::path::PathBuf;
@@ -100,6 +101,32 @@ struct ServeArgs {
     /// Serve plain HTTP/WebSocket (only behind a TLS-terminating proxy).
     #[arg(long, env = "RCONN_PLAIN")]
     plain: bool,
+    /// Public server (AnyDesk-style, no accounts needed): turns on account-less
+    /// enrollment and the relay caps below unless they are set explicitly.
+    #[arg(long, env = "RCONN_PUBLIC")]
+    public: bool,
+    /// Give IDs to computers without an account (owned by nobody: every session needs
+    /// their access password). Default: on with --public, else off.
+    #[arg(long, env = "RCONN_ANONYMOUS_ENROLL")]
+    anonymous_enroll: Option<bool>,
+    /// Account-less enrollments allowed per source address (IPv6: per /64) per hour.
+    #[arg(long, env = "RCONN_ENROLL_PER_IP_PER_HOUR", default_value_t = 5)]
+    enroll_per_ip_per_hour: usize,
+    /// Account-less enrollments allowed per hour, server-wide.
+    #[arg(long, env = "RCONN_ENROLL_PER_HOUR", default_value_t = 1000)]
+    enroll_per_hour: usize,
+    /// Header holding the client's address, set by the proxy in front (its last entry is
+    /// used). Default: `x-forwarded-for` with --plain, none otherwise; `none` turns it off.
+    #[arg(long, env = "RCONN_CLIENT_IP_HEADER")]
+    client_ip_header: Option<String>,
+    /// Built-in relay: megabytes one allocation may relay before it is closed; 0 means no
+    /// limit. Default: 4096 with --public, else 0.
+    #[arg(long, env = "RCONN_TURN_SESSION_CAP_MB")]
+    turn_session_cap_mb: Option<u64>,
+    /// Built-in relay: gigabytes relayed per calendar month (UTC) before relaying stops
+    /// until the next month; 0 means no limit. Default: 1000 with --public, else 0.
+    #[arg(long, env = "RCONN_TURN_MONTHLY_CAP_GB")]
+    turn_monthly_cap_gb: Option<u64>,
 }
 
 #[tokio::main]
@@ -176,14 +203,32 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
         oidc_client_id,
         oidc_allowed_domain,
         plain,
+        public,
+        anonymous_enroll,
+        enroll_per_ip_per_hour,
+        enroll_per_hour,
+        client_ip_header,
+        turn_session_cap_mb,
+        turn_monthly_cap_gb,
     } = args;
     let bind = bind.as_str();
+    let nonzero = |v: u64| (v > 0).then_some(v);
+    let session_cap = nonzero(turn_session_cap_mb.unwrap_or(if public { 4096 } else { 0 }))
+        .map(|mb| mb.saturating_mul(1024 * 1024));
+    let monthly_cap = nonzero(turn_monthly_cap_gb.unwrap_or(if public { 1000 } else { 0 }))
+        .map(|gb| gb.saturating_mul(1024 * 1024 * 1024));
+    let usage = Arc::new(RelayUsage::new(
+        monthly_cap,
+        Some(store.path().join("relay-usage.json")),
+    ));
     let turn = match turn_public_ip {
         Some(ip) => Some(TurnConfig {
             listen: turn_listen,
             public_ip: ip,
             relay_ports: parse_ports(&turn_ports)?,
             shared_secret: store.turn_secret()?,
+            per_allocation_bytes: session_cap,
+            usage: usage.clone(),
         }),
         None => None,
     };
@@ -192,6 +237,7 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
             shared_secret: secret,
             turn_urls: vec![url],
             stun_urls: vec![],
+            usage: None,
         }),
         (Some(_), None) => anyhow::bail!("--turn-url needs --turn-secret"),
         _ => None,
@@ -202,6 +248,30 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
     let ca = store.load_ca()?;
     let org_id = ca.org_id();
     let mut auth = FleetAuthenticator::new(server_id.clone()).with_org_ca(org_id, ca.cert_pem());
+    // Computers without an account: a separate CA (its own org, which no operator is in).
+    // Its hosts keep connecting even after enrollment is turned off.
+    let anonymous_enroll = anonymous_enroll.unwrap_or(public);
+    let public_hosts = match store.public_ca(anonymous_enroll)? {
+        Some(public_ca) => {
+            auth = auth.with_org_ca(public_ca.org_id(), public_ca.cert_pem());
+            let limits = anonymous_enroll.then_some(EnrollLimits {
+                per_source_per_hour: enroll_per_ip_per_hour,
+                global_per_hour: enroll_per_hour,
+            });
+            let hosts = PublicHosts::new(
+                public_ca,
+                limits,
+                Some(store.path().join("public-hosts.jsonl")),
+            )?;
+            tracing::info!(
+                enrollment = ?limits,
+                hosts = hosts.len(),
+                "computers without an account accepted"
+            );
+            Some(hosts)
+        }
+        None => None,
+    };
     for (digest_hex, operator_id) in store.operators()? {
         let digest = unhex32(&digest_hex).context("corrupt operators.json")?;
         auth = auth.with_operator_token_digest(
@@ -223,8 +293,22 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
         Some(cfg) => {
             let relay = TurnRelay::start(cfg).await?;
             let public = std::net::SocketAddr::new(cfg.public_ip, relay.local_addr.port());
-            auth = auth.with_turn(TurnMinter::for_relay(public, cfg.shared_secret.clone()));
-            tracing::info!(listen = %relay.local_addr, %public, ports = ?cfg.relay_ports, "TURN relay up");
+            auth = auth.with_turn(
+                TurnMinter::for_relay(public, cfg.shared_secret.clone()).with_usage(usage.clone()),
+            );
+            tracing::info!(
+                listen = %relay.local_addr, %public, ports = ?cfg.relay_ports,
+                session_cap_bytes = ?session_cap, monthly_cap_bytes = ?monthly_cap,
+                used_this_month = usage.used(), "TURN relay up"
+            );
+            // Keep the month's count across restarts.
+            let usage = usage.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    usage.save();
+                }
+            });
             Some(relay)
         }
         None => None,
@@ -261,6 +345,20 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
     let state = AppState::with_audit(auth.clone(), Arc::new(audit));
     // Signed-in operators may turn their own computers into hosts from the app.
     state.allow_enrollment(org_id, ca);
+    if let Some(hosts) = public_hosts {
+        state.allow_public_hosts(hosts);
+    }
+    let header = match client_ip_header.as_deref().map(str::trim) {
+        Some("none") | Some("") => None,
+        Some(h) => Some(h.to_owned()),
+        None => plain.then(|| "x-forwarded-for".to_owned()),
+    };
+    if let Some(h) = header {
+        let name = axum::http::HeaderName::try_from(h.as_str())
+            .with_context(|| format!("--client-ip-header {h}"))?;
+        tracing::info!(header = %name, "client addresses read from the proxy's header");
+        state.trust_client_ip_header(name);
+    }
     // Live reload: operators, accounts and revocations apply without a restart.
     {
         let (store, auth, state) = (DataDir::new(store.path()), auth.clone(), state.clone());
@@ -296,7 +394,7 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
             .await?;
             axum_server::bind_rustls(addr, tls)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
         (false, None) => anyhow::bail!(
@@ -306,12 +404,13 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
             tracing::warn!(%org_id, %server_id, %addr, revoked = revoked.len(), "serving PLAIN ws (expecting a TLS proxy in front)");
             axum_server::bind(addr)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
     }
     if let Some(relay) = relay {
         relay.close().await?;
     }
+    usage.save();
     Ok(())
 }

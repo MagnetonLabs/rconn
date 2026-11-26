@@ -159,6 +159,30 @@ impl SignalingClient {
         }
     }
 
+    /// Get an ID for this computer without an account (servers that allow it, like the
+    /// public one): returns its new id and certificate for `key`. The host belongs to
+    /// nobody, so every session to it must know its access password.
+    pub async fn enroll_anonymous(
+        url: &str,
+        trust: &ServerTrust,
+        key: &rconn_core::fleet::HostKey,
+    ) -> Result<(HostId, String)> {
+        let mut ws = open(url, trust).await?;
+        send_on(
+            &mut ws,
+            &ClientMessage::EnrollAnonymous {
+                protocol_version: PROTOCOL_VERSION,
+                public_key_der: key.public_der(),
+            },
+        )
+        .await?;
+        match recv_on(&mut ws).await? {
+            ServerMessage::HostEnrolled { host_id, cert_pem } => Ok((host_id, cert_pem)),
+            ServerMessage::Error { message, .. } => bail!("{message}"),
+            other => bail!("unexpected answer to enrollment: {other:?}"),
+        }
+    }
+
     /// The org's online computers (needs an operator token).
     pub async fn list_hosts(
         url: &str,
