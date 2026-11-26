@@ -1324,7 +1324,10 @@ mod ltr_tests {
             // one keyframe, and not taken for one that pays for changes.
             if !e.engine_name().contains("H264 Encoder MFT") {
                 assert_eq!(keys, 1, "only the first frame");
-                assert!(!e.bitrate_change_costs_keyframe(), "free changes taken for costly");
+                assert!(
+                    !e.bitrate_change_costs_keyframe(),
+                    "free changes taken for costly"
+                );
             }
         }
     }
