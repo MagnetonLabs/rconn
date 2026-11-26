@@ -454,6 +454,15 @@ pub enum Control {
     /// the resolution to its window). Appended: hosts that predate it reject it as an
     /// unknown message, log it and carry on.
     RestoreResolution,
+    /// Viewer -> host: the newest video frame (by the id the host tags each frame with)
+    /// decoded with every frame before it intact; with `lost`, the frames after it are
+    /// missing or broken and the host should repair them (from a long-term reference, or
+    /// with a keyframe). Sent only to hosts that tag their frames. Appended: older hosts
+    /// reject it as an unknown message, log it and carry on.
+    FrameAck {
+        decoded: u32,
+        lost: bool,
+    },
 }
 
 /// Toolbar actions the host performs on request.
@@ -739,6 +748,12 @@ mod tests {
             DataMessage::decode(&restore).unwrap(),
             DataMessage::Control(Control::RestoreResolution)
         );
+        let ack = enc(Control::FrameAck {
+            decoded: 300,
+            lost: true,
+        });
+        assert_eq!(restore[1] + 1, ack[1], "FrameAck appended after it");
+        assert_eq!(&ack[2..], [0xac, 0x02, 1], "varint id, then the flag");
     }
 
     #[test]

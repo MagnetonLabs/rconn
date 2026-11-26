@@ -4,6 +4,7 @@
 pub mod bwe;
 pub mod clipboard;
 pub mod files;
+pub mod frames;
 pub mod guest;
 pub mod identity;
 pub mod rtc;

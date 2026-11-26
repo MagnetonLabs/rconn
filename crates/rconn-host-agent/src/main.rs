@@ -586,6 +586,9 @@ async fn serve_channel(
                     Ok(_) if !gate.is_open() => {}
                     Ok(DataMessage::Control(Control::Ping(n))) => send(DataMessage::Control(Control::Pong(n))).await,
                     Ok(DataMessage::Control(Control::RequestKeyframe)) => keyframes.request(),
+                    Ok(DataMessage::Control(Control::FrameAck { decoded, lost })) => {
+                        keyframes.frame_feedback(rconn_peer::frames::Feedback { decoded, lost })
+                    }
                     Ok(DataMessage::Control(Control::Action(action))) => host_action(action),
                     Ok(DataMessage::Control(Control::Resize { width, height })) => {
                         if allow_resize {

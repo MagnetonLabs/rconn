@@ -12,10 +12,11 @@ use anyhow::Result;
 use rconn_media::capture::{Captured, Capturer, Surface};
 use rconn_media::video::{EncoderSettings, VideoEncoder, should_retarget};
 use rconn_media::yuv::I420;
+use rconn_peer::frames::{self, Feedback, FrameTag};
 use rconn_peer::video::{TargetBitrate, VideoSender};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 
@@ -30,15 +31,30 @@ pub struct StreamConfig {
     pub motion_half_res: bool,
 }
 
-/// Asks the encoder for an IDR frame (viewer joined, decoder lost sync).
+/// The viewer's requests to the encoder: an IDR frame (viewer joined, decoder lost
+/// sync), and per-frame feedback (frames decoded intact; a loss to repair).
 #[derive(Clone, Default)]
-pub struct KeyframeRequests(Arc<Notify>);
+pub struct KeyframeRequests {
+    keyframe: Arc<Notify>,
+    feedback: Arc<Mutex<Vec<Feedback>>>,
+}
 
 impl KeyframeRequests {
     pub fn request(&self) {
-        self.0.notify_one();
+        self.keyframe.notify_one();
+    }
+
+    /// `Control::FrameAck` from the viewer.
+    pub fn frame_feedback(&self, f: Feedback) {
+        let mut q = self.feedback.lock().expect("feedback");
+        if q.len() < 64 {
+            q.push(f);
+        }
     }
 }
+
+/// How often the encoder follows the bandwidth estimate (changes are live and cheap).
+const RETARGET_EVERY: Duration = Duration::from_millis(200);
 
 /// Encode rate for small background changes (spinner, caret) when nobody is interacting.
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(100);
@@ -51,9 +67,10 @@ const BIG_CHANGE: f32 = 0.02;
 /// Frames in a row changing this share of the screen count as motion (scrolling, a big
 /// video; not an animated banner)...
 const MOTION_CHANGE: f32 = 0.25;
-const MOTION_FRAMES: u32 = 4;
+/// (Each switch between half and full size costs a keyframe, so both ways have slack.)
+const MOTION_FRAMES: u32 = 6;
 /// ...which ends after this long without such a frame.
-const MOTION_SETTLE: Duration = Duration::from_millis(700);
+const MOTION_SETTLE: Duration = Duration::from_millis(1000);
 /// A new capture's first keyframe is sent again after this long if nothing followed it.
 const STILL_REPEAT: Duration = Duration::from_secs(1);
 /// Only screens this large (in pixels) are halved during motion.
@@ -90,25 +107,33 @@ pub async fn run(
     let want_key = Arc::new(AtomicBool::new(false));
     let forward = {
         let want_key = want_key.clone();
+        let keyframe = keyframes.keyframe.clone();
         tokio::spawn(async move {
             loop {
-                keyframes.0.notified().await;
+                keyframe.notified().await;
                 want_key.store(true, Ordering::Relaxed);
             }
         })
     };
     // Two frames in flight at most: if the network can't keep up, encoding waits.
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2);
+    let (tx, mut rx) = mpsc::channel::<(Vec<u8>, Instant)>(2);
+    let sending = Arc::new(SendClock::default());
     let ctx = Ctx {
         cfg,
         target,
         want_key,
+        feedback: keyframes.feedback.clone(),
         stop: stop.clone(),
         first_sent: AtomicBool::new(false),
+        next_id: AtomicU32::new(0),
+        sending: sending.clone(),
     };
     let worker = tokio::task::spawn_blocking(move || supervise(make_capturer, &ctx, &tx));
-    while let Some(au) = rx.recv().await {
-        if let Err(e) = video.write(au, frame_budget).await {
+    while let Some((au, encoded_at)) = rx.recv().await {
+        let t0 = Instant::now();
+        let result = video.write(au, frame_budget).await;
+        sending.note(t0 - encoded_at, t0.elapsed());
+        if let Err(e) = result {
             tracing::info!(error = %e, "video track closed");
             break;
         }
@@ -127,8 +152,39 @@ struct Ctx {
     cfg: StreamConfig,
     target: TargetBitrate,
     want_key: Arc<AtomicBool>,
+    feedback: Arc<Mutex<Vec<Feedback>>>,
     stop: Arc<AtomicBool>,
     first_sent: AtomicBool,
+    /// Id of the next frame of the stream (ids run on across capture generations).
+    next_id: AtomicU32,
+    sending: Arc<SendClock>,
+}
+
+/// Time encoded frames spend waiting for the session task, and being packetized and
+/// handed to the pacer (`write`), summed in microseconds, for the stats log.
+#[derive(Default)]
+struct SendClock {
+    queue_us: AtomicU64,
+    write_us: AtomicU64,
+    frames: AtomicU64,
+}
+
+impl SendClock {
+    fn note(&self, queued: Duration, write: Duration) {
+        self.queue_us
+            .fetch_add(queued.as_micros() as u64, Ordering::Relaxed);
+        self.write_us
+            .fetch_add(write.as_micros() as u64, Ordering::Relaxed);
+        self.frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// (queue ms, write ms) per frame since the last call.
+    fn take(&self) -> (f64, f64) {
+        let n = self.frames.swap(0, Ordering::Relaxed).max(1) as f64;
+        let q = self.queue_us.swap(0, Ordering::Relaxed) as f64;
+        let w = self.write_us.swap(0, Ordering::Relaxed) as f64;
+        (q / n / 1000.0, w / n / 1000.0)
+    }
 }
 
 /// Each capture "generation" lives on a fresh OS thread: after a desktop switch (lock
@@ -136,7 +192,11 @@ struct Ctx {
 /// a thread that has created D3D objects can't reliably move to another desktop. So on
 /// any capture error the generation ends and a new one starts (with a new encoder, whose
 /// first frame is a keyframe).
-fn supervise(make: CapturerFactory, ctx: &Ctx, tx: &mpsc::Sender<Vec<u8>>) -> Result<()> {
+fn supervise(
+    make: CapturerFactory,
+    ctx: &Ctx,
+    tx: &mpsc::Sender<(Vec<u8>, Instant)>,
+) -> Result<()> {
     let mut backoff = Duration::from_millis(250);
     let mut generation = 0u32;
     while !ctx.stop.load(Ordering::Relaxed) {
@@ -192,7 +252,7 @@ impl Pending {
 fn run_generation(
     make: &(dyn Fn() -> Result<Box<dyn Capturer>> + Send + Sync),
     ctx: &Ctx,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &mpsc::Sender<(Vec<u8>, Instant)>,
 ) -> Result<bool> {
     let cfg = &ctx.cfg;
     let budget = Duration::from_secs(1) / cfg.max_fps.max(1);
@@ -206,6 +266,9 @@ fn run_generation(
             slice_bytes: None,
         },
     )?;
+    // Frame ids run on from the previous capture; the viewer acknowledges by id.
+    let first_id = ctx.next_id.load(Ordering::Relaxed);
+    enc.start_frame_ids_at(first_id);
     // A hardware encoder that reads the capturer's GPU surfaces (macOS VideoToolbox) gets
     // them as they are: no CPU conversion, and no half-size motion frames (a CPU saving it
     // doesn't need).
@@ -220,7 +283,7 @@ fn run_generation(
     let mut produced = false;
     let started = Instant::now();
     let mut last_encode = Instant::now() - Duration::from_secs(1);
-    let mut retarget_at = Instant::now() + Duration::from_secs(1);
+    let mut retarget_at = Instant::now() + RETARGET_EVERY;
     let mut last_change = Instant::now();
     let mut warned = false;
     // The first keyframe can go out before the viewer is ready to receive video, and an
@@ -308,6 +371,23 @@ fn run_generation(
         };
 
         let now = Instant::now();
+        // The viewer's feedback: acknowledgements confirm long-term references (and that
+        // this capture's first keyframe arrived: no repeats of it needed); a loss is
+        // repaired at once, from a long-term reference where the encoder has one.
+        let mut repair = false;
+        for f in std::mem::take(&mut *ctx.feedback.lock().expect("feedback")) {
+            if f.lost {
+                enc.request_ltr_recovery(f.decoded);
+                stats.losses += 1;
+                repair = true;
+            } else {
+                enc.ltr_acked(f.decoded);
+                if sent_any && f.decoded >= first_id && !resends.is_empty() {
+                    resends.clear(); // the viewer has this capture's picture
+                    repeat_if_still = false;
+                }
+            }
+        }
         let mut force = ctx.want_key.swap(false, Ordering::Relaxed);
         if resends.first().is_some_and(|&t| now >= t) {
             resends.remove(0);
@@ -335,21 +415,23 @@ fn run_generation(
         } else {
             BACKGROUND_INTERVAL.max(budget)
         };
-        let encode_now = force || sharpen || (pending.is_some() && now >= last_encode + interval);
+        let encode_now =
+            force || repair || sharpen || (pending.is_some() && now >= last_encode + interval);
         if !encode_now {
             continue;
         }
 
         if now >= retarget_at {
-            retarget_at = now + Duration::from_secs(1);
+            retarget_at = now + RETARGET_EVERY;
             let want = (ctx.target.get() as u32).clamp(300_000, cfg.max_bitrate_bps);
             if should_retarget(enc.settings().bitrate_bps, want) {
-                tracing::info!(
+                tracing::debug!(
                     from_kbps = enc.settings().bitrate_bps / 1000,
                     to_kbps = want / 1000,
-                    "retarget encoder"
+                    "retarget encoder (live)"
                 );
                 enc.set_bitrate(want);
+                stats.retargets += 1;
             }
         }
         let p = pending.take();
@@ -380,6 +462,26 @@ fn run_generation(
             stats.urgent += 1;
         }
         if let Some(au) = encoded {
+            let info = enc.last_frame();
+            ctx.next_id
+                .store(info.id.wrapping_add(1), Ordering::Relaxed);
+            stats.keys += u32::from(info.key);
+            stats.repairs += u32::from(info.recovers_from.is_some());
+            let host_us = p
+                .as_ref()
+                .map_or(t0, |p| p.captured_at)
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u32::MAX)) as u32;
+            let au = frames::tag(
+                au,
+                &FrameTag {
+                    id: info.id,
+                    key: info.key,
+                    recovers_from: info.recovers_from,
+                    host_us,
+                },
+            );
             if !ctx.first_sent.swap(true, Ordering::Relaxed) {
                 let now = Instant::now();
                 resends = [300, 1000, 2500]
@@ -410,7 +512,7 @@ fn run_generation(
                 stats.latency += p.captured_at.elapsed();
                 stats.changed += f64::from(p.changed);
             }
-            if tx.blocking_send(au).is_err() {
+            if tx.blocking_send((au, Instant::now())).is_err() {
                 break; // the session ended
             }
         } else if let Some(p) = p {
@@ -418,7 +520,7 @@ fn run_generation(
             // under load): its change still has to reach the viewer, with the next frame.
             pending = Some(p);
         }
-        stats.maybe_log((w, h), ctx.target.get());
+        stats.maybe_log((w, h), &ctx.target, &ctx.sending);
     }
     Ok(produced)
 }
@@ -468,6 +570,12 @@ struct Stats {
     /// Frames sent at half size (motion).
     half: u32,
     captures: u32,
+    /// Keyframes, loss repairs from long-term references, losses the viewer reported,
+    /// live bitrate changes.
+    keys: u32,
+    repairs: u32,
+    losses: u32,
+    retargets: u32,
     bytes: usize,
     capture: Duration,
     encode: Duration,
@@ -479,7 +587,7 @@ struct Stats {
 }
 
 impl Stats {
-    fn maybe_log(&mut self, (w, h): (usize, usize), target_bps: f64) {
+    fn maybe_log(&mut self, (w, h): (usize, usize), target: &TargetBitrate, sending: &SendClock) {
         if self.since.is_none() {
             self.since = Some(Instant::now());
             self.cpu_at_start = cpu_times();
@@ -492,6 +600,7 @@ impl Stats {
         let pct = |now: f64, then: f64| format!("{:.0}", (now - then) / secs * 100.0);
         let n = f64::from(self.frames.max(1));
         let per = |d: Duration, n: f64| format!("{:.1}", d.as_secs_f64() * 1000.0 / n);
+        let (queue_ms, write_ms) = sending.take();
         tracing::info!(
             size = format!("{w}x{h}"),
             fps = format!("{:.1}", f64::from(self.frames) / secs),
@@ -502,7 +611,16 @@ impl Stats {
             capture_ms = per(self.capture, f64::from(self.captures.max(1))),
             encode_ms = per(self.encode, n),
             capture_to_send_ms = per(self.latency, n),
-            gcc_kbps = format!("{:.0}", target_bps / 1000.0),
+            // Stages after the encoder: waiting for the session task, then packetizing
+            // into RTP and queueing at the pacer.
+            queue_ms = format!("{queue_ms:.1}"),
+            write_ms = format!("{write_ms:.1}"),
+            bwe_kbps = format!("{:.0}", target.estimate() / 1000.0),
+            encoder_kbps = format!("{:.0}", target.get() / 1000.0),
+            keyframes_per_min = format!("{:.1}", f64::from(self.keys) * 60.0 / secs),
+            repairs = self.repairs,
+            losses = self.losses,
+            retargets = self.retargets,
             // 100 = one core. "thread" is capture + conversion + handing frames to the
             // encoder; the rest of "process" is the encoder's own threads and networking.
             cpu_process_pct = pct(process, self.cpu_at_start.0),

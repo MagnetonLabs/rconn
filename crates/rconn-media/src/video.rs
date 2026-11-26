@@ -1,6 +1,9 @@
 //! H.264 encode/decode for screen content, on Cisco's openh264.
 
 use crate::codec::CodecError;
+use crate::h264::SyntaxTracker;
+pub use crate::recovery::FrameInfo;
+use crate::recovery::{Ledger, Sent};
 use crate::yuv::I420;
 use openh264::OpenH264API;
 use openh264::decoder::{Decoder, DecoderConfig};
@@ -8,9 +11,6 @@ use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
     SpsPpsStrategy, UsageType,
 };
-use crate::h264::SyntaxTracker;
-pub use crate::recovery::FrameInfo;
-use crate::recovery::{Ledger, Sent};
 use openh264::formats::YUVSource;
 use std::time::Instant;
 
@@ -715,9 +715,7 @@ impl VideoEncoder {
         let slice = self.syntax.access_unit(out);
         let key = self.last_was_key;
         let ltr_slot = match &self.encoder {
-            Some(Engine::OpenH264(o)) if o.ltr => {
-                slice.and_then(|s| s.marks_long_term).map(|_| 0)
-            }
+            Some(Engine::OpenH264(o)) if o.ltr => slice.and_then(|s| s.marks_long_term).map(|_| 0),
             _ => repair.marked,
         };
         let recovers_from = match (repair.base, &self.encoder) {
