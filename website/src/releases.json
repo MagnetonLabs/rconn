@@ -1,6 +1,6 @@
 {
-  "version": "0.1.0",
-  "baseUrl": "https://github.com/MagnetonLabs/rconn/releases/download/v0.1.0/",
+  "version": "0.1.1",
+  "baseUrl": "https://github.com/MagnetonLabs/rconn/releases/download/v0.1.1/",
   "files": [
     {
       "id": "macos",
@@ -8,9 +8,9 @@
       "name": "macOS",
       "arch": "universal",
       "archLabel": "Apple silicon and Intel",
-      "file": "Rconn-0.1.0.dmg",
-      "sizeBytes": 52022384,
-      "sha256": "dc552ca8f2fdf149f3bbb8b4ad658e54022fed166605ce58606be5e0f4527fd1",
+      "file": "Rconn-0.1.1.dmg",
+      "sizeBytes": 52023167,
+      "sha256": "b7db43c266a8ac4059473a3ac51086ed60bc8fc49eed14b2cb557a13a98a6b46",
       "requires": "macOS 13 Ventura or later"
     },
     {
@@ -19,9 +19,9 @@
       "name": "Windows",
       "arch": "x64",
       "archLabel": "x64 (Intel and AMD)",
-      "file": "rconn-host-setup-x64-0.1.0.exe",
-      "sizeBytes": 22024693,
-      "sha256": "1733fe09ca5894a5f443ae2d6060ddb3dec5af0bb15d0cb9f2569a3f102a4ca5",
+      "file": "rconn-host-setup-x64-0.1.1.exe",
+      "sizeBytes": 22024460,
+      "sha256": "ade7240bfbbd2db1ede45094db47e6ae13ac49e7fb7c94473d521a1562ca2927",
       "requires": "64-bit Windows 11 (Windows 10 untested)"
     },
     {
@@ -30,9 +30,9 @@
       "name": "Windows",
       "arch": "arm64",
       "archLabel": "ARM64 (Snapdragon and other Arm PCs)",
-      "file": "rconn-host-setup-arm64-0.1.0.exe",
-      "sizeBytes": 19137948,
-      "sha256": "33aeb3d885662561b24a112fe55bcba0c1ff405dd1c277fe604719a23c58ac96",
+      "file": "rconn-host-setup-arm64-0.1.1.exe",
+      "sizeBytes": 19135292,
+      "sha256": "1c7b37018cf42c6af8da0d6a0b46941b310692009353591bf6235d074303ca43",
       "requires": "Windows 11 on Arm"
     },
     {
@@ -41,9 +41,9 @@
       "name": "Linux",
       "arch": "amd64",
       "archLabel": "x86-64 (.deb)",
-      "file": "rconn_0.1.0_amd64.deb",
-      "sizeBytes": 19067220,
-      "sha256": "b7fdc79e76078493f615b0a2781a460436cbdb12cfb72d14cbad2a612bbce48e",
+      "file": "rconn_0.1.1_amd64.deb",
+      "sizeBytes": 19050320,
+      "sha256": "08074c70db2ccfec9de538a070dedc53e0712d3483ba1319bf2a39f75c0448a2",
       "requires": "Ubuntu 24.04 or later, X11 or Wayland"
     },
     {
@@ -52,9 +52,9 @@
       "name": "Linux",
       "arch": "arm64",
       "archLabel": "ARM64 (.deb)",
-      "file": "rconn_0.1.0_arm64.deb",
-      "sizeBytes": 16854280,
-      "sha256": "6275a143971c4665dc5be8814af870b8cde4ce34d7881dd5837c2c712d86117a",
+      "file": "rconn_0.1.1_arm64.deb",
+      "sizeBytes": 16832884,
+      "sha256": "5f5f822c36d7434828415742234e898f822566206090d4bdf5052ba18ef2da13",
       "requires": "Ubuntu 24.04 or later, X11 or Wayland"
     }
   ]
