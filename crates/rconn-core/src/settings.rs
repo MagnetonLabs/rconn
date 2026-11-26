@@ -86,6 +86,9 @@ pub struct HostSettings {
     /// With an access password set, also let someone without it ask the person at the
     /// computer to accept. Off by default: then the password is the only way in.
     pub ask_with_password: bool,
+    /// Let viewers browse this computer's files and copy them both ways (the signed-in
+    /// user's home folder; uploads land in Downloads/Rconn). Fleet policy can lock it.
+    pub file_transfer: bool,
 }
 
 impl Default for HostSettings {
@@ -99,6 +102,7 @@ impl Default for HostSettings {
             log_level: "info".into(),
             access_password: String::new(),
             ask_with_password: false,
+            file_transfer: true,
         }
     }
 }
@@ -409,6 +413,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "log_level",
     "access_password",
     "ask_with_password",
+    "file_transfer",
 ];
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -506,6 +511,35 @@ mod tests {
         assert_eq!(
             s.check_write("nope", Writer::Admin, false),
             Err(WriteDenied::UnknownKey("nope".into()))
+        );
+    }
+
+    /// File transfer follows clipboard's rules: on by default, the local user may change
+    /// it, fleet policy locks it.
+    #[test]
+    fn file_transfer_defaults_on_and_policy_locks_it() {
+        let s = LoadedSettings::load(SettingsLayers::default()).unwrap();
+        assert!(s.settings().file_transfer);
+        assert_eq!(s.check_write("file_transfer", Writer::User, false), Ok(()));
+        let dir = tempfile::tempdir().unwrap();
+        let user = write(&dir, "user.toml", "file_transfer = false\n");
+        let s = LoadedSettings::load(SettingsLayers {
+            user_file: Some(user.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!s.settings().file_transfer);
+        assert_eq!(s.source("file_transfer"), Source::UserFile);
+        let s = LoadedSettings::load(SettingsLayers {
+            user_file: Some(user),
+            fleet_policy: Some(json!({ "file_transfer": true })),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(s.settings().file_transfer, "policy wins");
+        assert_eq!(
+            s.check_write("file_transfer", Writer::Admin, false),
+            Err(WriteDenied::LockedByPolicy("file_transfer".into()))
         );
     }
 

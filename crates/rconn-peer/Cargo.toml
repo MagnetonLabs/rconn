@@ -23,6 +23,8 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 webpki-roots = "1.0.12"
 rtc = "=0.21.1"
 arboard = { version = "3.7.0", default-features = false, optional = true }
+sha2 = "0.11.1"
+thiserror.workspace = true
 
 [features]
 default = ["clipboard"]
