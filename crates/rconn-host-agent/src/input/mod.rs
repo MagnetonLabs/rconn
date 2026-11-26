@@ -17,7 +17,9 @@ mod windows;
 #[cfg(target_os = "linux")]
 mod x11;
 
-/// Inject a pointer move and check the OS cursor followed. Windows only.
+/// Inject a pointer move and check the OS cursor followed (Windows). On a Wayland
+/// desktop: open the portal session (consent dialog), capture one picture and move the
+/// pointer to the middle of the screen.
 pub fn selftest() -> anyhow::Result<String> {
     #[cfg(windows)]
     {
@@ -28,7 +30,15 @@ pub fn selftest() -> anyhow::Result<String> {
             "pointer injection ok: expected {want:?}, cursor at {got:?}"
         ))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        anyhow::ensure!(
+            rconn_media::capture::uses_portal(),
+            "input self-test needs Windows or a Wayland desktop"
+        );
+        portal::selftest()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         anyhow::bail!("input self-test is Windows-only")
     }

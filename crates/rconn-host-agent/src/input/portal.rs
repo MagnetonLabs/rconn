@@ -128,6 +128,34 @@ impl Injector for PortalInjector {
     }
 }
 
+/// Capture one picture through the portal and move the pointer to the screen's middle.
+pub fn selftest() -> anyhow::Result<String> {
+    use rconn_media::capture::Capturer as _;
+    let mut cap = rconn_media::capture::portal::PortalCapturer::new()?;
+    let mut picture = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while picture.is_none() && Instant::now() < deadline {
+        cap.next_into(Duration::from_millis(500), &mut picture, (16384, 16384))?;
+    }
+    let (w, h) = picture
+        .as_ref()
+        .map(rconn_media::yuv::I420::dimensions)
+        .ok_or_else(|| anyhow::anyhow!("the portal stream sent no picture in 10 s"))?;
+    let mut inj = PortalInjector::new();
+    let stream = inj
+        .lease()
+        .map(Lease::stream)
+        .ok_or_else(|| anyhow::anyhow!("no portal session for input"))?;
+    inj.pointer_move(0.5, 0.5);
+    // Let the portal thread deliver the move before the session closes.
+    std::thread::sleep(Duration::from_millis(500));
+    Ok(format!(
+        "Wayland portal ok: captured {w}x{h} from PipeWire node {}, logical size {:?}; \
+         the pointer was moved to the middle of the screen (check that it did)",
+        stream.node_id, stream.size
+    ))
+}
+
 /// Normalized (0..1) position -> stream coordinates; 1.0 is the last pixel.
 fn to_stream((w, h): (i32, i32), x: f32, y: f32) -> (f64, f64) {
     let span = |len: i32| f64::from((len - 1).max(0));

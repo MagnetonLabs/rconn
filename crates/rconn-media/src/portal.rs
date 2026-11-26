@@ -322,6 +322,15 @@ async fn close(l: Live) {
     }
 }
 
+/// No portal service (or one without these interfaces) on the session bus.
+fn portal_missing(e: &ashpd::Error) -> bool {
+    let s = e.to_string();
+    matches!(e, ashpd::Error::PortalNotFound(_))
+        || ["ServiceUnknown", "UnknownInterface", "UnknownMethod"]
+            .iter()
+            .any(|k| s.contains(k))
+}
+
 fn is_cancelled(e: &ashpd::Error) -> bool {
     matches!(
         e,
@@ -364,10 +373,13 @@ async fn open(
         restore_token = token.is_some(),
         "opening the desktop portal session"
     );
-    let session = rd
-        .create_session(Default::default())
-        .await
-        .map_err(|e| other("CreateSession", e))?;
+    let session = rd.create_session(Default::default()).await.map_err(|e| {
+        if portal_missing(&e) {
+            PortalError::Unavailable(e.to_string())
+        } else {
+            other("CreateSession", e)
+        }
+    })?;
     let started = match start(&rd, &sc, &session, devices, cursor, token.as_deref()).await {
         Ok(s) => s,
         Err(e) => {
