@@ -2,9 +2,10 @@
 //! Baseline, P frames predicting from the previous frame only (no B-frames, no
 //! reordering), keyframes only on request, VBR/CBR whose bitrate changes live.
 //!
-//! The driver writes the stream headers and slice headers from the parameters given
-//! here. Each new encoder proves itself before use: two frames are encoded and decoded
-//! with openh264, and the picture must come back.
+//! The stream headers (SPS/PPS) are ours where the driver takes them packed (Intel's
+//! do, [`super::headers`]), else the driver's; the slice headers are always the
+//! driver's, from the parameters given here. Each new encoder proves itself before use:
+//! two frames are encoded and decoded with openh264, and the picture must come back.
 //!
 //! Loss repair: no long-term references (the driver writes the slice headers, so their
 //! marking can't be set from here); a reported loss is answered with a keyframe, as on
@@ -173,7 +174,7 @@ impl VaH264Encoder {
         }
         let d = display().map_err(err)?;
         let (va, dpy) = (d.va, d.dpy);
-        let mut attribs = [
+        let mut attribs = vec![
             VAConfigAttrib {
                 type_: VAConfigAttribRTFormat,
                 value: VA_RT_FORMAT_YUV420,
@@ -183,6 +184,13 @@ impl VaH264Encoder {
                 value: d.caps.rc_mode,
             },
         ];
+        if d.caps.packed_sequence {
+            // Our SPS and PPS; slice headers stay the driver's.
+            attribs.push(VAConfigAttrib {
+                type_: VAConfigAttribEncPackedHeaders,
+                value: VA_ENC_PACKED_HEADER_SEQUENCE,
+            });
+        }
         let mut config = VA_INVALID_ID;
         let s = unsafe {
             (va.vaCreateConfig)(
@@ -459,6 +467,26 @@ impl VaH264Encoder {
         Ok(())
     }
 
+    /// What our packed SPS/PPS say (the same as the parameter buffers).
+    fn header_settings(&self) -> super::headers::Settings {
+        let (crop_right, crop_bottom) = crop(self.width, self.height);
+        super::headers::Settings {
+            profile_idc: if self.d.caps.profile == VAProfileH264ConstrainedBaseline {
+                66
+            } else {
+                77
+            },
+            level_idc: level_idc(self.width, self.height, self.fps),
+            mb_w: self.mb_w,
+            mb_h: self.mb_h,
+            crop_right,
+            crop_bottom,
+            log2_max_frame_num: LOG2_MAX_FRAME_NUM,
+            max_num_ref_frames: 1,
+            pic_init_qp: INITIAL_QP as i32,
+        }
+    }
+
     fn seq_params(&self) -> VAEncSequenceParameterBufferH264 {
         let mut s: VAEncSequenceParameterBufferH264 = zeroed();
         s.seq_parameter_set_id = 0;
@@ -632,6 +660,15 @@ impl VaH264Encoder {
             VAEncPictureParameterBufferType,
             bytes_of(&self.pic_params(idr, slot)),
         )?);
+        if idr && self.d.caps.packed_sequence {
+            let header = super::headers::sequence_header(&self.header_settings());
+            let mut p: VAEncPackedHeaderParameterBuffer = zeroed();
+            p.type_ = VAEncPackedHeaderSequence;
+            p.bit_length = (header.len() * 8) as u32;
+            p.has_emulation_bytes = 1;
+            buffers.push(self.buffer(VAEncPackedHeaderParameterBufferType, bytes_of(&p))?);
+            buffers.push(self.buffer(VAEncPackedHeaderDataBufferType, &header)?);
+        }
         buffers.push(self.buffer(
             VAEncSliceParameterBufferType,
             bytes_of(&self.slice_params(idr)),

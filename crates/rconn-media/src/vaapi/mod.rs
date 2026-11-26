@@ -24,6 +24,7 @@
 
 mod encode;
 mod ffi;
+mod headers;
 mod vpp;
 
 pub use encode::{Stages, VaH264Encoder};
@@ -48,6 +49,8 @@ pub(crate) struct Caps {
     pub rc_mode: u32,
     /// A video processor (VPP) entry point: DMA-BUF conversion is possible.
     pub vpp: bool,
+    /// The driver takes a packed sequence header (our SPS and PPS).
+    pub packed_sequence: bool,
 }
 
 /// An initialized VA display on a DRM render node, shared by the process's encoders.
@@ -110,9 +113,11 @@ impl Display {
                 entrypoint: 0,
                 rc_mode: 0,
                 vpp: false,
+                packed_sequence: false,
             },
         };
         if let Err(e) = d.check(s, "vaInitialize") {
+            unsafe { (va.vaTerminate)(dpy) };
             return Err(format!("{}: {e}", path.display()));
         }
         // SAFETY: a static string owned by the driver, or null.
@@ -196,11 +201,13 @@ impl Display {
             .entrypoints(VAProfileNone)
             .contains(&VAEntrypointVideoProc);
         let (profile, entrypoint, rc_mode) = choose_encoder(&candidates)?;
+        let packed = self.attribute(profile, entrypoint, VAConfigAttribEncPackedHeaders);
         Some(Caps {
             profile,
             entrypoint,
             rc_mode,
             vpp,
+            packed_sequence: packed & VA_ENC_PACKED_HEADER_SEQUENCE != 0,
         })
     }
 
@@ -440,7 +447,7 @@ pub fn retry() {
 pub fn describe() -> Result<String, String> {
     let d = display()?;
     Ok(format!(
-        "{} ({}): H.264 {} via {}, {} rate control, video processor {}",
+        "{} ({}): H.264 {} via {}, {} rate control, {} stream headers, video processor {}",
         d.device.display(),
         d.vendor,
         d.profile_name(),
@@ -454,12 +461,18 @@ pub fn describe() -> Result<String, String> {
         } else {
             "CBR"
         },
+        if d.caps.packed_sequence {
+            "our"
+        } else {
+            "the driver's"
+        },
         if d.caps.vpp { "yes" } else { "no" },
     ))
 }
 
 /// Does the video processor convert a `size` picture to BT.601 limited range, as the CPU
-/// conversion does? Checked once per size (colour bars through a scratch encoder).
+/// conversion does? Checked once per size (colour bars through a scratch encoder); a
+/// failure is checked again next time (the path is off meanwhile, [`zero_copy_failed`]).
 pub fn check_zero_copy(size: (usize, usize)) -> Result<(), String> {
     type Checked = Vec<((usize, usize), Result<(), String>)>;
     static CHECKED: Mutex<Checked> = Mutex::new(Vec::new());
@@ -474,10 +487,12 @@ pub fn check_zero_copy(size: (usize, usize)) -> Result<(), String> {
     let r = VaH264Encoder::new(size.0 as u32, size.1 as u32, 30, 4_000_000, None)
         .map_err(|e| e.to_string())
         .and_then(|mut e| e.check_colours().map(|_| ()).map_err(|e| e.to_string()));
-    CHECKED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((size, r.clone()));
+    if r.is_ok() {
+        CHECKED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((size, r.clone()));
+    }
     r
 }
 

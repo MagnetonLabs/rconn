@@ -63,8 +63,13 @@ pub const VAEncCodedBufferType: VABufferType = 21;
 pub const VAEncSequenceParameterBufferType: VABufferType = 22;
 pub const VAEncPictureParameterBufferType: VABufferType = 23;
 pub const VAEncSliceParameterBufferType: VABufferType = 24;
+pub const VAEncPackedHeaderParameterBufferType: VABufferType = 25;
+pub const VAEncPackedHeaderDataBufferType: VABufferType = 26;
 pub const VAEncMiscParameterBufferType: VABufferType = 27;
 pub const VAProcPipelineParameterBufferType: VABufferType = 41;
+
+pub const VA_ENC_PACKED_HEADER_SEQUENCE: u32 = 0x1;
+pub const VAEncPackedHeaderSequence: u32 = 1;
 
 pub const VAEncMiscParameterTypeFrameRate: u32 = 0;
 pub const VAEncMiscParameterTypeRateControl: u32 = 1;
@@ -371,6 +376,15 @@ pub struct VAEncMiscParameterHRD {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct VAEncPackedHeaderParameterBuffer {
+    pub type_: u32,
+    pub bit_length: u32,
+    pub has_emulation_bytes: u8,
+    pub va_reserved: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct VADRMPRIMEObject {
     pub fd: c_int,
     pub size: u32,
@@ -461,6 +475,7 @@ impl Plain for VAEncSliceParameterBufferH264 {}
 impl Plain for VAEncMiscParameterRateControl {}
 impl Plain for VAEncMiscParameterFrameRate {}
 impl Plain for VAEncMiscParameterHRD {}
+impl Plain for VAEncPackedHeaderParameterBuffer {}
 impl Plain for VADRMPRIMESurfaceDescriptor {}
 impl Plain for VAProcPipelineParameterBuffer {}
 
@@ -512,6 +527,7 @@ const _: () = {
     assert!(size_of::<VAEncMiscParameterRateControl>() == 60);
     assert!(size_of::<VAEncMiscParameterFrameRate>() == 24);
     assert!(size_of::<VAEncMiscParameterHRD>() == 24);
+    assert!(size_of::<VAEncPackedHeaderParameterBuffer>() == 28);
     assert!(size_of::<VADRMPRIMESurfaceDescriptor>() == 312);
     assert!(offset_of!(VADRMPRIMESurfaceDescriptor, objects) == 16);
     assert!(offset_of!(VADRMPRIMESurfaceDescriptor, num_layers) == 80);

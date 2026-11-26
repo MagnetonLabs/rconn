@@ -31,6 +31,10 @@ const STOPPED_AFTER: Duration = Duration::from_millis(500);
 const MAX_RECTS: usize = 64;
 /// How long a new stream may take to agree on a format.
 const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(3);
+/// A DMA-BUF stream with no usable frame this long after it was agreed has failed.
+const FIRST_SURFACE_TIMEOUT: Duration = Duration::from_secs(5);
+/// DMA-BUF buffers that can't be used, in a row, before the stream counts as failed.
+const MAX_BAD_DMABUFS: u32 = 10;
 
 fn backend(what: &str, e: impl std::fmt::Display) -> CaptureError {
     CaptureError::Backend(format!("Wayland {what}: {e}"))
@@ -289,6 +293,8 @@ struct Negotiated {
     swap_rb: bool,
     /// DMA-BUF: the buffers' modifier and DRM format.
     dmabuf: Option<(u64, u32)>,
+    /// DMA-BUF buffers in a row that could not be used.
+    bad_dmabufs: u32,
     warned_unmapped: bool,
 }
 
@@ -716,15 +722,22 @@ fn on_process(stream: &pw::stream::Stream, fmt: &mut Negotiated, shared: &Shared
         let damage = (!whole).then_some(rects.as_slice());
         match dmabuf_frame(buf.datas_mut(), fmt) {
             Ok(frame) => {
+                fmt.bad_dmabufs = 0;
                 let mut l = shared.latest.lock().expect("latest frame");
                 l.note_dmabuf(frame, damage);
                 shared.changed.notify_all();
             }
-            Err(e) if !fmt.warned_unmapped => {
-                fmt.warned_unmapped = true;
-                tracing::warn!(error = %e, "unusable DMA-BUF screen buffer");
+            Err(e) => {
+                fmt.bad_dmabufs += 1;
+                if fmt.bad_dmabufs == MAX_BAD_DMABUFS {
+                    // Memory capture from the next capture on.
+                    let why = format!("DMA-BUF screen buffers unusable: {e}");
+                    crate::vaapi::zero_copy_failed(&why);
+                    shared.fail(why);
+                } else {
+                    tracing::debug!(error = %e, "skipped a DMA-BUF screen buffer");
+                }
             }
-            Err(e) => tracing::debug!(error = %e, "skipped a DMA-BUF screen buffer"),
         }
         return;
     }
@@ -792,6 +805,9 @@ pub struct PortalCapturer {
     want_full: bool,
     /// Surface mode: DMA-BUF screens, sent within this size.
     surfaces: Option<(usize, usize)>,
+    /// Surface mode: when it began, and whether a DMA-BUF frame has come since.
+    surfaces_since: Option<Instant>,
+    got_surface: bool,
 }
 
 impl PortalCapturer {
@@ -807,6 +823,8 @@ impl PortalCapturer {
             node: stream.node_id,
             want_full: true,
             surfaces: None,
+            surfaces_since: None,
+            got_surface: false,
         })
     }
 
@@ -818,6 +836,8 @@ impl PortalCapturer {
             node,
             want_full: true,
             surfaces: None,
+            surfaces_since: None,
+            got_surface: false,
         })
     }
 
@@ -830,7 +850,14 @@ impl PortalCapturer {
         // The old stream goes first: while it is linked, the compositor would also have
         // to serve its formats.
         self.pw.stop();
-        self.pw = PwStream::start(fd, Some(self.node), dmabuf)?;
+        match PwStream::start(fd, Some(self.node), dmabuf) {
+            Ok(pw) => self.pw = pw,
+            Err(e) => {
+                // No stream now: the next wait fails, and the capture restarts.
+                self.pw.shared.fail(e.to_string());
+                return Err(e);
+            }
+        }
         self.want_full = true;
         Ok(())
     }
@@ -945,6 +972,8 @@ impl Capturer for PortalCapturer {
                     "frames stay on the GPU (DMA-BUF capture, VA-API convert and encode)"
                 );
                 self.surfaces = Some(max);
+                self.surfaces_since = Some(Instant::now());
+                self.got_surface = false;
                 true
             }
             Err(e) => {
@@ -962,8 +991,27 @@ impl Capturer for PortalCapturer {
             .surfaces
             .ok_or_else(|| backend("capture", "not in surface mode"))?;
         let want_full = self.want_full;
-        let mut l = self.wait(timeout)?;
+        let first = !self.got_surface;
+        let mut l = match self.wait(timeout) {
+            Ok(l) => l,
+            Err(e) => {
+                if first {
+                    // The compositor agreed to DMA-BUFs but could not deliver them.
+                    crate::vaapi::zero_copy_failed(&format!("before the first DMA-BUF: {e}"));
+                }
+                return Err(e);
+            }
+        };
         if l.width == 0 || (l.damage == Damage::None && !want_full) {
+            if first
+                && self
+                    .surfaces_since
+                    .is_some_and(|t| t.elapsed() > FIRST_SURFACE_TIMEOUT)
+            {
+                drop(l);
+                crate::vaapi::zero_copy_failed("no DMA-BUF frame arrived");
+                return Err(backend("capture", "no DMA-BUF frame arrived"));
+            }
             return Ok(None);
         }
         let Some(frame) = l.dmabuf.clone() else {
@@ -985,6 +1033,7 @@ impl Capturer for PortalCapturer {
         drop(l);
         self.note_size(w, h);
         self.want_full = false;
+        self.got_surface = true;
         let (rows, changed) = surface_change(&damage, want_full, (w, h), size);
         Ok(Some((
             Surface { frame, size },
