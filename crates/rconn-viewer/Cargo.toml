@@ -1,7 +1,7 @@
 [package]
 name = "rconn-viewer"
 description = "rconn viewer."
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-only"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,7 +1,7 @@
 [package]
 name = "rconn-host-agent"
 description = "rconn host-agent."
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-only"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
-# License + advisory gate. The client is closed source: no GPL/AGPL/LGPL anywhere in the
-# dependency graph. Add a license here only after checking it permits closed distribution.
+# License + advisory gate. Rconn is AGPL-3.0-only. Dependencies must be compatible with
+# it; we keep them permissive (plus the scoped exceptions below) so the code can also be
+# offered under other terms by its copyright holder. Check a license before adding it.
 [graph]
 all-features = false
 
@@ -57,7 +58,7 @@ allow = ["MPL-2.0"]
 crate = "uniffi_pipeline"
 allow = ["MPL-2.0"]
 
-# Our own crates are publish = false, so their LicenseRef-Proprietary is skipped.
+# Our own crates (AGPL-3.0-only, see LICENSE) are publish = false and skipped here.
 [licenses.private]
 ignore = true
 

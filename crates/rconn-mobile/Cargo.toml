@@ -1,7 +1,7 @@
 [package]
 name = "rconn-mobile"
 description = "Viewer core for the iOS app: a guest session (computer ID + access password) behind a uniffi interface; H.264 out, input in."
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-only"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
