@@ -31,8 +31,11 @@ mod imp {
     use rconn_media::capture::{Captured, Capturer, Surface};
     use rconn_media::d3d11::{Converter, GpuDevice, Readback, fitted};
     use rconn_media::mf::MfH264Encoder;
-    use rconn_media::video::{EncoderSettings, Frame, VideoDecoder, VideoEncoder};
+    use rconn_media::video::{
+        DecodedFrame, EncoderSettings, Frame, PixelLayout, VideoDecoder, VideoEncoder,
+    };
     use rconn_media::yuv::I420;
+    use rconn_media::yuv::{i420_to_rgba, nv12_to_rgba};
     use std::fmt::Write as _;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -311,6 +314,7 @@ mod imp {
         let mut s = format!("decoded {pictures}/{} units", aus.len());
         if let (Some(p), Some(d)) = (last, desk) {
             if (p.width, p.height) == (d.width & !1, d.height & !1) {
+                let rgba = to_rgba(&p);
                 let crop: Vec<u8> = d
                     .bgra
                     .chunks_exact(d.width * 4)
@@ -321,14 +325,13 @@ mod imp {
                 let _ = write!(
                     s,
                     ", last picture {:.1} dB PSNR vs the desktop",
-                    psnr(&p.rgba, &crop)
+                    psnr(&rgba, &crop)
                 );
                 dump(
                     &format!("{label}-decoded"),
                     p.width,
                     p.height,
-                    p.rgba
-                        .as_chunks::<4>()
+                    rgba.as_chunks::<4>()
                         .0
                         .iter()
                         .flat_map(|px| [px[0], px[1], px[2]]),
@@ -347,6 +350,24 @@ mod imp {
             }
         }
         Ok(s)
+    }
+
+    /// A decoded picture as RGBA (BT.601 limited, as viewers show untagged streams).
+    fn to_rgba(p: &DecodedFrame) -> Vec<u8> {
+        let (w, h) = (p.width, p.height);
+        let (cw, ch) = p.chroma_size();
+        let mut out = vec![0u8; w * h * 4];
+        let chroma = &p.data[w * h..];
+        match p.layout {
+            PixelLayout::Nv12 => nv12_to_rgba((p.y(), chroma), (w, cw * 2), (w, h), &mut out),
+            PixelLayout::I420 => i420_to_rgba(
+                (p.y(), &chroma[..cw * ch], &chroma[cw * ch..]),
+                (w, cw, cw),
+                (w, h),
+                &mut out,
+            ),
+        }
+        out
     }
 
     /// The kept GPU desktop picture, read back and fitted to `max` (as sent).
@@ -515,6 +536,14 @@ mod imp {
             report,
             "  video processor vs CPU, colour bars: {}",
             colour_check(&gpu, &colour_bars())?
+        )?;
+        writeln!(
+            report,
+            "  colour gate for streaming: {}",
+            match cap.check_gpu_colours(max) {
+                Ok(()) => "passed (BT.601 limited)".to_string(),
+                Err(e) => format!("refused, memory path is used: {e}"),
+            }
         )?;
         if let Some(desk) = gpu_desktop(&mut cap, &gpu, max) {
             writeln!(

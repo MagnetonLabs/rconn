@@ -7,9 +7,9 @@ pub mod capture;
 #[cfg(not(target_os = "ios"))]
 pub mod cisco;
 pub mod codec;
-pub mod decode;
 #[cfg(windows)]
 pub mod d3d11;
+pub mod decode;
 #[cfg(windows)]
 pub mod mf;
 #[cfg(windows)]
