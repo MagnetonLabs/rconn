@@ -476,6 +476,7 @@ async fn serve_session(
         max_bitrate_bps: cli.max_kbps.saturating_mul(1000),
         max_size: (mw.parse()?, mh.parse()?),
         motion_half_res: cli.motion_half_res,
+        codec: session.video.codec(),
     };
     // Host sound runs alongside the picture; losing it never ends the session.
     if let (Some(audio_track), false) = (session.audio.take(), cli.no_audio) {

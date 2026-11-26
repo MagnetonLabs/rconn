@@ -772,9 +772,10 @@ async fn session(
                 }
                 compositor.lost();
             }
+            let codec = rx.codec();
             for au in aus {
                 bytes += au.len();
-                let tag = rconn_peer::frames::read(&au);
+                let (au, tag) = rconn_peer::frames::take(codec, &au);
                 match &tag {
                     Some(t) => {
                         stages.host(t.host_us);
@@ -789,7 +790,7 @@ async fn session(
                     }
                     None => {}
                 }
-                let (bits, ops) = copyrect::split(&au);
+                let (bits, ops) = copyrect::split_in(codec, &au);
                 match dec.decode(&bits) {
                     Ok(Some(mut f)) => {
                         if compositor.compose(ops.as_ref(), &mut f) == Composed::Resync {

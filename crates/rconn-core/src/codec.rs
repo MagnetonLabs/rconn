@@ -9,9 +9,10 @@
 //! it) and a metadata OBU of a private type in AV1. H.264 bytes are exactly what hosts
 //! sent before, so older viewers still read them.
 
-/// A video codec of the stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// A video codec of the stream. H.264 unless negotiated otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum VideoCodec {
+    #[default]
     H264,
     H265,
     Av1,

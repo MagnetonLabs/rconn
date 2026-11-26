@@ -30,6 +30,8 @@ pub struct StreamConfig {
     /// Send large screens at half size while a big area keeps changing (scrolling, video):
     /// a quarter of the encoding work; a sharp full-size picture follows when it settles.
     pub motion_half_res: bool,
+    /// The codec negotiated with the viewer ([`VideoSender::codec`]).
+    pub codec: rconn_media::caps::VideoCodec,
 }
 
 /// The viewer's requests to the encoder: an IDR frame (viewer joined, decoder lost
@@ -423,7 +425,7 @@ fn run_generation(
             force = true;
         }
         if composer.is_none() && !surfaces && ctx.copy_rects.load(Ordering::Relaxed) {
-            composer = Some(Composer::new()); // its first picture is whole
+            composer = Some(Composer::for_codec(cfg.codec)); // its first picture is whole
         }
         if force {
             enc.request_keyframe();
@@ -539,6 +541,7 @@ fn run_generation(
                 .as_micros()
                 .min(u128::from(u32::MAX)) as u32;
             let au = frames::tag(
+                cfg.codec,
                 au,
                 &FrameTag {
                     id: info.id,

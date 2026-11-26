@@ -125,6 +125,7 @@ fn a_lost_packet_is_repaired_without_a_keyframe() {
             repair_bytes.push(au.len());
         }
         let au = frames::tag(
+            rconn_peer::video::VideoCodec::H264,
             au,
             &FrameTag {
                 id: info.id,
@@ -146,7 +147,7 @@ fn a_lost_packet_is_repaired_without_a_keyframe() {
         for p in packets {
             for au in rx.push(p) {
                 // As the viewer does: no tag means the frame's head was lost.
-                let Some(tag) = frames::read(&au) else {
+                let Some(tag) = frames::read(rconn_peer::video::VideoCodec::H264, &au) else {
                     integrity.untagged();
                     continue;
                 };

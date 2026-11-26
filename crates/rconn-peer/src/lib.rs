@@ -8,6 +8,7 @@ pub mod frames;
 pub mod guest;
 pub mod identity;
 pub mod rtc;
+pub mod rtp_codecs;
 pub mod session;
 pub mod signaling;
 pub mod trust;
