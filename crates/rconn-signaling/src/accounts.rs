@@ -28,7 +28,7 @@ pub struct Account {
     pub password_hash: String,
 }
 
-/// Username -> account. Persisted as `accounts.json` by [`crate::store::DataDir`].
+/// Username -> account, as loaded from the database (`accounts.json` before 0.2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Accounts(pub BTreeMap<String, Account>);
 
@@ -71,7 +71,8 @@ impl Accounts {
     }
 }
 
-fn hash_password(password: &str) -> Result<String> {
+/// An argon2id PHC hash of `password` with a random salt.
+pub fn hash_password(password: &str) -> Result<String> {
     // argon2id with the crate's recommended parameters and a random salt.
     Ok(Argon2::default()
         .hash_password(password.as_bytes())

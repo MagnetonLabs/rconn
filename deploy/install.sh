@@ -42,6 +42,9 @@ fi
 systemctl enable --now docker >/dev/null 2>&1 || true
 
 mkdir -p "$DIR"
+# Server master key (seals org CA keys in the database): outside the data volume and its
+# backups. 10001 is the image's rconn user.
+install -d -o 10001 -g 10001 -m 700 "$DIR/keys"
 cat > "$DIR/compose.yaml" <<YAML
 services:
   signaling:
@@ -55,6 +58,7 @@ services:
       RUST_LOG: info
     volumes:
       - rconn-data:/data
+      - $DIR/keys:/keys
     command: ["serve"]
 volumes:
   rconn-data:

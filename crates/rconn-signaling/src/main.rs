@@ -5,14 +5,17 @@ use clap::{Parser, Subcommand};
 use rconn_core::fleet::HostKey;
 use rconn_core::ids::HostId;
 use rconn_core::protocol::IceServer;
-use rconn_signaling::auth::OperatorIdentity;
+use rconn_signaling::db::{DB_FILE, Db, Revoked};
 use rconn_signaling::fleet_auth::FleetAuthenticator;
+use rconn_signaling::hosts::DbInventory;
+use rconn_signaling::import;
 use rconn_signaling::public::{EnrollLimits, PublicHosts};
-use rconn_signaling::store::{DataDir, unhex32, write_private};
+use rconn_signaling::secrets::default_master_key_path;
+use rconn_signaling::store::{DataDir, write_private};
 use rconn_signaling::turn_relay::{RelayUsage, TurnConfig, TurnMinter, TurnRelay};
 use rconn_signaling::{AppState, router};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -26,6 +29,10 @@ struct Cli {
         global = true
     )]
     data_dir: PathBuf,
+    /// The server master key that seals org CA keys in the database. Keep it outside the
+    /// data dir and its backups. Default: `master.key` next to the data dir.
+    #[arg(long, env = "RCONN_MASTER_KEY_FILE", global = true)]
+    master_key_file: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -53,10 +60,35 @@ enum Cmd {
         #[arg(long)]
         username: String,
     },
-    /// Refuse a host from its next connect onward (restart `serve` to apply).
+    /// Refuse a host from now on (a running server evicts it within seconds).
     RevokeHost { host_id: uuid::Uuid },
+    /// Print the TLS pin (`sha256:…`) for host and viewer server profiles, or say why none
+    /// is needed.
+    Pin {
+        /// The server runs plain behind a TLS proxy (e.g. Caddy).
+        #[arg(long, env = "RCONN_PLAIN")]
+        plain: bool,
+    },
+    /// Manage the org.
+    Org {
+        #[command(subcommand)]
+        cmd: OrgCmd,
+    },
     /// Run the server.
     Serve(ServeArgs),
+}
+
+#[derive(Subcommand)]
+enum OrgCmd {
+    /// Make the person with this email the owner of the server's original org (the one
+    /// from `init`). Other owners become admins.
+    SetOwner {
+        #[arg(long)]
+        email: String,
+        /// Give this existing login account the email, so the owner signs in with it.
+        #[arg(long)]
+        account: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -138,21 +170,34 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let store = DataDir::new(&cli.data_dir);
+    let key_path = cli
+        .master_key_file
+        .clone()
+        .unwrap_or_else(|| default_master_key_path(&cli.data_dir));
 
     match cli.cmd {
         Cmd::Init { hostnames } => {
+            if cli.data_dir.join(DB_FILE).exists()
+                && let Some(org) = Db::open_in(&cli.data_dir).await?.legacy_org().await?
+            {
+                anyhow::bail!("{} already holds org {}", cli.data_dir.display(), org.id);
+            }
             let ca = store.init(&hostnames)?;
+            import::open(&store, &key_path).await?;
             println!(
-                "org {} initialised in {}",
+                "org {} initialised in {} (master key: {})",
                 ca.org_id(),
-                cli.data_dir.display()
+                cli.data_dir.display(),
+                key_path.display()
             );
             if let Some(fp) = store.tls_fingerprint()? {
                 println!("server fingerprint (pin this in host and viewer profiles): {fp}");
             }
         }
         Cmd::EnrollHost { out } => {
-            let ca = store.load_ca()?;
+            let (db, master, _) = import::open(&store, &key_path).await?;
+            let org = db.require_legacy_org().await?;
+            let ca = db.org_ca(org.id, &master).await?;
             let host_id = HostId::new();
             let key = HostKey::generate()?;
             let cert = ca.issue_host_cert(host_id, &key)?;
@@ -160,22 +205,61 @@ async fn main() -> Result<()> {
             fs::write(out.join("host.id"), host_id.to_string())?;
             fs::write(out.join("host.cert.pem"), &cert)?;
             write_private(&out.join("host.key.pem"), &key.to_pem())?;
+            db.host_enrolled(org.id, host_id, None, rconn_signaling::db::now())
+                .await?;
             println!("host {host_id} enrolled into {}", out.display());
         }
         Cmd::AddAccount { username } => {
             let password = rconn_signaling::accounts::read_password()?;
-            let id = store.add_account(&username, &password)?;
+            let (db, _, _) = import::open(&store, &key_path).await?;
+            let org = db.require_legacy_org().await?;
+            let id = db.add_account(org.id, &username, &password).await?;
             println!("account {username} created (operator {id})");
         }
         Cmd::AddOperator => {
-            let (id, token) = store.add_operator()?;
+            let (db, _, _) = import::open(&store, &key_path).await?;
+            let org = db.require_legacy_org().await?;
+            let (id, token) = db.add_operator(org.id).await?;
             println!("operator {id}\ntoken (shown once): {token}");
         }
         Cmd::RevokeHost { host_id } => {
-            store.revoke(HostId(host_id))?;
-            println!("host {host_id} revoked; restart serve to apply");
+            let (db, _, _) = import::open(&store, &key_path).await?;
+            let public =
+                rconn_signaling::public::registry_ids(&cli.data_dir.join("public-hosts.jsonl"))?;
+            let host = HostId(host_id);
+            match db.revoke_host(host, public.contains(&host)).await? {
+                Revoked::Already => println!("host {host_id} was already revoked"),
+                Revoked::PublicHost | Revoked::OrgHost(_) => println!(
+                    "host {host_id} revoked; a running server disconnects it within seconds"
+                ),
+            }
         }
-        Cmd::Serve(args) => serve(&store, args).await?,
+        Cmd::Pin { plain } => match store.tls_fingerprint()? {
+            Some(fp) if !plain => {
+                println!("{fp}");
+                eprintln!("pin this in host and viewer server profiles");
+            }
+            Some(_) => println!(
+                "no pin needed: the server runs behind a TLS proxy (--plain), so clients check \
+                 the proxy's public certificate"
+            ),
+            None => println!(
+                "no pin needed: there is no tls.cert.pem, so the server runs behind a TLS proxy \
+                 (e.g. Caddy) and clients check its public certificate"
+            ),
+        },
+        Cmd::Org {
+            cmd: OrgCmd::SetOwner { email, account },
+        } => {
+            let (db, _, _) = import::open(&store, &key_path).await?;
+            let org = db.require_legacy_org().await?;
+            let (owner, demoted) = db.set_owner(org.id, &email, account.as_deref()).await?;
+            println!("{email} (user {owner}) owns org {}", org.id);
+            for d in demoted {
+                println!("previous owner {d} is now an admin");
+            }
+        }
+        Cmd::Serve(args) => serve(&store, &key_path, args).await?,
     }
     Ok(())
 }
@@ -189,7 +273,7 @@ fn parse_ports(s: &str) -> Result<(u16, u16)> {
     Ok((a, b))
 }
 
-async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
+async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> {
     let ServeArgs {
         bind,
         server_id,
@@ -245,9 +329,11 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
     let oidc = oidc_issuer
         .zip(oidc_client_id)
         .map(|(i, c)| (i, c, oidc_allowed_domain));
-    let ca = store.load_ca()?;
-    let org_id = ca.org_id();
-    let mut auth = FleetAuthenticator::new(server_id.clone()).with_org_ca(org_id, ca.cert_pem());
+    let (db, master, _) = import::open(store, key_path).await?;
+    let org_id = db.require_legacy_org().await?.id;
+    let ca = db.org_ca(org_id, &master).await?;
+    // Org CAs, operator tokens, accounts and revocations come from the database (below).
+    let mut auth = FleetAuthenticator::new(server_id.clone());
     // Computers without an account: a separate CA (its own org, which no operator is in).
     // Its hosts keep connecting even after enrollment is turned off.
     let anonymous_enroll = anonymous_enroll.unwrap_or(public);
@@ -272,16 +358,6 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
         }
         None => None,
     };
-    for (digest_hex, operator_id) in store.operators()? {
-        let digest = unhex32(&digest_hex).context("corrupt operators.json")?;
-        auth = auth.with_operator_token_digest(
-            digest,
-            OperatorIdentity {
-                operator_id,
-                org_id,
-            },
-        );
-    }
     if !ice.is_empty() {
         auth = auth.with_ice_servers(vec![IceServer {
             urls: ice,
@@ -313,13 +389,9 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
         }
         None => None,
     };
-    let accounts = store.accounts()?;
-    if !accounts.0.is_empty() {
-        tracing::info!(accounts = accounts.0.len(), "password login enabled");
-    }
     auth = auth.with_accounts(
         org_id,
-        accounts,
+        Default::default(),
         rconn_signaling::accounts::SessionTokens::new(store.session_key()?),
     );
     if let Some((issuer, client_id, domains)) = oidc {
@@ -333,11 +405,6 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
         tracing::info!(urls = ?minter.turn_urls, "using external TURN");
         auth = auth.with_turn(minter);
     }
-    let revoked = store.revoked()?;
-    for h in &revoked {
-        auth.revoke(*h);
-    }
-
     let audit_path = store.path().join("audit.jsonl");
     let audit = rconn_signaling::audit::FileAudit::open(&audit_path)
         .with_context(|| format!("opening {}", audit_path.display()))?;
@@ -359,19 +426,27 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
         tracing::info!(header = %name, "client addresses read from the proxy's header");
         state.trust_client_ip_header(name);
     }
-    // Live reload: operators, accounts and revocations apply without a restart.
+    state.record_hosts_in(Arc::new(DbInventory::spawn(db.clone())));
+    // Load the database before accepting anyone, then follow its changes (and import
+    // legacy files that old scripts may still write) without a restart.
+    let mut seen = rconn_signaling::reload::Seen::default();
+    rconn_signaling::reload::reload_once(&db, &auth, &state, &mut seen).await?;
+    let revoked = db.revoked_hosts().await?.len();
     {
         let (store, auth, state) = (DataDir::new(store.path()), auth.clone(), state.clone());
         tokio::spawn(async move {
-            let mut seen = rconn_signaling::reload::Seen::default();
             loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if import::pending(&store)
+                    && let Err(e) = import::import(&db, &store, &master).await
+                {
+                    tracing::error!(error = %format!("{e:#}"), "importing data-dir files failed");
+                }
                 if let Err(e) =
-                    rconn_signaling::reload::reload_once(&store, &auth, &state, org_id, &mut seen)
-                        .await
+                    rconn_signaling::reload::reload_once(&db, &auth, &state, &mut seen).await
                 {
                     tracing::error!(error = %format!("{e:#}"), "reload failed; keeping previous config");
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         });
     }
@@ -386,7 +461,7 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
     match (plain, store.tls_pem()?) {
         (false, Some((cert, key))) => {
             let fp = rconn_core::tls::spki_fingerprint_pem(&cert)?;
-            tracing::info!(%org_id, %server_id, %addr, fingerprint = %fp, revoked = revoked.len(), "serving wss");
+            tracing::info!(%org_id, %server_id, %addr, fingerprint = %fp, revoked, "serving wss");
             let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
                 cert.into_bytes(),
                 key.into_bytes(),
@@ -401,7 +476,7 @@ async fn serve(store: &DataDir, args: ServeArgs) -> Result<()> {
             "no tls.cert.pem in the data dir; run `init`, or pass --plain behind a TLS proxy"
         ),
         (true, _) => {
-            tracing::warn!(%org_id, %server_id, %addr, revoked = revoked.len(), "serving PLAIN ws (expecting a TLS proxy in front)");
+            tracing::warn!(%org_id, %server_id, %addr, revoked, "serving PLAIN ws (expecting a TLS proxy in front)");
             axum_server::bind(addr)
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())

@@ -34,6 +34,21 @@ pub const LEGACY_DATA_CHANNEL_LABEL: &str = "rconn";
 /// only use optional features the server lists; unknown entries are ignored.
 pub const SERVER_CAPABILITIES: &[&str] = &["sessions", "ice-relay"];
 
+/// Host capability: sends [`DataMessage::HostName`] on the encrypted session.
+pub const HOST_CAP_HOST_NAME: &str = "host_name";
+/// Host capability: checks guests with the connection-bound access-password proof
+/// ([`DATA_CHANNEL_LABEL`]) and refuses legacy guest channels.
+pub const HOST_CAP_GUEST_V2: &str = "guest_v2";
+/// Capabilities this build's host agent sends in [`ClientMessage::HostHello`]. The server
+/// refuses (fails closed) a policy that needs one the host lacks; unknown entries are
+/// ignored. Hosts from 0.1.x send none.
+pub const HOST_CAPABILITIES: &[&str] = &[HOST_CAP_HOST_NAME, HOST_CAP_GUEST_V2];
+
+/// Longest `os` / `version` string in [`ClientMessage::HostHello`] the server keeps.
+pub const MAX_HOST_FACT_CHARS: usize = 64;
+/// Most `capabilities` entries in [`ClientMessage::HostHello`] the server keeps.
+pub const MAX_HOST_CAPABILITIES: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Signaling: client -> server
 // ---------------------------------------------------------------------------
@@ -52,6 +67,15 @@ pub enum ClientMessage {
         /// Human-readable name shown in viewers' computer lists (e.g. the hostname).
         #[serde(default)]
         label: Option<String>,
+        /// Operating system and its version, e.g. `macos 15.3` (admin inventory only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        os: Option<String>,
+        /// Host agent version, e.g. `0.1.3`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        /// Optional features this host supports (see [`HOST_CAPABILITIES`]).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     /// Signature, with the host cert's private key, over
     /// [`crate::fleet::host_proof_transcript`]. Proves possession at the application layer,
@@ -541,6 +565,9 @@ mod tests {
                 cert_pem: "-----BEGIN CERTIFICATE-----".into(),
                 client_nonce: vec![7; CHALLENGE_LEN],
                 label: None,
+                os: Some("linux ubuntu 24.04".into()),
+                version: Some("0.1.3".into()),
+                capabilities: HOST_CAPABILITIES.iter().map(|c| (*c).into()).collect(),
             },
             ClientMessage::HostProof {
                 signature: vec![1, 2, 3],

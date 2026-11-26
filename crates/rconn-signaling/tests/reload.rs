@@ -1,4 +1,5 @@
-//! Live reload: revocations evict connected hosts; new accounts work without a restart.
+//! Live reload from the database: revocations evict connected hosts; new accounts and
+//! operator tokens work without a restart.
 
 use futures_util::{SinkExt, StreamExt};
 use rconn_core::PROTOCOL_VERSION;
@@ -7,6 +8,7 @@ use rconn_core::ids::HostId;
 use rconn_core::protocol::{CHALLENGE_LEN, ClientMessage, ErrorCode, ServerMessage};
 use rconn_signaling::accounts::SessionTokens;
 use rconn_signaling::fleet_auth::FleetAuthenticator;
+use rconn_signaling::import;
 use rconn_signaling::reload::{Seen, reload_once};
 use rconn_signaling::store::DataDir;
 use rconn_signaling::{AppState, router};
@@ -52,6 +54,9 @@ async fn host_hello(
             cert_pem: cert.into(),
             client_nonce: cn.clone(),
             label: None,
+            os: None,
+            version: None,
+            capabilities: vec![],
         },
     )
     .await;
@@ -72,23 +77,29 @@ async fn revocation_evicts_and_new_accounts_apply_live() {
     let store = DataDir::new(dir.path());
     let ca = store.init(&[]).unwrap();
     let org = ca.org_id();
-    let auth = Arc::new(
-        FleetAuthenticator::new(SID)
-            .with_org_ca(org, ca.cert_pem())
-            .with_accounts(org, Default::default(), SessionTokens::new([3; 32])),
-    );
-    let state = AppState::new(auth.clone());
-    let mut seen = Seen::default();
-    reload_once(&store, &auth, &state, org, &mut seen)
+    let (db, _, _) = import::open(&store, &dir.path().join("master.key"))
         .await
         .unwrap();
+    // No CA given to the builder: it comes from the database.
+    let auth = Arc::new(FleetAuthenticator::new(SID).with_accounts(
+        org,
+        Default::default(),
+        SessionTokens::new([3; 32]),
+    ));
+    let state = AppState::new(auth.clone());
+    let mut seen = Seen::default();
+    assert!(reload_once(&db, &auth, &state, &mut seen).await.unwrap());
+    assert!(
+        !reload_once(&db, &auth, &state, &mut seen).await.unwrap(),
+        "nothing changed, nothing reloaded"
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/ws", listener.local_addr().unwrap());
     let st = state.clone();
     tokio::spawn(async move { axum::serve(listener, router(st)).await.unwrap() });
 
-    // A host connects, then gets revoked on disk.
+    // A host connects, then gets revoked in the database.
     let id = HostId::new();
     let key = HostKey::generate().unwrap();
     let cert = ca.issue_host_cert(id, &key).unwrap();
@@ -96,11 +107,8 @@ async fn revocation_evicts_and_new_accounts_apply_live() {
     assert!(matches!(verdict, Some(ServerMessage::Welcome { .. })));
     assert_eq!(state.online_hosts().await, 1);
 
-    tokio::time::sleep(Duration::from_millis(20)).await; // distinct mtime
-    store.revoke(id).unwrap();
-    reload_once(&store, &auth, &state, org, &mut seen)
-        .await
-        .unwrap();
+    db.revoke_host(id, false).await.unwrap();
+    assert!(reload_once(&db, &auth, &state, &mut seen).await.unwrap());
     assert_eq!(
         state.online_hosts().await,
         0,
@@ -126,12 +134,10 @@ async fn revocation_evicts_and_new_accounts_apply_live() {
     );
 
     // An account added after startup works after the reload.
-    store
-        .add_account("late", "a perfectly long password")
-        .unwrap();
-    reload_once(&store, &auth, &state, org, &mut seen)
+    db.add_account(org, "late", "a perfectly long password")
         .await
         .unwrap();
+    assert!(reload_once(&db, &auth, &state, &mut seen).await.unwrap());
     let (mut ws, _) = connect_async(&url).await.unwrap();
     send(
         &mut ws,
@@ -145,5 +151,21 @@ async fn revocation_evicts_and_new_accounts_apply_live() {
     assert!(matches!(
         recv(&mut ws).await,
         Some(ServerMessage::LoginToken { .. })
+    ));
+    // So does an operator token.
+    let (_, token) = db.add_operator(org).await.unwrap();
+    reload_once(&db, &auth, &state, &mut seen).await.unwrap();
+    let (mut ws, _) = connect_async(&url).await.unwrap();
+    send(
+        &mut ws,
+        &ClientMessage::OperatorHello {
+            protocol_version: PROTOCOL_VERSION,
+            token,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut ws).await,
+        Some(ServerMessage::Welcome { .. })
     ));
 }

@@ -29,6 +29,9 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - rconn-data:/data
+      # Server master key: back it up separately from rconn-data.
+      - rconn-keys:/keys
 
 volumes:
   rconn-data:
+  rconn-keys:

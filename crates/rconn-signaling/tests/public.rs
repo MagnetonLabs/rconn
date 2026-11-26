@@ -123,6 +123,9 @@ async fn connect_host(url: &str, host_id: HostId, cert: &str, key: &HostKey) -> 
             cert_pem: cert.into(),
             client_nonce: client_nonce.to_vec(),
             label: Some("LAPTOP".into()),
+            os: None,
+            version: None,
+            capabilities: vec![],
         },
     )
     .await;

@@ -1,6 +1,9 @@
 //! Production [`Authenticator`] for hosts: fleet-CA certificates plus a signed handshake
 //! transcript. Operator auth here is a static token table, which bridges until the
 //! accounts/passkey/OIDC store lands; tokens are compared by SHA-256 digest.
+//!
+//! Org CAs, tokens, accounts and revocations come from the database and are swapped in
+//! whole by [`crate::reload`]; CAs given to the builder (the public CA, tests) stay.
 
 use crate::accounts::{Accounts, SESSION_TOKEN_TTL, SessionTokens};
 use crate::auth::{AuthError, Authenticator, HostIdentity, HostProofInput, OperatorIdentity};
@@ -18,8 +21,10 @@ use std::sync::RwLock;
 pub struct FleetAuthenticator {
     /// Canonical server identity hosts bind into their proofs (their profile URL).
     server_id: String,
-    /// Fleet CA certificate (PEM) per org.
-    org_cas: HashMap<OrgId, String>,
+    /// Fleet CA certificate (PEM) per org, given at build time (e.g. the public CA).
+    fixed_cas: HashMap<OrgId, String>,
+    /// Fleet CA certificate (PEM) per org, from the database.
+    loaded_cas: RwLock<HashMap<OrgId, String>>,
     revoked: RwLock<HashSet<HostId>>,
     operator_tokens: RwLock<HashMap<[u8; 32], OperatorIdentity>>,
     ice_servers: Vec<IceServer>,
@@ -34,7 +39,8 @@ impl FleetAuthenticator {
     pub fn new(server_id: impl Into<String>) -> Self {
         Self {
             server_id: server_id.into(),
-            org_cas: HashMap::new(),
+            fixed_cas: HashMap::new(),
+            loaded_cas: RwLock::default(),
             revoked: RwLock::default(),
             operator_tokens: RwLock::default(),
             ice_servers: Vec::new(),
@@ -51,8 +57,25 @@ impl FleetAuthenticator {
     }
 
     pub fn with_org_ca(mut self, org: OrgId, ca_pem: impl Into<String>) -> Self {
-        self.org_cas.insert(org, ca_pem.into());
+        self.fixed_cas.insert(org, ca_pem.into());
         self
+    }
+
+    /// Replace the CAs loaded from the database (the builder's stay).
+    pub fn replace_org_cas(&self, cas: HashMap<OrgId, String>) {
+        *self.loaded_cas.write().expect("auth lock") = cas;
+    }
+
+    /// The CA certificate hosts of `org` are checked against.
+    fn org_ca(&self, org: OrgId) -> Option<String> {
+        if let Some(ca) = self.fixed_cas.get(&org) {
+            return Some(ca.clone());
+        }
+        self.loaded_cas
+            .read()
+            .expect("auth lock")
+            .get(&org)
+            .cloned()
     }
 
     pub fn with_operator_token(mut self, token: &str, identity: OperatorIdentity) -> Self {
@@ -100,12 +123,12 @@ impl FleetAuthenticator {
         self
     }
 
-    /// Replace the static operator tokens (by digest), e.g. after operators.json changed.
+    /// Replace the static operator tokens (by digest), e.g. after the database changed.
     pub fn replace_operator_digests(&self, table: HashMap<[u8; 32], OperatorIdentity>) {
         *self.operator_tokens.write().expect("auth lock") = table;
     }
 
-    /// Replace the account table, e.g. after accounts.json changed.
+    /// Replace the account table, e.g. after the database changed.
     pub fn replace_accounts(&self, org: OrgId, accounts: Accounts) {
         *self.accounts.write().expect("auth lock") = Some((accounts, org));
     }
@@ -140,8 +163,8 @@ fn invalid(e: FleetError) -> AuthError {
 impl Authenticator for FleetAuthenticator {
     async fn verify_host(&self, p: HostProofInput<'_>) -> Result<HostIdentity, AuthError> {
         let org = fleet::claimed_org(p.cert_pem).map_err(invalid)?;
-        let ca = self.org_cas.get(&org).ok_or(AuthError::Invalid)?;
-        let claims = fleet::verify_host_cert(ca, p.cert_pem).map_err(invalid)?;
+        let ca = self.org_ca(org).ok_or(AuthError::Invalid)?;
+        let claims = fleet::verify_host_cert(&ca, p.cert_pem).map_err(invalid)?;
         if claims.host_id != p.host_id {
             return Err(AuthError::Invalid);
         }

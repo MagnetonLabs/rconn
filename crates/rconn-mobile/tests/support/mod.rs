@@ -80,6 +80,9 @@ pub async fn start(setup: HostSetup) -> (String, String, Arc<HostLog>) {
             key: &key,
             cert_pem: &cert,
             label: None,
+            os: None,
+            version: None,
+            capabilities: vec![],
         },
     )
     .await

@@ -1,62 +1,53 @@
-//! Live reload of the self-hosted data dir: operators, accounts and revocations take
-//! effect without restarting the server. Revoked hosts are evicted immediately.
+//! Live reload: org CAs, operator tokens, accounts and revocations follow the database
+//! without a restart. The server polls the database's config version (bumped by
+//! triggers on every relevant change) and reloads everything when it moves. Hosts that
+//! became revoked are evicted at once.
 
 use crate::AppState;
-use crate::auth::OperatorIdentity;
+use crate::db::Db;
 use crate::fleet_auth::FleetAuthenticator;
-use crate::store::{DataDir, unhex32};
-use anyhow::{Context, Result};
-use rconn_core::ids::OrgId;
-use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
+use anyhow::Result;
 
-/// Last-seen modification times, so unchanged files aren't re-read.
+/// The config version last applied.
 #[derive(Default)]
-pub struct Seen(HashMap<&'static str, SystemTime>);
+pub struct Seen(Option<i64>);
 
-impl Seen {
-    fn changed(&mut self, store: &DataDir, name: &'static str) -> bool {
-        let Ok(m) = std::fs::metadata(store.path().join(name)).and_then(|m| m.modified()) else {
-            return false;
-        };
-        self.0.insert(name, m) != Some(m)
-    }
-}
-
-/// Apply whatever changed since the last call.
+/// Apply the database to `auth` if it changed since the last call. Returns whether it did.
 pub async fn reload_once(
-    store: &DataDir,
+    db: &Db,
     auth: &FleetAuthenticator,
     state: &AppState,
-    org: OrgId,
     seen: &mut Seen,
-) -> Result<()> {
-    if seen.changed(store, "operators.json") {
-        let mut table = HashMap::new();
-        for (digest_hex, operator_id) in store.operators()? {
-            let digest = unhex32(&digest_hex).context("corrupt operators.json")?;
-            table.insert(
-                digest,
-                OperatorIdentity {
-                    operator_id,
-                    org_id: org,
-                },
-            );
-        }
-        tracing::info!(operators = table.len(), "reloaded operator tokens");
-        auth.replace_operator_digests(table);
+) -> Result<bool> {
+    let version = db.config_version().await?;
+    if seen.0 == Some(version) {
+        return Ok(false);
     }
-    if seen.changed(store, "accounts.json") {
-        let accounts = store.accounts()?;
-        tracing::info!(accounts = accounts.0.len(), "reloaded accounts");
+    let cas = db.org_cas().await?;
+    let tokens = db.operator_tokens().await?;
+    let revoked = db.revoked_hosts().await?;
+    // Password accounts belong to the legacy org until people sign in through the portal.
+    let accounts = match db.legacy_org().await? {
+        Some(org) => Some((org.id, db.accounts(org.id).await?)),
+        None => None,
+    };
+    tracing::info!(
+        version,
+        orgs = cas.len(),
+        operator_tokens = tokens.len(),
+        accounts = accounts.as_ref().map_or(0, |(_, a)| a.0.len()),
+        revoked = revoked.len(),
+        "loaded configuration from the database"
+    );
+    auth.replace_org_cas(cas);
+    auth.replace_operator_digests(tokens);
+    if let Some((org, accounts)) = accounts {
         auth.replace_accounts(org, accounts);
     }
-    if seen.changed(store, "revoked.json") {
-        let set: HashSet<_> = store.revoked()?.into_iter().collect();
-        for host in auth.replace_revoked(set) {
-            tracing::warn!(%host, "host revoked; evicting");
-            state.evict_host(host).await;
-        }
+    for host in auth.replace_revoked(revoked) {
+        tracing::warn!(%host, "host revoked; evicting");
+        state.evict_host(host).await;
     }
-    Ok(())
+    seen.0 = Some(version);
+    Ok(true)
 }
