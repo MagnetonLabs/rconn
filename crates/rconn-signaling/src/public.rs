@@ -107,6 +107,35 @@ pub fn source_bucket(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Every host in a registry file and its owner (empty if the file doesn't exist).
+fn read_registry(path: &std::path::Path) -> anyhow::Result<HashMap<HostId, Option<HostOwner>>> {
+    let mut owners = HashMap::new();
+    if !path.exists() {
+        return Ok(owners);
+    }
+    let text = std::fs::read_to_string(path)?;
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Entry>(line) {
+            Ok(e) => {
+                owners.insert(e.host_id, e.owner);
+            }
+            // A torn last line (crash mid-write) must not stop the server.
+            Err(e) => {
+                tracing::warn!(line = n + 1, error = %e, "skipping bad registry line")
+            }
+        }
+    }
+    Ok(owners)
+}
+
+/// The IDs in a registry file (`public-hosts.jsonl`), without loading its CA.
+pub fn registry_ids(path: &std::path::Path) -> anyhow::Result<HashSet<HostId>> {
+    Ok(read_registry(path)?.into_keys().collect())
+}
+
 impl PublicHosts {
     /// `file`: the registry to load and append to (`None` keeps it in memory, for tests).
     pub fn new(
@@ -114,26 +143,10 @@ impl PublicHosts {
         limits: Option<EnrollLimits>,
         file: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
-        let mut owners = HashMap::new();
-        if let Some(path) = &file
-            && path.exists()
-        {
-            let text = std::fs::read_to_string(path)?;
-            for (n, line) in text.lines().enumerate() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Entry>(line) {
-                    Ok(e) => {
-                        owners.insert(e.host_id, e.owner);
-                    }
-                    // A torn last line (crash mid-write) must not stop the server.
-                    Err(e) => {
-                        tracing::warn!(line = n + 1, error = %e, "skipping bad registry line")
-                    }
-                }
-            }
-        }
+        let owners = match &file {
+            Some(path) => read_registry(path)?,
+            None => HashMap::new(),
+        };
         let codes = owners.keys().map(|h| short_code_number(*h)).collect();
         Ok(Self {
             ca,

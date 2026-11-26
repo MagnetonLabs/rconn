@@ -1,20 +1,19 @@
-//! File-backed state for a self-hosted server (single org).
+//! File-backed state of a server's data dir.
 //!
 //! ```text
-//! <data-dir>/ca.pem          fleet CA certificate
-//! <data-dir>/ca.key.pem      fleet CA private key (0600)
-//! <data-dir>/operators.json  { "<sha256(token) hex>": "<operator id>" }
-//! <data-dir>/revoked.json    [ "<host id>", ... ]
+//! <data-dir>/rconn.db        the database (orgs, people, computers, tokens; see db.rs)
+//! <data-dir>/ca.pem          legacy org's fleet CA certificate (imported into the database)
+//! <data-dir>/ca.key.pem      its private key (0600; kept for older tools, sealed in the db)
+//! <data-dir>/tls.cert.pem, tls.key.pem          server TLS identity from `init`
+//! <data-dir>/session.key, turn.secret           token and relay secrets
 //! <data-dir>/public-ca.pem, public-ca.key.pem   CA for computers without an account
 //! <data-dir>/public-hosts.jsonl                 their registry (id, owner)
 //! <data-dir>/relay-usage.json                   built-in relay's bytes this month
+//! <data-dir>/*.json.imported                    accounts/operators/revoked, after import
 //! ```
 
 use anyhow::{Context, Result, bail};
 use rconn_core::fleet::FleetCa;
-use rconn_core::ids::{HostId, OperatorId};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -43,8 +42,6 @@ impl DataDir {
         let ca = FleetCa::generate(rconn_core::ids::OrgId::new())?;
         fs::write(self.p("ca.pem"), ca.cert_pem())?;
         write_private(&self.p("ca.key.pem"), ca.key_pem())?;
-        fs::write(self.p("operators.json"), "{}")?;
-        fs::write(self.p("revoked.json"), "[]")?;
         let tls = rconn_core::tls::generate_server_tls(hostnames)?;
         fs::write(self.p("tls.cert.pem"), &tls.cert_pem)?;
         write_private(&self.p("tls.key.pem"), &tls.key_pem)?;
@@ -96,23 +93,6 @@ impl DataDir {
         Ok(Some(ca))
     }
 
-    pub fn operators(&self) -> Result<BTreeMap<String, OperatorId>> {
-        read_json(&self.p("operators.json"))
-    }
-
-    /// Create an operator and return its one-time-visible token.
-    pub fn add_operator(&self) -> Result<(OperatorId, String)> {
-        let mut ops = self.operators()?;
-        let token = hex(&rand::random::<[u8; 32]>());
-        let id = OperatorId::new();
-        ops.insert(hex(&Sha256::digest(token.as_bytes())), id);
-        write_private(
-            &self.p("operators.json"),
-            &serde_json::to_string_pretty(&ops)?,
-        )?;
-        Ok((id, token))
-    }
-
     /// Shared secret between signaling and the TURN relay, created on first use.
     pub fn turn_secret(&self) -> Result<String> {
         let path = self.p("turn.secret");
@@ -122,24 +102,6 @@ impl DataDir {
         let secret = hex(&rand::random::<[u8; 32]>());
         write_private(&path, &secret)?;
         Ok(secret)
-    }
-
-    pub fn accounts(&self) -> Result<crate::accounts::Accounts> {
-        let path = self.p("accounts.json");
-        if !path.exists() {
-            return Ok(Default::default());
-        }
-        read_json(&path)
-    }
-
-    pub fn add_account(&self, username: &str, password: &str) -> Result<OperatorId> {
-        let mut accounts = self.accounts()?;
-        let id = accounts.add(username, password)?;
-        write_private(
-            &self.p("accounts.json"),
-            &serde_json::to_string_pretty(&accounts)?,
-        )?;
-        Ok(id)
     }
 
     /// Key that signs session tokens, created on first use. Delete it to log everyone out.
@@ -152,24 +114,6 @@ impl DataDir {
         write_private(&path, &hex(&key))?;
         Ok(key)
     }
-
-    pub fn revoked(&self) -> Result<Vec<HostId>> {
-        read_json(&self.p("revoked.json"))
-    }
-
-    pub fn revoke(&self, host: HostId) -> Result<()> {
-        let mut list = self.revoked()?;
-        if !list.contains(&host) {
-            list.push(host);
-        }
-        fs::write(self.p("revoked.json"), serde_json::to_string_pretty(&list)?)?;
-        Ok(())
-    }
-}
-
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
 /// Write a file readable only by its owner (on Unix; on Windows the data dir's ACL applies).
@@ -203,7 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn init_then_reload_and_manage_operators_and_revocations() {
+    fn init_then_reload_cas() {
         let dir = tempfile::tempdir().unwrap();
         let store = DataDir::new(dir.path());
         let ca = store.init(&[]).unwrap();
@@ -220,15 +164,6 @@ mod tests {
                 .starts_with("sha256:")
         );
 
-        let (id, token) = store.add_operator().unwrap();
-        let ops = store.operators().unwrap();
-        let digest = hex(&Sha256::digest(token.as_bytes()));
-        assert_eq!(ops.get(&digest), Some(&id));
-        assert!(
-            !ops.keys().any(|k| k == &token),
-            "plaintext token must not be stored"
-        );
-
         assert!(store.public_ca(false).unwrap().is_none());
         let public = store.public_ca(true).unwrap().unwrap();
         assert_ne!(
@@ -238,11 +173,6 @@ mod tests {
         );
         let again = store.public_ca(false).unwrap().unwrap();
         assert_eq!(again.org_id(), public.org_id());
-
-        let h = HostId::new();
-        store.revoke(h).unwrap();
-        store.revoke(h).unwrap();
-        assert_eq!(store.revoked().unwrap(), vec![h]);
     }
 
     #[test]

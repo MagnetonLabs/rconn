@@ -4,10 +4,14 @@
 pub mod accounts;
 pub mod audit;
 pub mod auth;
+pub mod db;
 pub mod fleet_auth;
+pub mod hosts;
+pub mod import;
 pub mod oidc;
 pub mod public;
 pub mod reload;
+pub mod secrets;
 pub mod store;
 pub mod turn_relay;
 
@@ -21,6 +25,7 @@ use axum::http::{Extensions, HeaderMap, HeaderName};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
+use hosts::{HostFacts, HostInventory, InventoryEvent};
 use rconn_core::PROTOCOL_VERSION;
 use rconn_core::ids::{HostId, SessionId};
 use rconn_core::owner::{HostOwner, owner_admits};
@@ -58,6 +63,8 @@ struct Inner {
     public: std::sync::OnceLock<public::PublicHosts>,
     /// Behind a proxy: the header carrying the client's address (its last entry is used).
     client_ip_header: std::sync::OnceLock<HeaderName>,
+    /// Where org hosts' online/offline/enrollment are recorded, when configured.
+    inventory: std::sync::OnceLock<Arc<dyn HostInventory>>,
 }
 
 struct OnlineHost {
@@ -106,6 +113,7 @@ impl AppState {
                 enroller: std::sync::OnceLock::new(),
                 public: std::sync::OnceLock::new(),
                 client_ip_header: std::sync::OnceLock::new(),
+                inventory: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -130,6 +138,27 @@ impl AppState {
         let _ = self.inner.client_ip_header.set(name);
     }
 
+    /// Record org hosts (online, offline, enrolled) in this inventory. Computers without an
+    /// account are never recorded.
+    pub fn record_hosts_in(&self, inventory: Arc<dyn HostInventory>) {
+        let _ = self.inner.inventory.set(inventory);
+    }
+
+    /// Report to the inventory, unless the host is one without an account. Never blocks.
+    fn inventory(&self, event: InventoryEvent) {
+        let org = match &event {
+            InventoryEvent::Online { org, .. }
+            | InventoryEvent::Offline { org, .. }
+            | InventoryEvent::Enrolled { org, .. } => *org,
+        };
+        if self.inner.public.get().is_some_and(|p| p.org_id() == org) {
+            return;
+        }
+        if let Some(inv) = self.inner.inventory.get() {
+            inv.record(event);
+        }
+    }
+
     /// The owner of a host that just authenticated.
     fn owner_of(&self, h: &HostIdentity) -> Option<HostOwner> {
         match self.inner.public.get() {
@@ -150,6 +179,11 @@ impl AppState {
             self.audit(AuditEvent::HostOffline {
                 org_id: h.identity.org_id,
                 host_id,
+            });
+            self.inventory(InventoryEvent::Offline {
+                org: h.identity.org_id,
+                host: host_id,
+                at: unix_now() as i64,
             });
             let _ = h.tx.send(ServerMessage::Error {
                 code: ErrorCode::Forbidden,
@@ -243,7 +277,7 @@ enum Phase {
         cert_pem: String,
         client_nonce: Vec<u8>,
         nonce: [u8; CHALLENGE_LEN],
-        label: Option<String>,
+        facts: HostFacts,
     },
     Ready(Peer),
 }
@@ -346,6 +380,9 @@ async fn step(
                 cert_pem,
                 client_nonce,
                 label,
+                os,
+                version,
+                capabilities,
             },
         ) => {
             if !check_version(tx, protocol_version) {
@@ -368,7 +405,12 @@ async fn step(
                 cert_pem,
                 client_nonce,
                 nonce,
-                label,
+                facts: HostFacts::tidy(
+                    label.as_deref(),
+                    os.as_deref(),
+                    version.as_deref(),
+                    &capabilities,
+                ),
             })
         }
         (
@@ -377,7 +419,7 @@ async fn step(
                 cert_pem,
                 client_nonce,
                 nonce,
-                label,
+                facts,
             },
             ClientMessage::HostProof { signature },
         ) => {
@@ -404,14 +446,20 @@ async fn step(
                                 owner,
                             },
                         );
-                        match label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
-                            Some(l) => reg.labels.insert(host_id, l.chars().take(64).collect()),
+                        match &facts.label {
+                            Some(l) => reg.labels.insert(host_id, l.clone()),
                             None => reg.labels.remove(&host_id),
                         };
                     }
                     state.audit(AuditEvent::HostOnline {
                         org_id: identity.org_id,
                         host_id,
+                    });
+                    state.inventory(InventoryEvent::Online {
+                        org: identity.org_id,
+                        host: host_id,
+                        facts,
+                        at: unix_now() as i64,
                     });
                     let _ = tx.send(welcome(identity.org_id, ice_servers));
                     tracing::info!(%host_id, org = %identity.org_id, owned = owner.is_some(), "host online");
@@ -546,6 +594,12 @@ async fn step(
                         org_id: op.org_id,
                         host_id,
                         operator_id: op.operator_id,
+                    });
+                    state.inventory(InventoryEvent::Enrolled {
+                        org: op.org_id,
+                        host: host_id,
+                        by: Some(op.operator_id),
+                        at: unix_now() as i64,
                     });
                     let _ = tx.send(ServerMessage::HostEnrolled { host_id, cert_pem });
                 }
@@ -970,6 +1024,11 @@ async fn disconnect(state: &AppState, peer: Peer, tx: &Outbox) {
             state.audit(AuditEvent::HostOffline {
                 org_id: h.org_id,
                 host_id: h.host_id,
+            });
+            state.inventory(InventoryEvent::Offline {
+                org: h.org_id,
+                host: h.host_id,
+                at: unix_now() as i64,
             });
             tracing::info!(host_id = %h.host_id, "host offline");
         }

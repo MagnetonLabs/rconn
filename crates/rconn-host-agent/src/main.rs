@@ -211,6 +211,12 @@ async fn main() -> Result<()> {
             key: &key,
             cert_pem: &cert,
             label: Some(machine_name()),
+            os: Some(os_description().to_owned()),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            capabilities: rconn_core::protocol::HOST_CAPABILITIES
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect(),
         };
         match SignalingClient::connect_host(&server, &trust, creds).await {
             Ok(sig) => {
@@ -566,6 +572,69 @@ fn machine_name() -> String {
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unnamed computer".into())
+}
+
+/// Operating system and version for the admin inventory, e.g. `macos 15.3`,
+/// `linux ubuntu 24.04`, `windows 10.0.22631.4602`. Just the OS name when the version
+/// can't be read. Worked out once per process.
+fn os_description() -> &'static str {
+    static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OS.get_or_init(|| {
+        let os = std::env::consts::OS;
+        let version = os_version().map(|v| v.trim().to_owned());
+        let s = match version.filter(|v| !v.is_empty()) {
+            Some(v) => format!("{os} {v}"),
+            None => os.to_owned(),
+        };
+        s.chars()
+            .filter(|c| !c.is_control())
+            .take(rconn_core::protocol::MAX_HOST_FACT_CHARS)
+            .collect()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn os_version() -> Option<String> {
+    let out = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn os_version() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/os-release").ok()?;
+    let field = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+            .map(|v| v.trim().trim_matches('"').to_owned())
+    };
+    match (field("ID"), field("VERSION_ID")) {
+        (Some(id), Some(v)) => Some(format!("{id} {v}")),
+        (Some(id), None) => Some(id),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn os_version() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // "Microsoft Windows [Version 10.0.22631.4602]"
+    let out = std::process::Command::new("cmd")
+        .args(["/C", "ver"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let inner = text.split_once('[')?.1.split_once(']')?.0;
+    inner.rsplit(' ').next().map(str::to_owned)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn os_version() -> Option<String> {
+    None
 }
 
 /// Publishes `HostStatus` for the local app; a no-op without `--status-file`.

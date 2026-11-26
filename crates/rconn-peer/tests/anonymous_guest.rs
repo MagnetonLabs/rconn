@@ -194,6 +194,9 @@ async fn enroll_without_an_account_then_connect_by_password_or_by_asking() {
                 key: &key,
                 cert_pem: &cert,
                 label: Some("LAPTOP".into()),
+                os: None,
+                version: None,
+                capabilities: vec![],
             },
         )
         .await

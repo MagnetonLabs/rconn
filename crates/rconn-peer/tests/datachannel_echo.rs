@@ -90,6 +90,9 @@ async fn run(relay_only: bool) {
             key: &key,
             cert_pem: &cert,
             label: None,
+            os: None,
+            version: None,
+            capabilities: vec![],
         },
     )
     .await

@@ -92,6 +92,9 @@ async fn run() {
             key: &key,
             cert_pem: &cert,
             label: None,
+            os: None,
+            version: None,
+            capabilities: vec![],
         },
     )
     .await

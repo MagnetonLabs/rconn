@@ -29,6 +29,12 @@ pub struct HostCredentials<'a> {
     pub cert_pem: &'a str,
     /// Name shown in viewers' computer lists (usually the hostname).
     pub label: Option<String>,
+    /// Operating system and version, for the admin inventory (e.g. `macos 15.3`).
+    pub os: Option<String>,
+    /// Host agent version.
+    pub version: Option<String>,
+    /// Optional features this host supports ([`rconn_core::protocol::HOST_CAPABILITIES`]).
+    pub capabilities: Vec<String>,
 }
 
 impl SignalingClient {
@@ -47,6 +53,9 @@ impl SignalingClient {
                 cert_pem: creds.cert_pem.to_owned(),
                 client_nonce: client_nonce.to_vec(),
                 label: creds.label.clone(),
+                os: creds.os.clone(),
+                version: creds.version.clone(),
+                capabilities: creds.capabilities.clone(),
             },
         )
         .await?;

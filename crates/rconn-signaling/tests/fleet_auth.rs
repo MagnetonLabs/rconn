@@ -90,6 +90,9 @@ async fn handshake(
             cert_pem: host.cert.clone(),
             client_nonce: client_nonce.clone(),
             label: None,
+            os: None,
+            version: None,
+            capabilities: vec![],
         },
     )
     .await;
@@ -185,6 +188,9 @@ async fn short_client_nonce_is_refused() {
             cert_pem: host.cert,
             client_nonce: vec![1],
             label: None,
+            os: None,
+            version: None,
+            capabilities: vec![],
         },
     )
     .await;

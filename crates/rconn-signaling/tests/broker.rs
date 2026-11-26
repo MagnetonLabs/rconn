@@ -127,6 +127,9 @@ async fn connect_host(url: &str) -> (Ws, HostId) {
             cert_pem: "test".into(),
             client_nonce: vec![0; 32],
             label: Some("BOX-1".into()),
+            os: None,
+            version: None,
+            capabilities: vec![],
         },
     )
     .await;
@@ -249,6 +252,9 @@ async fn bad_host_proof_is_refused_and_closed() {
             cert_pem: "x".into(),
             client_nonce: vec![0; 32],
             label: None,
+            os: None,
+            version: None,
+            capabilities: vec![],
         },
     )
     .await;
