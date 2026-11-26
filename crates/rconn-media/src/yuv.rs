@@ -293,6 +293,35 @@ impl I420 {
 }
 
 impl I420 {
+    /// Copy the top-left of an NV12 picture (Y plane, interleaved UV plane, each with its
+    /// row stride) into this one.
+    pub fn fill_from_nv12(&mut self, (y, uv): (&[u8], &[u8]), (ys, uvs): (usize, usize)) {
+        let (w, h) = (self.width, self.height);
+        assert!(
+            ys >= w && uvs >= w && y.len() >= ys * (h - 1) + w && uv.len() >= uvs * (h / 2 - 1) + w,
+            "source smaller than picture"
+        );
+        let (dy, duv) = self.data.split_at_mut(w * h);
+        let (du, dv) = duv.split_at_mut(w * h / 4);
+        for (row, dst) in dy.chunks_exact_mut(w).enumerate() {
+            dst.copy_from_slice(&y[row * ys..row * ys + w]);
+        }
+        let half = w / 2;
+        for (cy, (u, v)) in du
+            .chunks_exact_mut(half)
+            .zip(dv.chunks_exact_mut(half))
+            .enumerate()
+        {
+            let src = &uv[cy * uvs..cy * uvs + w];
+            for (x, pair) in src.as_chunks::<2>().0.iter().enumerate() {
+                u[x] = pair[0];
+                v[x] = pair[1];
+            }
+        }
+    }
+}
+
+impl I420 {
     /// Half the size (2x2 averages), for sending fast motion at a quarter of the pixels.
     /// `out` is reallocated if it isn't half this picture's size (rounded down to even).
     pub fn half_into(&self, out: &mut Option<I420>) {

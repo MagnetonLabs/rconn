@@ -1,9 +1,6 @@
 //! H.264 encode/decode for screen content, on Cisco's openh264.
 
 use crate::codec::CodecError;
-use crate::h264::SyntaxTracker;
-pub use crate::recovery::FrameInfo;
-use crate::recovery::{Ledger, Sent};
 use crate::yuv::I420;
 use openh264::OpenH264API;
 use openh264::decoder::{Decoder, DecoderConfig};
@@ -11,6 +8,9 @@ use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
     SpsPpsStrategy, UsageType,
 };
+use crate::h264::SyntaxTracker;
+pub use crate::recovery::FrameInfo;
+use crate::recovery::{Ledger, Sent};
 use openh264::formats::YUVSource;
 use std::time::Instant;
 
@@ -112,6 +112,10 @@ enum Engine {
     /// and the GPU's encoder where a vendor registers one.
     #[cfg(windows)]
     MediaFoundation(crate::mf::MfH264Encoder),
+    /// Apple's encoder (the hardware one where there is one), in low-latency mode; it
+    /// can also take the capturer's GPU surfaces without a copy.
+    #[cfg(target_os = "macos")]
+    VideoToolbox(Box<crate::vt_encode::VtEncoder>),
 }
 
 /// An openh264 encoder and the rate it was last told.
@@ -131,6 +135,19 @@ struct OpenH264 {
 #[cfg(windows)]
 const MF_LTR_PERIOD: u32 = 30;
 
+/// Per-frame loss-repair state between the start of an encode and [`VideoEncoder::finish`].
+#[derive(Default)]
+struct Repair {
+    /// The loss report being answered (last good frame id).
+    asked: Option<u32>,
+    /// The long-term reference the frame predicts from.
+    base: Option<Sent>,
+    /// Media Foundation: the slot the frame was marked into, and the slots the encoder
+    /// says it predicted from.
+    marked: Option<u8>,
+    used: Option<u16>,
+}
+
 pub struct VideoEncoder {
     api_path: std::path::PathBuf,
     settings: EncoderSettings,
@@ -149,6 +166,13 @@ pub struct VideoEncoder {
     scale: f32,
     last_was_key: bool,
     force_key: bool,
+    /// macOS: openh264 rather than VideoToolbox, as asked for (`RCONN_ENCODER=openh264`,
+    /// [`VideoEncoder::software`]) or because VideoToolbox failed.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    software_only: bool,
+    /// VideoToolbox failures in a row.
+    #[cfg(target_os = "macos")]
+    vt_failures: u32,
     /// openh264 in long-term-reference mode for engines built from now on.
     openh264_ltr: bool,
     /// Reads our own output: frame numbers and reference marks for loss repair.
@@ -160,10 +184,22 @@ pub struct VideoEncoder {
     /// A loss was reported after this frame: repair at the next encode.
     repair: Option<u32>,
     /// Frames since the last long-term mark (Media Foundation).
+    #[cfg_attr(not(windows), allow(dead_code))]
     since_mark: u32,
 }
 
 impl VideoEncoder {
+    /// Cisco's openh264 rather than VideoToolbox (comparisons, tests).
+    #[cfg(target_os = "macos")]
+    pub fn software(
+        openh264_path: &std::path::Path,
+        settings: EncoderSettings,
+    ) -> Result<Self, CodecError> {
+        let mut enc = Self::new(openh264_path, settings)?;
+        enc.software_only = true;
+        Ok(enc)
+    }
+
     /// `openh264_path` is Cisco's shared library (see [`crate::cisco`]).
     pub fn new(
         openh264_path: &std::path::Path,
@@ -184,6 +220,9 @@ impl VideoEncoder {
             scale: 1.0,
             last_was_key: false,
             force_key: false,
+            software_only: std::env::var("RCONN_ENCODER").is_ok_and(|v| v == "openh264"),
+            #[cfg(target_os = "macos")]
+            vt_failures: 0,
             openh264_ltr: std::env::var("RCONN_OPENH264_LTR").is_ok_and(|v| v == "1"),
             syntax: SyntaxTracker::default(),
             ledger: Ledger::default(),
@@ -195,6 +234,19 @@ impl VideoEncoder {
     }
 
     fn build(&mut self, width: usize, height: usize) -> Result<Engine, CodecError> {
+        #[cfg(target_os = "macos")]
+        if !self.software_only {
+            match crate::vt_encode::VtEncoder::new(width, height, &self.settings) {
+                Ok(vt) => {
+                    self.engine_name = vt.name().to_owned();
+                    return Ok(Engine::VideoToolbox(Box::new(vt)));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "VideoToolbox encoder unavailable; using openh264");
+                    self.software_only = true;
+                }
+            }
+        }
         #[cfg(windows)]
         match crate::mf::MfH264Encoder::new(
             width as u32,
@@ -228,7 +280,8 @@ impl VideoEncoder {
         // Long-term references (loss repair without a keyframe) only work in openh264's
         // camera mode: in screen mode it switches them off ("not supported yet"). Camera
         // mode measured 3.7x faster per frame, ~25 % more bytes on scrolling and static
-        // text (see `ltr_tests`), so it is opt-in: `RCONN_OPENH264_LTR=1`.
+        // text (`ltr_tests::compare_screen_and_ltr_modes`), so it is opt-in:
+        // `RCONN_OPENH264_LTR=1`.
         let (usage, ltr) = if self.openh264_ltr {
             (UsageType::CameraVideoRealTime, true)
         } else {
@@ -297,15 +350,15 @@ impl VideoEncoder {
         let bps = self.settings.bitrate_bps;
         match &mut self.encoder {
             Some(Engine::OpenH264(o)) if o.started && o.bps != bps => {
-                if crate::oh264::set_bitrate(&mut o.encoder, o.bps, bps) {
-                    o.bps = bps;
-                } else {
+                if !crate::oh264::set_bitrate(&mut o.encoder, o.bps, bps) {
                     tracing::warn!(bps, "openh264 refused a live bitrate change");
-                    o.bps = bps; // don't retry every frame; the next change tries again
                 }
+                o.bps = bps; // not retried every frame; the next change tries again
             }
             #[cfg(windows)]
             Some(Engine::MediaFoundation(mf)) => mf.set_bitrate(bps), // live, no keyframe
+            #[cfg(target_os = "macos")]
+            Some(Engine::VideoToolbox(vt)) => vt.set_bitrate(bps), // live, no keyframe
             _ => {}
         }
     }
@@ -322,11 +375,14 @@ impl VideoEncoder {
     }
 
     /// Can a reported loss be repaired without a keyframe ([`Self::request_ltr_recovery`])?
+    /// VideoToolbox: not yet (its LTR properties are not wired; repairs are keyframes).
     pub fn supports_ltr(&self) -> bool {
         match &self.encoder {
             Some(Engine::OpenH264(o)) => o.ltr,
             #[cfg(windows)]
             Some(Engine::MediaFoundation(mf)) => mf.ltr_slots() > 0,
+            #[cfg(target_os = "macos")]
+            Some(Engine::VideoToolbox(_)) => false,
             None => self.openh264_ltr,
         }
     }
@@ -336,7 +392,7 @@ impl VideoEncoder {
         self.next_id = id;
     }
 
-    /// The last frame put out by [`Self::encode_yuv`] / [`Self::encode`].
+    /// The last frame put out.
     pub fn last_frame(&self) -> FrameInfo {
         self.last
     }
@@ -389,6 +445,22 @@ impl VideoEncoder {
         }
     }
 
+    /// Start a frame: the live bitrate, a pending loss repair, a keyframe asked for.
+    fn begin_frame(&mut self) -> (bool, Repair) {
+        self.apply_bitrate();
+        let mut repair = Repair {
+            asked: self.repair.take(),
+            ..Repair::default()
+        };
+        if let Some(last_good) = repair.asked {
+            repair.base = self.plan_repair(last_good);
+            if repair.base.is_none() {
+                self.force_key = true; // nothing to repair from
+            }
+        }
+        (std::mem::take(&mut self.force_key), repair)
+    }
+
     /// Encode one frame into an Annex-B access unit. `None` means the rate controller
     /// skipped the frame.
     pub fn encode(&mut self, frame: &Frame) -> Result<Option<Vec<u8>>, CodecError> {
@@ -420,6 +492,136 @@ impl VideoEncoder {
         changed_rows: Option<(usize, usize)>,
     ) -> Result<Option<Vec<u8>>, CodecError> {
         let (w, h) = yuv.dimensions();
+        self.ensure_engine(w, h)?;
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let (force_key, mut repair) = self.begin_frame();
+        let out = match self.encoder.as_mut().expect("built above") {
+            Engine::OpenH264(o) => {
+                if force_key {
+                    o.encoder.force_intra_frame();
+                }
+                let bits = o
+                    .encoder
+                    .encode(yuv)
+                    .map_err(|e| CodecError::OpenH264(e.to_string()))?;
+                self.last_was_key = matches!(
+                    bits.frame_type(),
+                    openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
+                );
+                let out = bits.to_vec();
+                if !o.started {
+                    o.started = true;
+                    // Changed before the first frame, the rate would have been lost.
+                    let bps = self.settings.bitrate_bps;
+                    if o.bps != bps && crate::oh264::set_bitrate(&mut o.encoder, o.bps, bps) {
+                        o.bps = bps;
+                    }
+                }
+                out
+            }
+            #[cfg(windows)]
+            Engine::MediaFoundation(mf) => {
+                if force_key {
+                    mf.force_keyframe();
+                }
+                // Long-term references: the keyframe into slot 0 (a keyframe empties
+                // them), then about once a second into a slot not holding the newest
+                // picture the viewer confirmed.
+                let slots = mf.ltr_slots();
+                if slots > 0 && repair.base.is_none() {
+                    let slot = if force_key || self.ledger.newest().is_none() {
+                        Some(0)
+                    } else if self.since_mark >= MF_LTR_PERIOD {
+                        Some(self.ledger.free_slot(slots))
+                    } else {
+                        None
+                    };
+                    if let Some(slot) = slot
+                        && mf.mark_ltr(slot)
+                    {
+                        repair.marked = Some(slot);
+                    }
+                }
+                yuv.write_nv12(&mut self.nv12, changed_rows);
+                let out = mf.encode(&self.nv12)?;
+                self.last_was_key = has_idr(&out);
+                // Where the encoder reports what it did, its word wins.
+                if let Some((m, u)) = mf.last_ltr_info() {
+                    repair.marked = m;
+                    repair.used = Some(u);
+                }
+                out
+            }
+            #[cfg(target_os = "macos")]
+            Engine::VideoToolbox(vt) => match vt.encode_i420(yuv, changed_rows, force_key) {
+                Ok(au) => self.vt_output(au),
+                Err(e) => {
+                    // A new session (or openh264) gets the whole picture again.
+                    self.vt_failed(&e, force_key);
+                    self.repair = self.repair.or(repair.asked);
+                    return self.encode_yuv(yuv, None);
+                }
+            },
+        };
+        let _ = changed_rows; // only the NV12 paths can use it
+        Ok(self.finish(out, force_key, repair))
+    }
+
+    /// Can this encoder take the capturer's GPU surfaces as they are (VideoToolbox)?
+    pub fn wants_surfaces(&self) -> bool {
+        cfg!(target_os = "macos") && !self.software_only
+    }
+
+    /// Encode a captured GPU surface. VideoToolbox reads it where it is (no copy); a
+    /// software encoder gets a CPU conversion of it.
+    pub fn encode_surface(
+        &mut self,
+        surface: &crate::capture::Surface,
+    ) -> Result<Option<Vec<u8>>, CodecError> {
+        let (w, h) = surface.dimensions();
+        let (w, h) = (w & !1, h & !1);
+        if w == 0 || h == 0 {
+            return Ok(None);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if !self.software_only {
+                self.ensure_engine(w, h)?;
+            }
+            if matches!(self.encoder, Some(Engine::VideoToolbox(_))) {
+                let (force_key, repair) = self.begin_frame();
+                let Some(Engine::VideoToolbox(vt)) = self.encoder.as_mut() else {
+                    unreachable!("checked above");
+                };
+                return match vt.encode_surface(surface, force_key) {
+                    Ok(au) => {
+                        let out = self.vt_output(au);
+                        Ok(self.finish(out, force_key, repair))
+                    }
+                    Err(e) => {
+                        self.vt_failed(&e, force_key);
+                        self.repair = self.repair.or(repair.asked);
+                        self.encode_surface(surface)
+                    }
+                };
+            }
+            let mut yuv = self.yuv.take();
+            if !surface.to_i420(&mut yuv) {
+                return Err(CodecError::VideoToolbox(
+                    "could not read the captured surface".into(),
+                ));
+            }
+            let yuv = yuv.expect("allocated by to_i420");
+            let out = self.encode_yuv(&yuv, None);
+            self.yuv = Some(yuv);
+            out
+        }
+        #[cfg(not(target_os = "macos"))]
+        match *surface {}
+    }
+
+    /// Make sure the engine encodes `w` x `h` pictures.
+    fn ensure_engine(&mut self, w: usize, h: usize) -> Result<(), CodecError> {
         if self.dims != Some((w, h)) || self.encoder.is_none() {
             // Switching between two sizes (full / half while things move) reuses the
             // encoder kept for the other size; its next frame must be a keyframe.
@@ -437,86 +639,49 @@ impl VideoEncoder {
             self.encoder = Some(engine);
             self.dims = Some((w, h));
             self.nv12.clear(); // forces a full NV12 rewrite
+            // References never cross encoders.
             self.ledger.new_instance();
             self.since_mark = 0;
+            // A kept encoder may still have an older bitrate (applied in `begin_frame`).
+            #[cfg(target_os = "macos")]
+            if let Some(Engine::VideoToolbox(vt)) = &mut self.encoder {
+                vt.set_bitrate(self.settings.bitrate_bps);
+                vt.forget_picture(); // a kept session's copy predates the rows reported
+            }
         }
-        // A kept encoder may still have an older bitrate.
-        self.apply_bitrate();
-        let asked = self.repair.take();
-        let base = match asked {
-            Some(last_good) => {
-                let base = self.plan_repair(last_good);
-                if base.is_none() {
-                    self.force_key = true; // nothing to repair from
-                }
-                base
-            }
-            None => None,
-        };
-        let force_key = std::mem::take(&mut self.force_key);
-        // Media Foundation: the slot this frame was marked into, and the slots the encoder
-        // says it predicted from.
-        #[cfg_attr(not(windows), allow(unused_mut))]
-        let (mut marked, mut used): (Option<u8>, Option<u16>) = (None, None);
-        let out = match self.encoder.as_mut().expect("built above") {
-            Engine::OpenH264(o) => {
-                if force_key {
-                    o.encoder.force_intra_frame();
-                }
-                let bits = o
-                    .encoder
-                    .encode(yuv)
-                    .map_err(|e| CodecError::OpenH264(e.to_string()))?;
-                self.last_was_key = matches!(
-                    bits.frame_type(),
-                    openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
-                );
-                let out = bits.to_vec();
-                if !o.started {
-                    o.started = true;
-                    // Set before the first frame, a live rate would have been lost.
-                    let bps = self.settings.bitrate_bps;
-                    if o.bps != bps && crate::oh264::set_bitrate(&mut o.encoder, o.bps, bps) {
-                        o.bps = bps;
-                    }
-                }
-                out
-            }
-            #[cfg(windows)]
-            Engine::MediaFoundation(mf) => {
-                if force_key {
-                    mf.force_keyframe();
-                }
-                // Long-term references: the keyframe into slot 0 (a keyframe empties
-                // them), then about once a second into a slot not holding the newest
-                // picture the viewer confirmed.
-                let slots = mf.ltr_slots();
-                if slots > 0 && base.is_none() {
-                    let slot = if force_key || self.ledger.newest().is_none() {
-                        Some(0)
-                    } else if self.since_mark >= MF_LTR_PERIOD {
-                        Some(self.ledger.free_slot(slots))
-                    } else {
-                        None
-                    };
-                    if let Some(slot) = slot
-                        && mf.mark_ltr(slot)
-                    {
-                        marked = Some(slot);
-                    }
-                }
-                yuv.write_nv12(&mut self.nv12, changed_rows);
-                let out = mf.encode(&self.nv12)?;
-                self.last_was_key = has_idr(&out);
-                // Where the encoder reports what it did, its word wins.
-                if let Some((m, u)) = mf.last_ltr_info() {
-                    marked = m;
-                    used = Some(u);
-                }
-                out
-            }
-        };
-        let _ = changed_rows; // only the NV12 path can use it
+        Ok(())
+    }
+
+    /// A VideoToolbox frame out: `None` (dropped) becomes an empty unit.
+    #[cfg(target_os = "macos")]
+    fn vt_output(&mut self, au: Option<(Vec<u8>, bool)>) -> Vec<u8> {
+        self.vt_failures = 0;
+        let (out, key) = au.unwrap_or_default();
+        self.last_was_key = key;
+        out
+    }
+
+    /// VideoToolbox failed to encode (its session dies on sleep/wake or a GPU change):
+    /// drop the session so the next frame makes a new one. After a few failures in a row,
+    /// openh264 takes over for good.
+    #[cfg(target_os = "macos")]
+    fn vt_failed(&mut self, error: &str, force_key: bool) {
+        self.vt_failures += 1;
+        self.encoder = None;
+        self.spare = None;
+        self.force_key |= force_key;
+        if self.vt_failures >= 3 {
+            tracing::warn!(error, "VideoToolbox keeps failing; using openh264");
+            self.software_only = true;
+        } else {
+            tracing::warn!(error, "VideoToolbox encode failed; starting a new session");
+        }
+    }
+
+    /// Bookkeeping after a frame: a keyframe still owed, stream headers in front of
+    /// keyframes, the frame's id and references. `None` for an empty unit (a skipped
+    /// frame).
+    fn finish(&mut self, out: Vec<u8>, force_key: bool, repair: Repair) -> Option<Vec<u8>> {
         // A keyframe asked for (a viewer lost its picture) is owed until one comes out: the
         // rate controller may skip the frame it was asked of, and a viewer without a
         // picture has nothing to show until it gets one.
@@ -536,31 +701,27 @@ impl VideoEncoder {
         }
         let out = with_headers(out, &mut self.headers);
         if out.is_empty() {
-            if base.is_some() {
-                self.repair = asked; // the repair frame was skipped: again next frame
+            if repair.base.is_some() {
+                self.repair = repair.asked; // the repair frame was skipped: again next frame
             }
-            return Ok(None);
+            return None;
         }
-        self.note_output(&out, base, marked, used);
-        Ok(Some(out))
+        self.note_output(&out, &repair);
+        Some(out)
     }
 
     /// Record a frame that went out: its id, what it references, for repairs to come.
-    fn note_output(
-        &mut self,
-        out: &[u8],
-        base: Option<Sent>,
-        marked: Option<u8>,
-        used: Option<u16>,
-    ) {
+    fn note_output(&mut self, out: &[u8], repair: &Repair) {
         let slice = self.syntax.access_unit(out);
         let key = self.last_was_key;
         let ltr_slot = match &self.encoder {
-            Some(Engine::OpenH264(o)) if o.ltr => slice.and_then(|s| s.marks_long_term).map(|_| 0),
-            _ => marked,
+            Some(Engine::OpenH264(o)) if o.ltr => {
+                slice.and_then(|s| s.marks_long_term).map(|_| 0)
+            }
+            _ => repair.marked,
         };
-        let recovers_from = match (base, &self.encoder) {
-            (_, _) if key => None,
+        let recovers_from = match (repair.base, &self.encoder) {
+            _ if key => None,
             (None, _) => None,
             // openh264 says in the bitstream whether it predicted from a long-term picture.
             (Some(b), Some(Engine::OpenH264(_))) => {
@@ -569,15 +730,18 @@ impl VideoEncoder {
             // Media Foundation, where it reports the slots it used.
             (Some(b), _) => {
                 let slot = b.ltr_slot.unwrap_or(0);
-                used.is_none_or(|u| u & (1 << slot) != 0).then_some(b.id)
+                repair
+                    .used
+                    .is_none_or(|u| u & (1 << slot) != 0)
+                    .then_some(b.id)
             }
         };
-        if base.is_some() && !key && recovers_from.is_none() {
+        if repair.base.is_some() && !key && recovers_from.is_none() {
             // The encoder did not honour the repair: the viewer still has a broken picture.
             tracing::warn!(engine = %self.engine_name, "loss repair not taken; sending a keyframe");
             self.force_key = true;
         }
-        if marked.is_some() || key {
+        if repair.marked.is_some() || key {
             self.since_mark = 0;
         } else {
             self.since_mark += 1;
@@ -596,6 +760,15 @@ impl VideoEncoder {
             key,
             recovers_from,
         };
+    }
+
+    /// The VideoToolbox session in use, if any.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn vt_for_test(&mut self) -> Option<&mut crate::vt_encode::VtEncoder> {
+        match self.encoder.as_mut() {
+            Some(Engine::VideoToolbox(vt)) => Some(vt),
+            _ => None,
+        }
     }
 
     /// Was the last encoded frame a keyframe? (Keyframes are always slow and large.)
@@ -644,7 +817,7 @@ pub(crate) fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// The sequence parameter set (SPS) in `annex_b`, if any (without its start code).
-fn sequence_header(annex_b: &[u8]) -> Option<&[u8]> {
+pub(crate) fn sequence_header(annex_b: &[u8]) -> Option<&[u8]> {
     nal_units(annex_b).find(|nal| nal[0] & 0x1f == 7)
 }
 
@@ -989,14 +1162,15 @@ mod ltr_tests {
 
     fn encoder(ltr: bool, bps: u32) -> Option<VideoEncoder> {
         let lib = crate::cisco::local_binary_path()?;
-        let mut e = VideoEncoder::new(
-            &lib,
-            EncoderSettings {
-                bitrate_bps: bps,
-                ..EncoderSettings::default()
-            },
-        )
-        .ok()?;
+        let settings = EncoderSettings {
+            bitrate_bps: bps,
+            ..EncoderSettings::default()
+        };
+        // openh264 everywhere (macOS would pick VideoToolbox).
+        #[cfg(target_os = "macos")]
+        let mut e = VideoEncoder::software(&lib, settings).ok()?;
+        #[cfg(not(target_os = "macos"))]
+        let mut e = VideoEncoder::new(&lib, settings).ok()?;
         e.set_long_term_refs(ltr);
         Some(e)
     }
