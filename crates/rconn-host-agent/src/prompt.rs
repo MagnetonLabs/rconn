@@ -32,7 +32,13 @@ fn prompt_exe() -> Option<PathBuf> {
 
 /// What the app printed, as an answer.
 pub fn parse(stdout: &str) -> Answer {
-    match stdout.lines().next().map(str::trim) {
+    // The answer is a line of its own; anything else the app printed (a library's warning
+    // on a misconfigured system) is ignored. The last answer line counts.
+    let answer = stdout
+        .lines()
+        .map(str::trim)
+        .rfind(|l| [ANSWER_ACCEPT, ANSWER_DECLINE, ANSWER_TIMEOUT].contains(l));
+    match answer {
         Some(ANSWER_ACCEPT) => Answer::Accept,
         Some(ANSWER_DECLINE) => Answer::Decline,
         Some(ANSWER_TIMEOUT) => Answer::TimedOut,
@@ -87,6 +93,15 @@ mod tests {
         assert_eq!(parse("timeout\n"), Answer::TimedOut);
         assert!(matches!(parse(""), Answer::CannotAsk(_)));
         assert!(matches!(parse("accepted\n"), Answer::CannotAsk(_)));
+        // Ubuntu: a clipboard library warned on stdout before the answer (seen live).
+        assert_eq!(
+            parse("WARN arboard::platform::linux: Tried to initialize ...\naccept\n"),
+            Answer::Accept
+        );
+        assert!(matches!(
+            parse("the user said accept\n"),
+            Answer::CannotAsk(_)
+        ));
     }
 
     /// A stand-in for the app that answers at once (Unix: a shell script).

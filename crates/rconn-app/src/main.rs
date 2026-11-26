@@ -42,7 +42,9 @@ impl eframe::App for App {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Logs go to stderr: stdout carries `--ask`'s answer to the host agent.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )

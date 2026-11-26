@@ -434,7 +434,10 @@ async fn serve_channel(
             return;
         }
     }
-    let input = input::InputSink::start();
+    // Started at the first input, which only arrives once the session is allowed: on
+    // Wayland the injector opens the desktop's sharing session, which must not happen
+    // while the person here is still deciding.
+    let mut input: Option<input::InputSink> = None;
     let mut cursor_shapes = cursor::watch();
     let (clip, mut local_clip) = if clipboard {
         let (c, rx) = ClipboardSync::start();
@@ -506,7 +509,7 @@ async fn serve_channel(
                     }
                     Ok(DataMessage::Input(ev)) => {
                         stream::note_input(); // someone is interacting: full frame rate
-                        input.send(ev)
+                        input.get_or_insert_with(input::InputSink::start).send(ev)
                     }
                     Ok(DataMessage::Clipboard(text)) => match &clip {
                         Some(c) => c.apply_remote(text),
