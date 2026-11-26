@@ -1,5 +1,6 @@
-//! The main window: this computer's ID on the left, "connect to a computer" on the right,
-//! with tabs for the computer list, recent connections and settings.
+//! The main window, like AnyDesk: this computer's ID and access password on the left,
+//! "connect to: ID + password" on the right, with recent computers below. No account is
+//! needed for either side; signing in (Settings) adds a self-hosted fleet's computer list.
 
 use crate::profile::Profile;
 use egui::{Color32, FontId, RichText};
@@ -44,7 +45,8 @@ pub enum Request {
     /// Open the admin settings window (UAC prompt on Windows).
     OpenHostSettings,
     RestartHostAgent,
-    /// macOS and Linux: make this computer a host ("Allow connections to this computer").
+    /// macOS and Linux: make this computer a host (an ID from the server, no account
+    /// needed; the first launch does this by itself).
     EnableHost,
     /// macOS and Linux: stop being a host (the identity is kept).
     DisableHost,
@@ -93,6 +95,14 @@ pub struct Home {
     pub host_settings: Option<HostSettings>,
     /// The app itself can make this computer a host (macOS; Windows uses the installer).
     pub can_host_here: bool,
+    /// Setting this computer up as a host right now (e.g. "Getting an ID…").
+    pub host_setup: Option<String>,
+    /// Why turning on incoming connections failed last time.
+    pub host_error: Option<String>,
+    /// "Change" was clicked next to a set access password.
+    pub changing_password: bool,
+    /// Move the keyboard focus to the access-password field (after picking a recent ID).
+    pub focus_password: bool,
 }
 
 impl Home {
@@ -105,7 +115,7 @@ impl Home {
             this: None,
             now: 0,
             signed_in: false,
-            tab: Tab::Computers,
+            tab: Tab::Recent,
             connect_to: String::new(),
             access_password: String::new(),
             new_host_password: String::new(),
@@ -116,6 +126,10 @@ impl Home {
             busy: None,
             host_settings: None,
             can_host_here: cfg!(unix),
+            host_setup: None,
+            host_error: None,
+            changing_password: false,
+            focus_password: false,
         }
     }
 
@@ -141,7 +155,7 @@ pub fn resolve<'a>(typed: &str, computers: &'a [HostInfo]) -> Option<&'a HostInf
 pub fn draw(ui: &mut egui::Ui, h: &mut Home) -> Vec<Request> {
     let mut out = Vec::new();
     egui::Panel::left("this_computer")
-        .exact_size(270.0)
+        .exact_size(290.0)
         .resizable(false)
         .frame(
             egui::Frame::new()
@@ -168,45 +182,57 @@ pub fn draw(ui: &mut egui::Ui, h: &mut Home) -> Vec<Request> {
     out
 }
 
-fn this_computer(ui: &mut egui::Ui, h: &Home, out: &mut Vec<Request>) {
+fn this_computer(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     ui.label(
         RichText::new("This computer")
             .font(FontId::proportional(24.0))
             .strong(),
     );
     ui.add_space(6.0);
-    let Some(s) = &h.this else {
-        if !h.can_host_here {
-            ui.label("Connections to this computer are off: the Rconn host isn't installed here.");
+    let Some(s) = h.this.clone() else {
+        if let Some(step) = &h.host_setup {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(step.as_str());
+            });
             return;
         }
-        ui.label("Connections to this computer are off.");
+        if !h.can_host_here {
+            ui.label("Incoming connections are off: the Rconn host isn't installed here.");
+            return;
+        }
+        ui.label("Incoming connections are off.");
         ui.add_space(12.0);
-        let ready = h.signed_in && h.busy.is_none();
-        let button = egui::Button::new(
-            RichText::new("Allow connections to this computer").color(Color32::WHITE),
-        )
-        .fill(ACCENT);
-        if ui.add_enabled(ready, button).clicked() {
+        let button =
+            egui::Button::new(RichText::new("Turn on incoming connections").color(Color32::WHITE))
+                .fill(ACCENT);
+        if ui.add(button).clicked() {
             out.push(Request::EnableHost);
         }
         ui.add_space(6.0);
         ui.label(
-            RichText::new(if h.signed_in && cfg!(target_os = "macos") {
-                "Gives this Mac an ID on your server. macOS will then ask you to allow Screen Recording and Accessibility."
-            } else if h.signed_in {
-                "Gives this computer an ID on your server and starts the host when you log in."
+            RichText::new(if cfg!(target_os = "macos") {
+                "Gives this Mac an ID (no account needed). macOS then asks you to allow Screen Recording and Accessibility."
             } else {
-                "Sign in first (⚙ Settings)."
+                "Gives this computer an ID (no account needed) and starts the host when you log in."
             })
             .small()
             .color(Color32::GRAY),
         );
+        if let Some(e) = &h.host_error {
+            ui.add_space(8.0);
+            ui.label(RichText::new(e.as_str()).color(BAD).small());
+        }
         return;
     };
-    ui.label("Others can connect to this computer with this ID.");
-    ui.add_space(14.0);
-    ui.label(RichText::new("ID").color(Color32::GRAY));
+    ui.label("Your ID");
+    ui.label(
+        RichText::new("Give it, with the access password, to whoever should connect.")
+            .small()
+            .color(Color32::GRAY),
+    );
+    ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(&s.short_code)
@@ -217,9 +243,9 @@ fn this_computer(ui: &mut egui::Ui, h: &Home, out: &mut Vec<Request>) {
             ui.ctx().copy_text(s.short_code.clone());
         }
     });
+    ui.label(RichText::new(&s.label).color(Color32::GRAY));
     ui.add_space(10.0);
-    ui.label(RichText::new("Name").color(Color32::GRAY));
-    ui.label(RichText::new(&s.label).size(16.0));
+    access_password_block(ui, h, &s, out);
     ui.add_space(10.0);
     let fresh = s.is_fresh(h.now);
     let (dot, text) = if !fresh {
@@ -266,7 +292,7 @@ fn this_computer(ui: &mut egui::Ui, h: &Home, out: &mut Vec<Request>) {
     }
     if h.can_host_here {
         ui.add_space(16.0);
-        if ui.small_button("Turn off connections").clicked() {
+        if ui.small_button("Turn off incoming connections").clicked() {
             out.push(Request::DisableHost);
         }
     }
@@ -286,7 +312,7 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             ui.add_space(8.0);
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut h.connect_to)
-                    .hint_text("Enter computer ID")
+                    .hint_text("Computer ID (123 456 789)")
                     .font(FontId::proportional(22.0))
                     .desired_width(f32::INFINITY),
             );
@@ -295,9 +321,13 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             let pw = ui.add(
                 egui::TextEdit::singleline(&mut h.access_password)
                     .password(true)
-                    .hint_text("Access password (no account needed)")
+                    .hint_text("Its access password")
+                    .font(FontId::proportional(18.0))
                     .desired_width(f32::INFINITY),
             );
+            if std::mem::take(&mut h.focus_password) {
+                pw.request_focus();
+            }
             enter |= pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -325,10 +355,8 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
                 }
                 if !h.signed_in && !guest {
                     ui.label(
-                        RichText::new(
-                            "Enter the computer's access password, or sign in (⚙ Settings)",
-                        )
-                        .color(Color32::GRAY),
+                        RichText::new("No account needed: the ID and its access password.")
+                            .color(Color32::GRAY),
                     );
                 }
             });
@@ -337,11 +365,19 @@ fn connect_card(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
 
 fn tabs(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     ui.horizontal(|ui| {
-        for (tab, icon, name) in [
-            (Tab::Computers, "🖥", "Computers"),
+        // "Computers" is a signed-in fleet's list; without an account there is none.
+        if !h.signed_in && h.tab == Tab::Computers {
+            h.tab = Tab::Recent;
+        }
+        let tabs = [
             (Tab::Recent, "🕘", "Recent"),
+            (Tab::Computers, "🖥", "Computers"),
             (Tab::Settings, "⚙", "Settings"),
-        ] {
+        ];
+        for (tab, icon, name) in tabs
+            .into_iter()
+            .filter(|(t, _, _)| *t != Tab::Computers || h.signed_in)
+        {
             let text = RichText::new(format!("{icon}  {name}")).size(17.0);
             if ui.selectable_label(h.tab == tab, text).clicked() {
                 h.tab = tab;
@@ -367,7 +403,7 @@ fn tabs(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
 
 fn computer_card(
     ui: &mut egui::Ui,
-    host_id: HostId,
+    code: &str,
     label: Option<&str>,
     online: Option<bool>,
     enabled: bool,
@@ -382,11 +418,7 @@ fn computer_card(
                 ui.label(RichText::new("🖥").size(28.0));
                 ui.vertical(|ui| {
                     ui.label(RichText::new(label.unwrap_or("Unnamed computer")).strong());
-                    ui.label(
-                        RichText::new(host_id.short_code())
-                            .monospace()
-                            .color(Color32::GRAY),
-                    );
+                    ui.label(RichText::new(code).monospace().color(Color32::GRAY));
                     if let Some(online) = online {
                         let (c, t) = if online {
                             (GOOD, "online")
@@ -434,36 +466,51 @@ fn computers(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     let enabled = h.busy.is_none();
     let cards: Vec<_> = list
         .iter()
-        .map(|c| (c.host_id, c.label.clone(), Some(true)))
+        .map(|c| (c.host_id.short_code(), c.label.clone(), Some(true)))
         .collect();
-    if let Some((id, label)) = card_grid(ui, &cards, enabled) {
-        out.push(Request::Connect(id, label));
+    if let Some(i) = card_grid(ui, &cards, enabled) {
+        out.push(Request::Connect(list[i].host_id, list[i].label.clone()));
     }
 }
 
 fn recent(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     if h.profile.recent.is_empty() {
-        return empty(ui, "🕘", "No recent sessions yet.");
+        return empty(
+            ui,
+            "🕘",
+            "Computers you connect to appear here. Enter an ID and its password above.",
+        );
     }
     let online: Option<Vec<HostId>> = h
         .computers
         .as_ref()
         .map(|l| l.iter().map(|c| c.host_id).collect());
-    let enabled = h.busy.is_none() && h.signed_in;
+    let enabled = h.busy.is_none();
     let cards: Vec<_> = h
         .profile
         .recent
         .iter()
         .map(|r| {
-            (
-                r.host_id,
-                r.label.clone(),
-                online.as_ref().map(|o| o.contains(&r.host_id)),
-            )
+            let listed = match (&online, r.host_id) {
+                (Some(o), Some(id)) if h.signed_in => Some(o.contains(&id)),
+                _ => None,
+            };
+            (r.code(), r.label.clone(), listed)
         })
         .collect();
-    if let Some((id, label)) = card_grid(ui, &cards, enabled) {
-        out.push(Request::Connect(id, label));
+    if let Some(i) = card_grid(ui, &cards, enabled) {
+        let r = h.profile.recent[i].clone();
+        let in_list = cards[i].2 == Some(true);
+        match r.host_id {
+            // One of the signed-in fleet's computers: no password needed.
+            Some(id) if in_list => out.push(Request::Connect(id, r.label)),
+            // Otherwise it takes the access password: fill in the ID, ask for it.
+            _ => {
+                h.connect_to = r.code();
+                h.access_password.clear();
+                h.focus_password = true;
+            }
+        }
     }
 }
 
@@ -475,6 +522,14 @@ fn section(ui: &mut egui::Ui, title: &str) {
 
 fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
     section(ui, "🌐  Server");
+    ui.label(
+        RichText::new(format!(
+            "Empty: the public Rconn server ({}). Self-hosted: your server's URL and pin.",
+            rconn_core::DEFAULT_SERVER
+        ))
+        .small()
+        .color(Color32::GRAY),
+    );
     egui::Grid::new("server")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -482,7 +537,7 @@ fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             let label = ui.label("Server URL").id;
             ui.add(
                 egui::TextEdit::singleline(&mut h.server_edit)
-                    .hint_text("wss://server:443/v1/ws")
+                    .hint_text(rconn_core::DEFAULT_SERVER)
                     .desired_width(360.0),
             )
             .labelled_by(label);
@@ -508,7 +563,15 @@ fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
         });
     }
 
-    section(ui, "👤  Account");
+    section(ui, "👤  Account (optional)");
+    ui.label(
+        RichText::new(
+            "Not needed to connect or to be connected: the ID and access password are enough. \
+             Sign in only to see a self-hosted fleet's computers.",
+        )
+        .small()
+        .color(Color32::GRAY),
+    );
     if h.signed_in {
         ui.horizontal(|ui| {
             ui.label(format!(
@@ -523,9 +586,31 @@ fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
                 out.push(Request::SignOut);
             }
         });
-    } else if h.profile.server.is_empty() {
-        ui.label(RichText::new("Enter and save the server first.").color(Color32::GRAY));
     } else {
+        egui::CollapsingHeader::new("Sign in to a self-hosted fleet")
+            .id_salt("sign_in")
+            .show(ui, |ui| sign_in_form(ui, h, out));
+    }
+
+    section(ui, "🖥  This computer (host)");
+    match &mut h.host_settings {
+        None => {
+            ui.label("The Rconn host isn't running here, so nobody can connect to this computer.");
+        }
+        Some(model) => {
+            let actions = rconn_host_settings::ui::draw(ui, model);
+            if actions.relaunch_elevated {
+                out.push(Request::OpenHostSettings);
+            }
+            if actions.restart_agent {
+                out.push(Request::RestartHostAgent);
+            }
+        }
+    }
+}
+
+fn sign_in_form(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
+    {
         egui::Grid::new("login")
             .num_columns(2)
             .spacing([12.0, 6.0])
@@ -573,83 +658,100 @@ fn settings(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
             }
         });
     }
+}
 
-    section(ui, "🖥  This computer (host)");
-    access_password_block(ui, h, out);
-    match &mut h.host_settings {
-        None => {
-            ui.label(
-                "The Rconn host isn't installed here, so nobody can connect to this computer.",
-            );
-        }
-        Some(model) => {
-            let actions = rconn_host_settings::ui::draw(ui, model);
-            if actions.relaunch_elevated {
-                out.push(Request::OpenHostSettings);
-            }
-            if actions.restart_agent {
-                out.push(Request::RestartHostAgent);
-            }
-        }
+/// Is an access password set? (Just saved: trusted for a minute, until the host's status
+/// file reports it.)
+pub fn access_password_on(h: &Home, this: &HostStatus) -> bool {
+    match h.host_password_saved {
+        Some((on, at)) if h.now.saturating_sub(at) < 60 => on,
+        _ => this.access_password,
     }
 }
 
-/// "Access password": lets anyone with this computer's ID and the password connect.
-fn access_password_block(ui: &mut egui::Ui, h: &mut Home, out: &mut Vec<Request>) {
-    ui.label(RichText::new("Access password").strong());
-    let Some(this) = &h.this else {
-        ui.label(RichText::new("Turn on connections to this computer first.").color(Color32::GRAY));
-        ui.add_space(8.0);
-        return;
-    };
-    // Just saved: trust that for a minute, until the host's status reports it.
-    let on = match h.host_password_saved {
-        Some((on, at)) if h.now.saturating_sub(at) < 60 => on,
-        _ => this.access_password,
-    };
-    ui.label(if on {
-        format!(
-            "On: anyone with this computer's ID ({}) and the password can connect.",
-            this.short_code
-        )
+/// "Access password": with this computer's ID it is all anyone needs to connect, and
+/// without one nobody can (the ID alone never lets anyone in).
+fn access_password_block(
+    ui: &mut egui::Ui,
+    h: &mut Home,
+    this: &HostStatus,
+    out: &mut Vec<Request>,
+) {
+    let on = access_password_on(h, this);
+    let editing = !on || h.changing_password;
+    let frame = if on {
+        egui::Frame::new()
     } else {
-        "Off: only signed-in accounts can connect.".into()
-    });
-    ui.horizontal(|ui| {
-        let label = ui.label(if on { "New password" } else { "Password" });
-        ui.add(
+        // Not set yet: the one thing left to do, so make it stand out.
+        egui::Frame::group(ui.style())
+            .stroke(egui::Stroke::new(1.5, ACCENT))
+            .corner_radius(8.0)
+            .inner_margin(10.0)
+    };
+    frame.show(ui, |ui| {
+        if on {
+            ui.horizontal(|ui| {
+                status_dot(ui, GOOD);
+                ui.label(RichText::new("Access password set").strong());
+                if !h.changing_password && ui.small_button("Change").clicked() {
+                    h.changing_password = true;
+                }
+            });
+        } else {
+            ui.label(
+                RichText::new("Set an access password")
+                    .strong()
+                    .color(ACCENT),
+            );
+            ui.label(RichText::new("Nobody can connect to this computer until you do.").small());
+        }
+        if !editing {
+            return;
+        }
+        ui.add_space(4.0);
+        let field = ui.add(
             egui::TextEdit::singleline(&mut h.new_host_password)
                 .password(true)
                 .hint_text("8 or more characters")
-                .desired_width(240.0),
-        )
-        .labelled_by(label.id);
+                .desired_width(f32::INFINITY),
+        );
         let ok = h.new_host_password.chars().count() >= rconn_core::guest::MIN_PASSWORD_LEN
             && h.busy.is_none();
-        if ui
-            .add_enabled(ok, egui::Button::new("Set password"))
-            .clicked()
-        {
-            out.push(Request::SetAccessPassword(Secret(std::mem::take(
-                &mut h.new_host_password,
-            ))));
-        }
-        if on
-            && ui
-                .add_enabled(h.busy.is_none(), egui::Button::new("Turn off"))
-                .clicked()
-        {
-            out.push(Request::ClearAccessPassword);
+        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.horizontal(|ui| {
+            let set =
+                egui::Button::new(RichText::new("Set password").color(Color32::WHITE)).fill(ACCENT);
+            if (ui.add_enabled(ok, set).clicked() || (enter && ok))
+                && !h.new_host_password.is_empty()
+            {
+                h.changing_password = false;
+                out.push(Request::SetAccessPassword(Secret(std::mem::take(
+                    &mut h.new_host_password,
+                ))));
+            }
+            if on {
+                if ui.button("Cancel").clicked() {
+                    h.changing_password = false;
+                    h.new_host_password.clear();
+                }
+                if ui
+                    .add_enabled(h.busy.is_none(), egui::Button::new("Remove"))
+                    .on_hover_text("Nobody can connect with the ID alone then")
+                    .clicked()
+                {
+                    h.changing_password = false;
+                    out.push(Request::ClearAccessPassword);
+                }
+            }
+        });
+        if cfg!(windows) {
+            ui.label(
+                RichText::new("Windows asks for administrator approval.")
+                    .small()
+                    .color(Color32::GRAY),
+            );
         }
     });
-    if cfg!(windows) {
-        ui.label(
-            RichText::new("Windows asks for administrator approval to change it.")
-                .small()
-                .color(Color32::GRAY),
-        );
-    }
-    ui.add_space(8.0);
 }
 
 fn status_bar(ui: &mut egui::Ui, h: &Home) {
@@ -660,12 +762,9 @@ fn status_bar(ui: &mut egui::Ui, h: &Home) {
         } else if let Some((text, err)) = &h.notice {
             status_dot(ui, if *err { BAD } else { GOOD });
             ui.label(text.as_str());
-        } else if h.signed_in {
-            status_dot(ui, GOOD);
-            ui.label(format!("Ready. Server: {}", h.profile.server));
         } else {
-            status_dot(ui, Color32::GRAY);
-            ui.label("Not signed in. Open ⚙ Settings to sign in.");
+            status_dot(ui, GOOD);
+            ui.label(format!("Ready. Server: {}", h.profile.server_url()));
         }
     });
 }
@@ -678,23 +777,23 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
 
 const CARD_W: f32 = 210.0;
 
-/// Cards in even rows; returns the one whose Connect was clicked.
+/// Cards (ID, name, online?) in even rows; returns the index of the one clicked.
 fn card_grid(
     ui: &mut egui::Ui,
-    cards: &[(HostId, Option<String>, Option<bool>)],
+    cards: &[(String, Option<String>, Option<bool>)],
     enabled: bool,
-) -> Option<(HostId, Option<String>)> {
+) -> Option<usize> {
     let per_row = ((ui.available_width() + 12.0) / (CARD_W + 12.0 + 26.0))
         .floor()
         .max(1.0) as usize;
     let mut clicked = None;
     ui.add_space(8.0);
-    for row in cards.chunks(per_row) {
+    for (r, row) in cards.chunks(per_row).enumerate() {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
-            for (id, label, online) in row {
-                if computer_card(ui, *id, label.as_deref(), *online, enabled) {
-                    clicked = Some((*id, label.clone()));
+            for (i, (code, label, online)) in row.iter().enumerate() {
+                if computer_card(ui, code, label.as_deref(), *online, enabled) {
+                    clicked = Some(r * per_row + i);
                 }
             }
         });

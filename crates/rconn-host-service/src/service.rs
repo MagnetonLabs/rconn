@@ -49,11 +49,16 @@ fn agent_launch() -> Result<AgentLaunch> {
         system_file: Some(dir.join("host.toml")),
         ..Default::default()
     })?;
-    let server = settings
-        .settings()
-        .server
-        .clone()
-        .context("host.toml has no [server]; run `rconn-host-service configure`")?;
+    // No server configured: the public one (an ID is fetched at the agent's first start).
+    let server =
+        settings
+            .settings()
+            .server
+            .clone()
+            .unwrap_or_else(|| rconn_core::settings::ServerProfile {
+                url: rconn_core::DEFAULT_SERVER.into(),
+                fingerprint: None,
+            });
     let install = std::env::current_exe()?
         .parent()
         .context("service exe has no directory")?
@@ -67,6 +72,8 @@ fn agent_launch() -> Result<AgentLaunch> {
         dir.join("identity").to_string_lossy().into_owned(),
         "--max-kbps".into(),
         settings.settings().max_bitrate_kbps.to_string(),
+        // First start without an identity: get an ID from the server (no account).
+        "--enroll-if-missing".into(),
     ];
     let status_dir = status_dir();
     let _ = std::fs::create_dir_all(&status_dir);
@@ -255,9 +262,9 @@ pub fn uninstall() -> Result<()> {
 
 /// Write host.toml and the identity, then lock the data dir to SYSTEM + Administrators.
 pub fn configure(
-    server: &str,
+    server: Option<&str>,
     fingerprint: Option<&str>,
-    identity_from: &std::path::Path,
+    identity_from: Option<&std::path::Path>,
 ) -> Result<()> {
     let dir = data_dir();
     std::fs::create_dir_all(dir.join("identity"))?;
@@ -267,15 +274,32 @@ pub fn configure(
         .arg(dir.join("*"))
         .args(["/reset", "/T", "/Q"])
         .status();
-    for f in ["host.id", "host.cert.pem", "host.key.pem"] {
-        std::fs::copy(identity_from.join(f), dir.join("identity").join(f))
-            .with_context(|| format!("copying {f}"))?;
+    if let Some(from) = identity_from {
+        for f in ["host.id", "host.cert.pem", "host.key.pem"] {
+            std::fs::copy(from.join(f), dir.join("identity").join(f))
+                .with_context(|| format!("copying {f}"))?;
+        }
+        // An org's identity: no "owned by nobody" record from an earlier account-less ID.
+        let _ = std::fs::remove_file(dir.join("identity").join(rconn_core::owner::OWNER_FILE));
     }
-    let mut toml = format!("[server]\nurl = {server:?}\n");
-    if let Some(fp) = fingerprint {
-        toml.push_str(&format!("fingerprint = {fp:?}\n"));
+    if let Some(server) = server {
+        // Settings other than the server (access password, hidden mode) are kept.
+        let layers = || SettingsLayers {
+            system_file: Some(dir.join("host.toml")),
+            ..Default::default()
+        };
+        let set = |key: &str, value: &str| {
+            rconn_core::settings::write_setting(
+                layers(),
+                key,
+                value,
+                rconn_core::settings::Writer::Admin,
+                false,
+            )
+        };
+        set("server.url", server)?;
+        set("server.fingerprint", fingerprint.unwrap_or(""))?;
     }
-    std::fs::write(dir.join("host.toml"), toml)?;
     // Admin-only: users must not change the server, read the host key, or edit policy.
     // Lock the directory (inheritable grants for SYSTEM and Administrators only), then
     // reset everything inside to inherit from it. Applying /inheritance:r to the files

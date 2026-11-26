@@ -53,6 +53,10 @@ struct Cli {
     /// with a public certificate.
     #[arg(long, env = "RCONN_FINGERPRINT")]
     fingerprint: Option<String>,
+    /// No identity in --identity yet: get an ID from the server without an account (owned
+    /// by nobody; every session then needs the access password) and save it there.
+    #[arg(long, env = "RCONN_ENROLL_IF_MISSING")]
+    enroll_if_missing: bool,
     /// Directory with host.id, host.cert.pem and host.key.pem from `enroll-host`.
     #[arg(
         long,
@@ -155,6 +159,9 @@ async fn main() -> Result<()> {
         cli.server_id.clone().context("--server-id is required")?,
         cli.identity.clone().context("--identity is required")?,
     );
+    if cli.enroll_if_missing && !rconn_peer::identity::has_identity(&identity) {
+        enroll_until_done(&identity, &server, cli.fingerprint.as_deref()).await;
+    }
     let read =
         |f: &str| fs::read_to_string(identity.join(f)).with_context(|| format!("reading {f}"));
     let host_id = HostId(
@@ -285,8 +292,17 @@ async fn serve_session(
     // Data channels: Ping/Pong, keyframe requests, input, clipboard (if policy allows).
     let clipboard = session.policy.clipboard;
     let kf = keyframes.clone();
-    // Guests (ID + access password, no account) see and control nothing until it checks out.
-    let gate = access::Gate::new(session.policy.guest);
+    // Guests (ID + access password, no account) see and control nothing until it checks
+    // out; nor does anyone at all on a computer owned by nobody.
+    let owner = cli.identity.as_deref().map_or(
+        rconn_peer::identity::LocalOwner::Recorded(None),
+        rconn_peer::identity::local_owner,
+    );
+    let password_first = access::needs_password(session.policy.guest, owner, session.operator_id);
+    if password_first && !session.policy.guest {
+        tracing::warn!(%session.session_id, "server sent a session without the password check to a computer owned by nobody; requiring the password");
+    }
+    let gate = access::Gate::new(password_first);
     let verifier = settings.settings().access_password.clone();
     let session_id = session.session_id;
     let channel_gate = gate.clone();
@@ -334,7 +350,7 @@ async fn serve_session(
     if !connected {
         anyhow::bail!("peer connection did not connect");
     }
-    if session.policy.guest {
+    if password_first {
         tracing::info!(%session_id, "access-password session: waiting for the password");
         if !gate.wait(Duration::from_secs(60)).await {
             // Let the refusal reach the viewer before the connection closes.
@@ -469,6 +485,26 @@ async fn serve_channel(
             Some(text) = local_clip.recv(), if gate.is_open() => send(DataMessage::Clipboard(text)).await,
             Some(shape) = cursor_shapes.recv(), if gate.is_open() => send(DataMessage::Control(Control::Cursor(shape))).await,
         }
+    }
+}
+
+/// First start without an identity: ask the server for an ID (no account), retrying until
+/// it answers. Nothing else can work before this does.
+async fn enroll_until_done(dir: &std::path::Path, server: &str, fingerprint: Option<&str>) {
+    let trust = ServerTrust::from_fingerprint(fingerprint);
+    let mut backoff = Duration::from_secs(2);
+    loop {
+        match rconn_peer::identity::enroll_anonymous_into(dir, server, &trust).await {
+            Ok(id) => {
+                tracing::info!(host_id = %id, code = %id.short_code(), "got an ID from the server (no account)");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not get an ID yet; retrying")
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(300));
     }
 }
 

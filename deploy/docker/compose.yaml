@@ -9,6 +9,11 @@
 # Host networking: TURN needs its UDP relay ports reachable on the VM's own address.
 # Put a TLS reverse proxy (Caddy, a cloud load balancer, Cloudflare) in front of 8080
 # so clients connect with wss://.
+#
+# Public server (no accounts, AnyDesk-style): also export RCONN_PUBLIC=true. Computers then
+# get IDs by themselves (rate limited; see `rconn-signaling serve --help` for
+# RCONN_ENROLL_PER_IP_PER_HOUR, RCONN_ENROLL_PER_HOUR, RCONN_TURN_SESSION_CAP_MB,
+# RCONN_TURN_MONTHLY_CAP_GB, RCONN_CLIENT_IP_HEADER).
 services:
   signaling:
     image: ghcr.io/rconn/signaling:latest
@@ -20,6 +25,7 @@ services:
     environment:
       RCONN_SERVER_ID: ${RCONN_SERVER_ID:?set RCONN_SERVER_ID to the wss:// URL hosts use}
       RCONN_TURN_PUBLIC_IP: ${RCONN_TURN_PUBLIC_IP:-}
+      RCONN_PUBLIC: ${RCONN_PUBLIC:-false}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - rconn-data:/data

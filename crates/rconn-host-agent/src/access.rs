@@ -3,8 +3,10 @@
 //! checks out (see `rconn_core::guest` for the exchange itself).
 
 use rconn_core::guest::HostCheck;
-use rconn_core::ids::SessionId;
+use rconn_core::ids::{OperatorId, SessionId};
+use rconn_core::owner::HostOwner;
 use rconn_core::protocol::{GuestMessage, GuestRefusal};
+use rconn_peer::identity::LocalOwner;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -68,6 +70,18 @@ impl Gate {
             }
         }
     }
+}
+
+/// Must this session prove the access password before anything else? Always for guests,
+/// and for a host owned by nobody whatever the server says: only the owner may skip it.
+/// (A host enrolled into an org has no owner file; the server checked the operator's org.)
+pub fn needs_password(policy_guest: bool, owner: LocalOwner, operator: OperatorId) -> bool {
+    let owner_admits = match owner {
+        LocalOwner::Org | LocalOwner::Recorded(Some(HostOwner::Org { .. })) => true,
+        LocalOwner::Recorded(Some(HostOwner::Operator { operator_id })) => operator_id == operator,
+        LocalOwner::Recorded(None) => false,
+    };
+    policy_guest || !owner_admits
 }
 
 /// Recent wrong passwords, for every session on this computer.
@@ -181,6 +195,27 @@ mod tests {
             ),
             "{reply:?}"
         );
+    }
+
+    #[test]
+    fn a_host_owned_by_nobody_always_needs_the_password() {
+        let (op, other) = (OperatorId::new(), OperatorId::new());
+        // The server claims a signed-in operator; a host owned by nobody refuses that.
+        assert!(needs_password(false, LocalOwner::Recorded(None), op));
+        assert!(needs_password(true, LocalOwner::Recorded(None), op));
+        // Org hosts: the server vouches for the operator's org.
+        assert!(!needs_password(false, LocalOwner::Org, op));
+        assert!(needs_password(true, LocalOwner::Org, op));
+        // A claimed host: only its account skips the password.
+        let mine = LocalOwner::Recorded(Some(HostOwner::Operator { operator_id: op }));
+        assert!(!needs_password(false, mine, op));
+        assert!(needs_password(false, mine, other));
+        // And with no password set, a password session is refused outright.
+        let gate = Gate::new(true);
+        let (check, first) = open(&gate, "", SessionId::new());
+        assert!(check.is_none());
+        assert_eq!(first, GuestMessage::Refused(GuestRefusal::NotEnabled));
+        assert!(!gate.is_open());
     }
 
     #[tokio::test]

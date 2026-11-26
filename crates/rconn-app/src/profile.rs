@@ -7,17 +7,50 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
+    /// Empty: the public server ([`rconn_core::DEFAULT_SERVER`]).
     pub server: String,
     pub fingerprint: String,
     pub username: String,
     #[serde(default)]
     pub recent: Vec<Recent>,
+    /// Incoming connections to this computer: `None` until decided (the first launch
+    /// turns them on), `Some(false)` once turned off here.
+    #[serde(default)]
+    pub incoming: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recent {
-    pub host_id: HostId,
+    /// Known for computers in an account's list; connecting by ID and password only knows
+    /// the typed `code`.
+    #[serde(default)]
+    pub host_id: Option<HostId>,
+    /// The 9-digit ID ("123 456 789").
+    #[serde(default)]
+    pub code: String,
     pub label: Option<String>,
+}
+
+impl Recent {
+    pub fn code(&self) -> String {
+        match (&self.host_id, self.code.is_empty()) {
+            (Some(id), true) => id.short_code(),
+            _ => self.code.clone(),
+        }
+    }
+}
+
+/// "123456789" or "123-456 789" as "123 456 789"; anything else as typed (trimmed).
+pub fn tidy_code(typed: &str) -> String {
+    let digits: String = typed.chars().filter(|c| c.is_ascii_digit()).collect();
+    let only_digits = typed
+        .chars()
+        .all(|c| c.is_ascii_digit() || c.is_whitespace() || c == '-');
+    if digits.len() == 9 && only_digits {
+        format!("{} {} {}", &digits[0..3], &digits[3..6], &digits[6..9])
+    } else {
+        typed.trim().to_owned()
+    }
 }
 
 /// Same shape and file as the CLI viewer's saved login.
@@ -55,13 +88,53 @@ impl Profile {
 
     /// Move `host` to the front of the recent list.
     pub fn remember(&mut self, host_id: HostId, label: Option<String>) {
-        self.recent.retain(|r| r.host_id != host_id);
-        self.recent.insert(0, Recent { host_id, label });
+        let code = host_id.short_code();
+        self.recent
+            .retain(|r| r.host_id != Some(host_id) && r.code() != code);
+        self.recent.insert(
+            0,
+            Recent {
+                host_id: Some(host_id),
+                code,
+                label,
+            },
+        );
+        self.recent.truncate(MAX_RECENT);
+    }
+
+    /// Move a computer connected to by its typed ID to the front of the recent list.
+    pub fn remember_code(&mut self, typed: &str) {
+        let code = tidy_code(typed);
+        let old = self.recent.iter().position(|r| r.code() == code);
+        let (host_id, label) = old
+            .map(|i| self.recent.remove(i))
+            .map_or((None, None), |r| (r.host_id, r.label));
+        self.recent.insert(
+            0,
+            Recent {
+                host_id,
+                code,
+                label,
+            },
+        );
         self.recent.truncate(MAX_RECENT);
     }
 
     pub fn fingerprint(&self) -> Option<&str> {
         Some(self.fingerprint.trim()).filter(|f| !f.is_empty())
+    }
+
+    /// The server to use: the configured one, else the public one.
+    pub fn server_url(&self) -> &str {
+        match self.server.trim() {
+            "" => rconn_core::DEFAULT_SERVER,
+            s => s,
+        }
+    }
+
+    /// Using the built-in public server (no pin, no account needed)?
+    pub fn on_public_server(&self) -> bool {
+        self.server_url() == rconn_core::DEFAULT_SERVER
     }
 }
 

@@ -57,6 +57,8 @@ async fn run(relay_only: bool) {
         public_ip: "127.0.0.1".parse().unwrap(),
         relay_ports: (50000, 50100),
         shared_secret: secret.clone(),
+        per_allocation_bytes: None,
+        usage: rconn_signaling::turn_relay::RelayUsage::unlimited(),
     })
     .await
     .unwrap();
