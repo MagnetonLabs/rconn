@@ -713,6 +713,71 @@ mod tests {
         assert!(parse(&[0x67, 100]).is_none(), "truncated");
     }
 
+    /// libaom's real-time screen-content output (`aomenc --rt --tune-content=screen`).
+    #[test]
+    fn av1_sequence_header_parses() {
+        let stream = include_bytes!("../tests/fixtures/av1-screen-320x240.obu");
+        let header = crate::video::sequence_header_of(rconn_core::codec::VideoCodec::Av1, stream)
+            .expect("a sequence header");
+        let s = parse_av1(header).expect("parses");
+        assert_eq!((s.info.width, s.info.height), (320, 240));
+        assert_eq!((s.profile, s.mono, s.subsampling), (0, false, (true, true)));
+        assert!(!s.high_bitdepth && !s.reduced_still_picture);
+        assert!(crate::video::is_keyframe(
+            rconn_core::codec::VideoCodec::Av1,
+            stream
+        ));
+    }
+
+    #[test]
+    fn hevc_sps_with_a_conformance_window_parses() {
+        // VideoToolbox's 1280x720 Main SPS has no window; this one (an x265-style 1920x1080
+        // Main SPS: 1088 coded rows, 8 cropped) does, and a VUI with BT.709 colours.
+        let mut w = W::default();
+        w.bits(0, 4).bits(0, 3).bit(true); // vps id, max sub layers 1, nesting
+        w.bits(0x01, 8)
+            .bits(0x6000_0000, 32)
+            .bits(0x9000_0000, 32)
+            .bits(0, 16)
+            .bits(93, 8);
+        w.ue(0)
+            .ue(1)
+            .ue(1920)
+            .ue(1088)
+            .bit(true)
+            .ue(0)
+            .ue(0)
+            .ue(0)
+            .ue(4);
+        w.ue(0).ue(0).ue(4).bit(true).ue(3).ue(0).ue(0); // depths, poc bits, ordering
+        w.ue(0).ue(3).ue(0).ue(3).ue(1).ue(1); // block sizes, transform depths
+        w.bit(false).bit(true).bit(true).bit(false); // scaling, amp, sao, pcm
+        w.ue(1).ue(1).ue(0).ue(0).bit(true); // one short-term set: one negative picture
+        w.bit(false).bit(true).bit(true).bit(true); // no long-term; tmvp; smoothing; VUI
+        w.bit(false)
+            .bit(false)
+            .bit(true)
+            .bits(5, 3)
+            .bit(false)
+            .bit(true);
+        w.bits(1, 8).bits(1, 8).bits(1, 8); // BT.709
+        let mut nal = vec![0x42, 0x01];
+        let mut zeros = 0;
+        for &b in &w.bytes {
+            if zeros >= 2 && b <= 3 {
+                nal.push(3);
+                zeros = 0;
+            }
+            nal.push(b);
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+        }
+        let s = parse_hevc(&nal).expect("parses");
+        assert_eq!((s.width, s.height), (1920, 1080));
+        assert_eq!(s.colour.matrix, Matrix::Bt709);
+        assert!(!s.colour.full_range);
+        assert!(parse_hevc(&[0x40, 0x01, 0]).is_none(), "a VPS, not an SPS");
+    }
+
     #[test]
     fn encoder_headers_parse() {
         let Some(lib) = crate::cisco::local_binary_path().filter(|p| p.exists()) else {

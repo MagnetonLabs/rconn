@@ -15,6 +15,7 @@ use rconn_media::video::{
 use rconn_peer::frames::{self, FrameTag};
 use rconn_peer::video::{VideoReceiver, payload_type};
 use rtc::rtp::packetizer::Payloader;
+use sha2::Digest;
 use std::time::{Duration, Instant};
 
 const W: usize = 1280;
@@ -272,4 +273,74 @@ fn hevc_round_trips_and_is_compared_with_h264() {
             results[1].psnr - results[0].psnr
         );
     }
+}
+
+/// AV1 as a viewer on Apple silicon with an AV1 decoder (M3 and later): a real-time
+/// screen-content stream (libaom, `aomenc --rt --tune-content=screen`: palette and intra
+/// block copy allowed) through RTP and the viewer's reassembly to VideoToolbox, bit for
+/// bit what dav1d decodes (AV1 decoding is exact; the hashes are dav1d's luma planes).
+#[test]
+fn av1_screen_content_decodes_on_videotoolbox_exactly() {
+    if !rconn_media::vt::hardware_decodes(VideoCodec::Av1) {
+        eprintln!("no AV1 hardware decoder here; skipping");
+        return;
+    }
+    const DAV1D_LUMA_SHA256: [&str; 12] = [
+        "ac8c9e4e0234fd8e",
+        "43b09d6bd666f17d",
+        "2af1ab7c9cee7a8e",
+        "3b8fbc75aada7c2a",
+        "c4873a48b482a087",
+        "b7a6b8dff2b6f9b7",
+        "8e53454937dd5b7e",
+        "718f8c475c15264f",
+        "556153cfbdbe5674",
+        "4b9f12ed5693ad1f",
+        "78da7307e286fe54",
+        "a1f888aa86b76000",
+    ];
+    let stream: &[u8] = include_bytes!("../../rconn-media/tests/fixtures/av1-screen-320x240.obu");
+    // Temporal units: each starts at a temporal delimiter.
+    let units = rconn_core::codec::units(VideoCodec::Av1, stream);
+    let mut tus: Vec<Vec<u8>> = Vec::new();
+    for u in &units {
+        let obu = &stream[u.start..u.end];
+        if rconn_core::codec::obu::kind(obu[0]) == rconn_core::codec::obu::TEMPORAL_DELIMITER {
+            tus.push(Vec::new());
+        }
+        tus.last_mut()
+            .expect("starts with a delimiter")
+            .extend_from_slice(obu);
+    }
+    assert_eq!(tus.len(), 12);
+    let lib = rconn_media::cisco::local_binary_path().expect("Cisco binary path");
+    let mut dec = VideoDecoder::new(&lib).expect("decoder");
+    let mut rx = VideoReceiver::default();
+    let (mut seq, mut got) = (0u16, Vec::new());
+    for (k, tu) in tus.into_iter().enumerate() {
+        let tagged = frames::tag(
+            VideoCodec::Av1,
+            tu,
+            &FrameTag {
+                id: k as u32,
+                ..FrameTag::default()
+            },
+        );
+        for p in packetize(VideoCodec::Av1, tagged, k as u32 * 3000, &mut seq) {
+            for au in rx.push(p) {
+                dec.set_codec(rx.codec()).expect("an AV1 decoder");
+                let (bits, tag) = frames::take(VideoCodec::Av1, &au);
+                assert_eq!(tag.map(|t| t.id), Some(k as u32));
+                let pic = dec.decode(&bits).expect("decode").expect("a picture");
+                assert_eq!((pic.width, pic.height), (320, 240));
+                let hash = sha2::Sha256::digest(pic.y());
+                let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+                got.push(hex);
+            }
+        }
+    }
+    assert_eq!(
+        got, DAV1D_LUMA_SHA256,
+        "VideoToolbox decodes what dav1d does"
+    );
 }

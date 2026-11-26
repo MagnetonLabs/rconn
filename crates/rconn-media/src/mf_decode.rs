@@ -102,9 +102,13 @@ fn decoders(codec: VideoCodec) -> Vec<IMFActivate> {
     }
 }
 
-/// Is a `codec` decoder installed? H.264's is part of Windows.
+/// Is a `codec` decoder installed that [`MfH264Decoder::new_codec`] can use (a
+/// synchronous MFT)? H.264's is part of Windows.
 pub fn decoder_exists(codec: VideoCodec) -> bool {
-    codec == VideoCodec::H264 || !decoders(codec).is_empty()
+    codec == VideoCodec::H264
+        || decoders(codec)
+            .iter()
+            .any(|a| unsafe { a.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) == 0)
 }
 
 /// The Direct3D 11 device the decoder works on, and a staging texture to read from.

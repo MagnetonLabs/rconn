@@ -17,7 +17,7 @@ pub use rconn_core::codec::VideoCodec;
 use std::sync::OnceLock;
 
 /// Codecs whose whole path (encode, decode, packetization, side data) this build has.
-const BUILT: &[VideoCodec] = &[VideoCodec::H265];
+const BUILT: &[VideoCodec] = &[VideoCodec::H265, VideoCodec::Av1];
 
 /// Codecs besides H.264 this machine decodes.
 pub fn decodable() -> Vec<VideoCodec> {
@@ -73,8 +73,11 @@ mod platform {
     }
 
     #[cfg(target_os = "macos")]
+    /// Listed, and a session starts (a listed encoder that can't start would leave a
+    /// session that negotiated it without video).
     pub fn can_encode(codec: VideoCodec, hardware: bool) -> bool {
         crate::vt_encode::encoder_exists(codec, hardware)
+            && crate::vt_encode::VtEncoder::new(codec, 640, 360, &Default::default()).is_ok()
     }
 
     #[cfg(target_os = "ios")]
@@ -91,8 +94,12 @@ mod platform {
         crate::mf_decode::decoder_exists(codec)
     }
 
+    /// Registered, and one starts and passes its self-test (a registered encoder that
+    /// can't start would leave a session that negotiated it without video).
     pub fn can_encode(codec: VideoCodec, hardware: bool) -> bool {
         crate::mf::encoder_exists(codec, hardware)
+            && crate::mf::MfH264Encoder::new_codec(codec, 640, 360, 30, 2_000_000)
+                .is_ok_and(|e| !hardware || e.is_hardware())
     }
 }
 
