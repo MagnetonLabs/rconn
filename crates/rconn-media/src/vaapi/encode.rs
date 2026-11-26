@@ -371,18 +371,20 @@ impl VaH264Encoder {
     /// `Err` if the colours are not BT.601 limited range (some drivers ignore the
     /// requested colour standard).
     pub fn check_colours(&mut self) -> Result<ColourCheck, CodecError> {
-        let image = self.staging()?;
-        let (w, h) = (self.width, self.height);
-        let input = self.input;
-        self.image_valid = false;
-        let check = self
-            .vpp()?
-            .check_colours(input, w, h, &image)
-            .map_err(err)?;
+        let check = self.colour_check()?;
         if let Some(e) = &check.refused {
             return Err(err(e));
         }
         Ok(check)
+    }
+
+    /// As [`Self::check_colours`], but a refusal is only reported in the result.
+    pub fn colour_check(&mut self) -> Result<ColourCheck, CodecError> {
+        let image = self.staging()?;
+        let (w, h) = (self.width, self.height);
+        let input = self.input;
+        self.image_valid = false;
+        self.vpp()?.check_colours(input, w, h, &image).map_err(err)
     }
 
     /// The NV12 staging image (made on first use).

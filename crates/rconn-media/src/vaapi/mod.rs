@@ -370,8 +370,23 @@ pub fn encoder_allowed() -> bool {
     }
 }
 
+static LAST_REASON: Mutex<Option<String>> = Mutex::new(None);
+
+fn remember(why: &str) {
+    *LAST_REASON.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_owned());
+}
+
+/// Why VA-API (or its DMA-BUF path) was last given up on, for the self-test.
+pub fn last_failure() -> Option<String> {
+    LAST_REASON
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// One info line the first time VA-API can't be used; debug afterwards.
 fn note_unavailable(why: &str) {
+    remember(why);
     if !ENCODER_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::info!(
             reason = why,
@@ -405,6 +420,7 @@ pub fn zero_copy_allowed() -> bool {
 /// The DMA-BUF path failed (no DMA-BUF offered, wrong colours, an import or encode
 /// error): capture to memory for a while.
 pub fn zero_copy_failed(why: &str) {
+    remember(why);
     tracing::info!(error = why, "DMA-BUF capture off; frames go through memory");
     *ZERO_COPY_FAILED_AT
         .lock()
@@ -463,6 +479,14 @@ pub fn check_zero_copy(size: (usize, usize)) -> Result<(), String> {
         .unwrap_or_else(|e| e.into_inner())
         .push((size, r.clone()));
     r
+}
+
+/// The video processor against the CPU conversion on colour bars at `size` (the
+/// self-test prints the numbers; [`check_zero_copy`] is the gate).
+pub fn colour_report(size: (usize, usize)) -> Result<ColourCheck, String> {
+    VaH264Encoder::new(size.0 as u32, size.1 as u32, 30, 4_000_000, None)
+        .and_then(|mut e| e.colour_check())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

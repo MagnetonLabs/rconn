@@ -38,6 +38,7 @@ Maintainer: Magneton Labs <support@rconn.app>
 Installed-Size: $size
 Depends: libc6 (>= 2.36), libasound2t64 | libasound2, libx11-6, libxcursor1, libxrandr2, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libpipewire-0.3-0t64 | libpipewire-0.3-0, libgtk-3-0t64 | libgtk-3-0, libayatana-appindicator3-1
 Recommends: xdg-desktop-portal-gnome | xdg-desktop-portal
+Suggests: libva-drm2, intel-media-va-driver | mesa-va-drivers
 Section: net
 Priority: optional
 Description: Rconn remote desktop

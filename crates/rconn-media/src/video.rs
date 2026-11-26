@@ -704,8 +704,11 @@ impl VideoEncoder {
             Engine::VaApi(va) => match va.encode_dmabuf(&surface.frame, force_key) {
                 Ok(out) => out,
                 Err(e) => {
-                    // This capture ends; the next one goes through memory.
-                    self.va_failed(&e.to_string(), force_key);
+                    // This capture ends; the next one goes through memory, still on
+                    // VA-API (which gives way to openh264 if it fails there too).
+                    self.encoder = None;
+                    self.spare = None;
+                    self.force_key |= force_key;
                     return Err(e);
                 }
             },
