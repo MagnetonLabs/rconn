@@ -576,6 +576,97 @@ async fn paths_outside_the_shared_folder_are_refused() {
     .expect("test timed out");
 }
 
+/// An upload goes into the folder the viewer names (the one its Files panel shows), with
+/// the same inside-the-root checks as listings and downloads; a plain name (viewers
+/// before 0.1.11) still goes to Downloads/Rconn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploads_land_in_the_chosen_folder_and_never_outside_the_root() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let rig = rig(true, true).await;
+        let root = rig.host_root.path();
+        std::fs::create_dir_all(root.join("Projects").join("Q3")).unwrap();
+        std::fs::write(root.join("inside.txt"), b"ok").unwrap();
+        let note = rig.viewer.path().join("plan.txt");
+        std::fs::write(&note, b"the plan").unwrap();
+        let up = |folder: Option<&str>| {
+            let (files, note, folder) = (&rig.files, note.clone(), folder.map(str::to_owned));
+            async move {
+                files
+                    .upload_into(&note, folder.as_deref(), &Progress::new())
+                    .await
+            }
+        };
+
+        // Into a subfolder, twice: never replacing a file there.
+        assert_eq!(
+            up(Some("Projects/Q3")).await.unwrap(),
+            "Projects/Q3/plan.txt"
+        );
+        assert_eq!(
+            up(Some("Projects\\Q3/")).await.unwrap(),
+            "Projects/Q3/plan (2).txt"
+        );
+        assert_eq!(
+            std::fs::read(root.join("Projects").join("Q3").join("plan.txt")).unwrap(),
+            b"the plan"
+        );
+        // Into the root.
+        assert_eq!(up(Some("")).await.unwrap(), "plan.txt");
+        // A plain name: the inbox, as before.
+        assert_eq!(up(None).await.unwrap(), "Downloads/Rconn/plan.txt");
+        assert_eq!(
+            rig.files.upload(&note, &Progress::new()).await.unwrap(),
+            "Downloads/Rconn/plan (2).txt"
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        let before = files_in(root);
+        for bad in [
+            "..",
+            "Projects/../..",
+            "../outside",
+            "/etc",
+            "C:\\Windows",
+            "\\\\server\\share",
+            "missing",
+            "inside.txt",
+        ] {
+            let err = up(Some(bad)).await.unwrap_err();
+            assert!(stopped(&err).is_none(), "{bad}: {err:#}");
+            assert!(
+                format!("{err:#}").contains("can't save into"),
+                "{bad}: {err:#}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(outside.path(), root.join("out")).unwrap();
+            symlink(root.join("Projects"), root.join("in")).unwrap();
+            let err = up(Some("out")).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("inside the shared folder"),
+                "{err:#}"
+            );
+            assert!(
+                files_in(outside.path()).is_empty(),
+                "nothing written outside"
+            );
+            // A link that stays inside is fine; the host says where it really went.
+            assert_eq!(up(Some("in")).await.unwrap(), "Projects/plan.txt");
+        }
+        let mut after = files_in(root);
+        after.retain(|n| n != "out" && n != "in");
+        assert_eq!(
+            after, before,
+            "nothing new at the root from the refused uploads"
+        );
+        rig.close().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_channel_is_refused_when_the_setting_or_the_policy_is_off() {
     tokio::time::timeout(Duration::from_secs(60), async {

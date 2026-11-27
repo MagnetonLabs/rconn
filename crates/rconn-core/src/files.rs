@@ -10,7 +10,8 @@
 //! * [`FileMessage::Get`] → [`FileMessage::Opened`], [`FileMessage::Data`] chunks,
 //!   [`FileMessage::Done`] with the SHA-256 of what was sent.
 //! * [`FileMessage::Put`] → [`FileMessage::Ack`] `{ received: 0 }` (go ahead), Data chunks,
-//!   Done with the SHA-256 → [`FileMessage::Saved`] with where it landed.
+//!   Done with the SHA-256 → [`FileMessage::Saved`] with where it landed. The name may
+//!   carry the folder to save into (see [`put_name`]).
 //! * Either side may send [`FileMessage::Cancel`]; a failed request ends with
 //!   [`FileMessage::Error`]. `req` 0 means the channel itself (refused), and it closes.
 //!
@@ -71,6 +72,8 @@ pub enum FileMessage {
     /// End of the content, with the SHA-256 of every byte sent.
     Done { req: u32, sha256: [u8; 32] },
     /// Viewer -> host: a file of `size` bytes called `name` follows (once acknowledged).
+    /// A `name` with a `/` names the folder too ([`put_name`], [`put_target`]); without,
+    /// the host saves to its inbox (Downloads/Rconn).
     Put { req: u32, name: String, size: u64 },
     /// Host -> viewer: the upload was checked and saved here (relative to the root).
     Saved { req: u32, path: String },
@@ -279,6 +282,27 @@ pub fn sanitize_file_name(name: &str) -> String {
         s = format!("{base}{ext}");
     }
     s
+}
+
+/// The [`FileMessage::Put`] name for saving `file` into `folder` on the host (relative
+/// to its shared root, "" for the root itself): `folder/file`, or `/file` for the root.
+/// Hosts since 0.1.11 save there (if it is a folder inside the root); older ones keep
+/// the last component, as they always did, and save to their inbox. A name too long for
+/// the message is sent as `file` alone (the inbox).
+pub fn put_name(folder: &str, file: &str) -> String {
+    let name = format!("{}/{file}", folder.trim_end_matches(['/', '\\']));
+    if name.len() > MAX_NAME_BYTES {
+        file.to_owned()
+    } else {
+        name
+    }
+}
+
+/// The host's reading of a [`FileMessage::Put`] name: `Some((folder, file))` when it
+/// names a folder (split at the last `/`; the folder is "" for the root and still has to
+/// pass [`relative_components`]), `None` for a plain name (the inbox).
+pub fn put_target(name: &str) -> Option<(&str, &str)> {
+    name.rsplit_once('/')
 }
 
 /// `name` with ` (n)` before its extension, for the n-th file of that name in a folder
@@ -534,6 +558,39 @@ mod tests {
         assert!(s.ends_with(".gz"), "{s}");
         let no_ext = sanitize_file_name(&"x".repeat(500));
         assert_eq!(no_ext.len(), MAX_SAVED_NAME_BYTES);
+    }
+
+    #[test]
+    fn upload_names_carry_the_folder_and_old_hosts_keep_the_file_name() {
+        assert_eq!(put_name("Projects/Q3", "plan.pdf"), "Projects/Q3/plan.pdf");
+        assert_eq!(put_name("Projects/", "plan.pdf"), "Projects/plan.pdf");
+        assert_eq!(put_name("", "plan.pdf"), "/plan.pdf", "the root");
+        assert_eq!(
+            put_target("Projects/Q3/plan.pdf"),
+            Some(("Projects/Q3", "plan.pdf"))
+        );
+        assert_eq!(put_target("/plan.pdf"), Some(("", "plan.pdf")));
+        assert_eq!(put_target("plan.pdf"), None, "old viewers: the inbox");
+        // What a host before 0.1.11 makes of them: the file name, in its inbox.
+        assert_eq!(
+            sanitize_file_name(&put_name("Projects/Q3", "plan.pdf")),
+            "plan.pdf"
+        );
+        assert_eq!(sanitize_file_name(&put_name("", "plan.pdf")), "plan.pdf");
+        // Too long for the message: the name alone.
+        let deep = "d/".repeat(MAX_NAME_BYTES / 2);
+        assert_eq!(put_name(&deep, "plan.pdf"), "plan.pdf");
+        let fits = "d".repeat(MAX_NAME_BYTES - "/plan.pdf".len());
+        assert_eq!(put_name(&fits, "plan.pdf").len(), MAX_NAME_BYTES);
+        assert!(
+            FileMessage::Put {
+                req: 1,
+                name: put_name(&fits, "plan.pdf"),
+                size: 1
+            }
+            .encode()
+            .is_ok()
+        );
     }
 
     #[test]

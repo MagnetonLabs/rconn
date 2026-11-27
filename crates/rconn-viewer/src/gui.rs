@@ -1654,7 +1654,11 @@ impl ViewerApp {
                 ui.painter().text(
                     area.center(),
                     egui::Align2::CENTER_CENTER,
-                    format!("Drop to send to {} (Downloads/Rconn)", self.name),
+                    format!(
+                        "Drop to send to {} ({})",
+                        self.name,
+                        crate::files::remote_place(self.files.upload_folder().as_deref())
+                    ),
                     egui::FontId::proportional(22.0),
                     Color32::WHITE,
                 );

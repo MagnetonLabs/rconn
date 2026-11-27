@@ -11,7 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use rconn_core::files::{
     ACK_EVERY, FILE_CHUNK_BYTES, FILES_CHANNEL_LABEL, FILES_CHANNEL_PROTOCOL, FileEntry,
-    FileMessage, TRANSFER_WINDOW, numbered_name, relative_components, sanitize_file_name,
+    FileMessage, TRANSFER_WINDOW, numbered_name, put_name, put_target, relative_components,
+    sanitize_file_name,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -304,7 +305,8 @@ pub type FreeSpace = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 pub struct ServeConfig {
     /// Every listed or sent path is inside this folder (symlinks included).
     pub root: PathBuf,
-    /// Where uploads are saved (created when first needed).
+    /// Where uploads without a folder are saved (created when first needed). An upload
+    /// that names a folder goes there instead, if it is one inside the root.
     pub inbox: PathBuf,
     pub free_space: Option<FreeSpace>,
     /// Names the session in audit lines.
@@ -585,14 +587,39 @@ impl Host {
         }
     }
 
+    /// Where an upload called `name` goes: the folder it names, which must exist and be a
+    /// folder inside the root (checked as List and Get are), or the inbox. Returns the
+    /// folder and the file name to create there (not yet sanitized).
+    async fn upload_dir<'a>(&self, name: &'a str) -> Result<(PathBuf, &'a str)> {
+        let Some((folder, file)) = put_target(name) else {
+            let inbox = self.cfg.inbox.clone();
+            fs::create_dir_all(&inbox).await.map_err(|e| {
+                anyhow!(
+                    "could not create the Rconn downloads folder: {}",
+                    io_text(&e)
+                )
+            })?;
+            return Ok((inbox, name));
+        };
+        let shown = if folder.is_empty() { "~" } else { folder };
+        let dir = self
+            .resolve(folder)
+            .await
+            .map_err(|e| anyhow!("can't save into {shown}: {e:#}"))?;
+        let meta = fs::metadata(&dir)
+            .await
+            .map_err(|e| anyhow!("can't save into {shown}: {}", io_text(&e)))?;
+        if !meta.is_dir() {
+            bail!("can't save into {shown}: it is not a folder");
+        }
+        Ok((dir, file))
+    }
+
     async fn put(&self, req: u32, name: &str, size: u64, mut control: mpsc::Receiver<FileMessage>) {
         let mut saved = String::new();
         let result: Result<(u64, [u8; 32])> = async {
-            let inbox = &self.cfg.inbox;
-            fs::create_dir_all(inbox)
-                .await
-                .map_err(|e| anyhow!("could not create the Rconn downloads folder: {}", io_text(&e)))?;
-            if let Some(free) = self.cfg.free_space.as_ref().and_then(|f| f(inbox.as_path()))
+            let (dir, file_name) = self.upload_dir(name).await?;
+            if let Some(free) = self.cfg.free_space.as_ref().and_then(|f| f(dir.as_path()))
                 && size.saturating_add(FREE_SPACE_RESERVE) > free
             {
                 bail!(
@@ -601,7 +628,7 @@ impl Host {
                     (size + FREE_SPACE_RESERVE) >> 20
                 );
             }
-            let (path, file) = create_unique(inbox, &sanitize_file_name(name)).await?;
+            let (path, file) = create_unique(&dir, &sanitize_file_name(file_name)).await?;
             let mut partial = Partial(Some(path.clone()));
             self.wire
                 .send(&FileMessage::Ack { req, received: 0 })
@@ -924,9 +951,21 @@ impl FilesClient {
     /// Copy a local file to the host (its Downloads/Rconn folder). Returns where the host
     /// saved it.
     pub async fn upload(&self, local: &Path, progress: &Progress) -> Result<String> {
+        self.upload_into(local, None, progress).await
+    }
+
+    /// Copy a local file into `folder` on the host (relative to its shared root, "" for
+    /// the root), or its Downloads/Rconn folder if `None`. Hosts before 0.1.11 always use
+    /// Downloads/Rconn. Returns where the host saved it.
+    pub async fn upload_into(
+        &self,
+        local: &Path,
+        folder: Option<&str>,
+        progress: &Progress,
+    ) -> Result<String> {
         let mut route = self.start()?;
         let req = route.req;
-        let result = self.upload_inner(&mut route, local, progress).await;
+        let result = self.upload_inner(&mut route, local, folder, progress).await;
         if result.is_err() {
             let _ = self.client.wire.send(&FileMessage::Cancel { req }).await;
         }
@@ -937,6 +976,7 @@ impl FilesClient {
         &self,
         route: &mut Route,
         local: &Path,
+        folder: Option<&str>,
         progress: &Progress,
     ) -> Result<String> {
         let req = route.req;
@@ -951,6 +991,10 @@ impl FilesClient {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".into());
+        let name = match folder {
+            Some(f) => put_name(f, &name),
+            None => name,
+        };
         let mut file = fs::File::open(local)
             .await
             .map_err(|e| anyhow!("{}: {}", local.display(), io_text(&e)))?;
