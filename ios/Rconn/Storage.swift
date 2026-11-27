@@ -92,6 +92,35 @@ enum Recents {
     private static let key = "recentComputers"
     private static let limit = 8
 
+    /// Rconn's public server (`rconn_core::DEFAULT_SERVER`).
+    static let publicServer = "wss://connect.rconn.app/v1/ws"
+
+    /// Empty, or the example address the Server field used to show as its hint.
+    static func isPlaceholder(_ server: String) -> Bool {
+        let s = server.trimmingCharacters(in: .whitespaces)
+        return s.isEmpty || s.contains("rconn.example.com")
+    }
+
+    /// Recent computers saved with the example address point at Rconn's server instead.
+    static func replacePlaceholderServers() {
+        let list = load()
+        guard list.contains(where: { isPlaceholder($0.server) }) else { return }
+        var seen = Set<String>()
+        let fixed = list.map { r -> RecentComputer in
+            var r = r
+            if isPlaceholder(r.server) {
+                if r.passwordSaved == true,
+                   let pw = SavedPasswords.password(server: r.server, computerID: r.computerID) {
+                    _ = SavedPasswords.set(pw, server: publicServer, computerID: r.computerID)
+                    SavedPasswords.forget(server: r.server, computerID: r.computerID)
+                }
+                r.server = publicServer
+            }
+            return r
+        }.filter { seen.insert($0.id).inserted }
+        save(fixed)
+    }
+
     static func load() -> [RecentComputer] {
         guard let data = UserDefaults.standard.data(forKey: key),
               let list = try? JSONDecoder().decode([RecentComputer].self, from: data)

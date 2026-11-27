@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Server, computer ID and access password; recent computers below.
 struct ConnectView: View {
-    @AppStorage("server") private var server = ""
+    @AppStorage("server") private var server = Recents.publicServer
     @State private var fingerprint = ""
     @State private var computerID = ""
     @State private var password = ""
@@ -57,7 +57,7 @@ struct ConnectView: View {
                 }
 
                 Section {
-                    TextField("Server", text: $server, prompt: Text("wss://rconn.example.com/v1/ws"))
+                    TextField("Server", text: $server, prompt: Text(Recents.publicServer))
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -162,6 +162,11 @@ struct ConnectView: View {
                 }
             }
             .onAppear {
+                // An empty server, or the old example address someone typed in, means Rconn's.
+                if Recents.isPlaceholder(server) {
+                    server = Recents.publicServer
+                }
+                Recents.replacePlaceholderServers()
                 fingerprint = Keychain.fingerprint(for: server) ?? ""
                 autoConnectForTesting()
             }
