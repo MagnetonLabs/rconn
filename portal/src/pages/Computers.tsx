@@ -5,6 +5,7 @@ import type { Computer, ComputerStatus } from '../api/computers';
 import { listGroups, type Group } from '../api/policies';
 import { useOrg, useCan } from '../lib/org';
 import { useResource } from '../lib/useResource';
+import { usePoll } from '../lib/poll';
 import { relTime, dateTime, plural } from '../lib/format';
 import { ConfirmDialog, Empty, ErrorState, SkeletonRows, errorMessage, useToast } from '../components/ui';
 
@@ -32,6 +33,8 @@ function useDebounced<T>(v: T, ms: number): T {
 }
 
 const UNGROUPED = '__none';
+/** How often the list follows status changes while the page is visible. */
+export const REFRESH_MS = 10_000;
 
 export default function Computers() {
   const org = useOrg();
@@ -52,6 +55,8 @@ export default function Computers() {
       }),
     [org.org_id, dq, group, status],
   );
+  // Online status changes by itself: follow it quietly (no spinner, scroll and edits kept).
+  usePoll(list.refresh, REFRESH_MS);
   const rows = useMemo(
     () => (list.data ?? []).filter((c) => group !== UNGROUPED || c.group_id === null),
     [list.data, group],

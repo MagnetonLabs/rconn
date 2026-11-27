@@ -235,6 +235,9 @@ test('enroll a real host with a token, rename, move to a group, revoke', async (
   await expect(page.getByText(secret)).toHaveCount(0);
   await shot(page, '08-tokens');
 
+  // Watch the list while the computer joins: it shows up without a reload (the list polls).
+  await tab(page, 'Computers').click();
+  await expect(page.getByText('No computers yet')).toBeVisible();
   const tokenFile = join(WORK, 'enroll.token');
   writeFileSync(tokenFile, secret + '\n', { mode: 0o600 });
   host = new Host(tokenFile, join(WORK, 'host-identity'), 'e2e-host');
@@ -242,10 +245,8 @@ test('enroll a real host with a token, rename, move to a group, revoke', async (
   const hostId = enrolled.split(' ')[1];
   await host.waitFor('online');
 
-  await tab(page, 'Computers').click();
-  await page.reload();
   const row = page.locator('tbody tr').filter({ hasText: 'e2e-host' });
-  await expect(row).toHaveCount(1);
+  await expect(row).toHaveCount(1, { timeout: 15_000 });
   await expect(row.getByRole('img', { name: 'Online' })).toBeVisible();
   await expect(page.getByText('1 online')).toBeVisible();
   await shot(page, '09-computers-online');

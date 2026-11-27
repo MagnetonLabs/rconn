@@ -106,6 +106,39 @@ test('rename and revoke a computer', async ({ page }) => {
   await expect(page.locator('tbody tr')).toHaveCount(4);
 });
 
+test('the list follows status changes without losing a rename in progress', async ({ page }) => {
+  await page.clock.install();
+  await signIn(page, 'dana@northwind.test');
+  const lab = page.locator('tbody tr').filter({ hasText: 'Lab tablet' });
+  await expect(lab.getByRole('img', { name: 'Offline' })).toBeVisible();
+  const row = page.getByTestId('computer-880615746');
+  await row.getByRole('button', { name: 'Rename Front desk 1' }).click();
+  await row.getByLabel('New name for Front desk 1').fill('Half typed');
+  // The computer comes online on the (mock) server.
+  await page.evaluate(() => {
+    const c = window.__rconnMock!.db.computers.find((x) => x.name === 'Lab tablet')!;
+    c.online = true;
+  });
+  await page.clock.runFor(10_500);
+  await expect(lab.getByRole('img', { name: 'Online' })).toBeVisible();
+  // No skeleton, and the rename keeps what was typed.
+  await expect(page.locator('tbody.skeleton')).toHaveCount(0);
+  await expect(row.getByLabel('New name for Front desk 1')).toHaveValue('Half typed');
+  // Hidden tabs don't poll.
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.__rconnMock!.db.computers.find((x) => x.name === 'Lab tablet')!.online = false;
+  });
+  await page.clock.runFor(30_000);
+  await expect(lab.getByRole('img', { name: 'Online' })).toBeVisible();
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await expect(lab.getByRole('img', { name: 'Offline' })).toBeVisible();
+});
+
 test('enrollment token shows its secret once', async ({ page }) => {
   await signIn(page, 'dana@northwind.test');
   await page.getByRole('link', { name: 'Enrollment tokens' }).click();
