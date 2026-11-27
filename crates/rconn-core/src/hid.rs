@@ -52,6 +52,36 @@ pub mod usage {
     pub const META_RIGHT: u16 = 0xE7;
 }
 
+/// Key combinations a viewer offers in its Keys menu: keys the viewer's own system would
+/// keep for itself (or that its keyboard lacks). Shared by the desktop and iOS viewers;
+/// send them with [`combo_events`].
+pub const COMBOS: [(&str, &[u16]); 10] = {
+    use usage as u;
+    [
+        // (Windows hosts from 0.1.12 turn this into a real Ctrl+Alt+Delete.)
+        ("Ctrl+Alt+Del", &[u::CONTROL_LEFT, u::ALT_LEFT, u::DELETE]),
+        (
+            "Task Manager (Ctrl+Shift+Esc)",
+            &[u::CONTROL_LEFT, u::SHIFT_LEFT, u::ESCAPE],
+        ),
+        ("Windows key", &[u::META_LEFT]),
+        ("Alt+Tab", &[u::ALT_LEFT, u::TAB]),
+        ("Close window (Alt+F4)", &[u::ALT_LEFT, u::F1 + 3]),
+        ("Show desktop (Win+D)", &[u::META_LEFT, u::A + 3]),
+        ("Run (Win+R)", &[u::META_LEFT, u::A + 17]),
+        ("File Explorer (Win+E)", &[u::META_LEFT, u::A + 4]),
+        ("Print Screen", &[u::PRINT_SCREEN]),
+        ("Insert", &[u::INSERT]),
+    ]
+};
+
+/// A combo's key events as (HID usage, pressed): pressed in order, released in reverse.
+pub fn combo_events(keys: &[u16]) -> impl Iterator<Item = (u16, bool)> + '_ {
+    keys.iter()
+        .map(|&k| (k, true))
+        .chain(keys.iter().rev().map(|&k| (k, false)))
+}
+
 /// A PC/AT (set 1) scan code, as Windows `SendInput` takes with `KEYEVENTF_SCANCODE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanCode {
@@ -248,6 +278,41 @@ pub fn to_linux_evdev(hid: u16) -> Option<u16> {
 mod tests {
     use super::usage::*;
     use super::*;
+
+    #[test]
+    fn combos_press_in_order_and_release_in_reverse() {
+        let (label, keys) = COMBOS[0];
+        assert_eq!(label, "Ctrl+Alt+Del");
+        let events: Vec<_> = combo_events(keys).collect();
+        assert_eq!(
+            events,
+            [
+                (CONTROL_LEFT, true),
+                (ALT_LEFT, true),
+                (DELETE, true),
+                (DELETE, false),
+                (ALT_LEFT, false),
+                (CONTROL_LEFT, false),
+            ]
+        );
+        // The F4/D/R/E arithmetic lands on the right usages.
+        let find = |l: &str| COMBOS.iter().find(|(n, _)| n.contains(l)).unwrap().1;
+        assert_eq!(find("Alt+F4"), [ALT_LEFT, 0x3D]);
+        assert_eq!(find("Win+D"), [META_LEFT, 0x07]);
+        assert_eq!(find("Win+R"), [META_LEFT, 0x15]);
+        assert_eq!(find("Win+E"), [META_LEFT, 0x08]);
+        // Every key reaches every host OS.
+        for (label, keys) in COMBOS {
+            assert!(!keys.is_empty(), "{label}");
+            for &k in keys {
+                assert!(
+                    to_windows_scancode(k).is_some(),
+                    "{label}: {k:#x} on Windows"
+                );
+                assert!(to_linux_evdev(k).is_some(), "{label}: {k:#x} on Linux");
+            }
+        }
+    }
 
     #[test]
     fn evdev_spot_checks_against_input_event_codes() {

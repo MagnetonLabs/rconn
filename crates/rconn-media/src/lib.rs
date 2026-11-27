@@ -22,6 +22,8 @@ pub mod mf_decode;
 mod oh264;
 #[cfg(all(windows, target_arch = "aarch64"))]
 mod opus_shim;
+#[cfg(feature = "playback")]
+pub mod playback;
 #[cfg(target_os = "linux")]
 pub mod portal;
 pub mod recovery;

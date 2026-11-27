@@ -1,26 +1,34 @@
-//! Plays the host's sound on the viewer's default output device.
+//! Plays the host's sound on this device's default output (the desktop viewer and the iOS
+//! app share it): Opus packets in, the speakers out.
 //!
-//! Decoded 48 kHz stereo goes into a bounded queue (≈200 ms). The device callback drains it,
-//! filling silence on underrun; on overrun the oldest audio is dropped, so latency can't
-//! build up behind a stall.
+//! Decoded 48 kHz stereo goes into a bounded queue. The device callback drains it, filling
+//! silence on underrun; on overrun the oldest audio is dropped, so latency can't build up
+//! behind a stall. Dropping the [`Player`] stops the output stream.
 
 use anyhow::{Context, Result, anyhow};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-const MAX_QUEUE: usize = 48_000 * 2 / 5; // 200 ms of 48 kHz stereo samples
+/// 48 kHz stereo samples per millisecond.
+const SAMPLES_PER_MS: usize = 48 * 2;
+/// The most PCM one Opus packet decodes to: 120 ms of 48 kHz stereo.
+const MAX_PACKET_SAMPLES: usize = 960 * 2 * 6;
 
-#[derive(Clone)]
 pub struct Player {
     queue: Arc<Mutex<VecDeque<f32>>>,
+    max_queue: usize,
+    /// Dropped to stop the stream (its thread waits on the other end).
+    _stop: std::sync::mpsc::Sender<()>,
 }
 
 impl Player {
-    /// Start playback on a dedicated thread (cpal streams are not Send everywhere).
-    pub fn start() -> Result<Self> {
+    /// Start playback on a dedicated thread (cpal streams are not Send everywhere),
+    /// holding at most `max_queue_ms` of sound.
+    pub fn start(max_queue_ms: usize) -> Result<Self> {
         let queue: Arc<Mutex<VecDeque<f32>>> = Arc::default();
         let q = queue.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String>>();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
         std::thread::Builder::new()
             .name("rconn-playback".into())
             .spawn(move || {
@@ -65,7 +73,8 @@ impl Player {
                 match built {
                     Ok((stream, desc)) => {
                         let _ = ready_tx.send(Ok(desc));
-                        std::thread::park(); // keep the stream alive for the process lifetime
+                        // Until the Player is dropped.
+                        let _ = stopped.recv();
                         drop(stream);
                     }
                     Err(e) => {
@@ -75,19 +84,48 @@ impl Player {
             })?;
         let desc = ready_rx.recv().context("playback thread died")??;
         tracing::info!(device = %desc, "audio playback started");
-        Ok(Self { queue })
+        Ok(Self {
+            queue,
+            max_queue: max_queue_ms * SAMPLES_PER_MS,
+            _stop: stop,
+        })
     }
 
     /// Queue decoded 48 kHz interleaved stereo.
     pub fn push(&self, pcm: &[f32]) {
-        bounded_push(&mut self.queue.lock().expect("playback queue"), pcm);
+        bounded_push(
+            &mut self.queue.lock().expect("playback queue"),
+            pcm,
+            self.max_queue,
+        );
     }
 }
 
-/// Append, then drop the oldest whole stereo frames beyond `MAX_QUEUE`.
-fn bounded_push(q: &mut VecDeque<f32>, pcm: &[f32]) {
+/// Decodes the host's Opus packets (48 kHz stereo) into PCM for a [`Player`].
+pub struct SoundDecoder {
+    dec: opus::Decoder,
+    pcm: Vec<f32>,
+}
+
+impl SoundDecoder {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            dec: crate::codec::opus_decoder()?,
+            pcm: vec![0.0; MAX_PACKET_SAMPLES],
+        })
+    }
+
+    /// One RTP payload's interleaved stereo, or None if it doesn't decode.
+    pub fn decode(&mut self, packet: &[u8]) -> Option<&[f32]> {
+        let n = self.dec.decode_float(packet, &mut self.pcm, false).ok()?;
+        Some(&self.pcm[..n * 2])
+    }
+}
+
+/// Append, then drop the oldest whole stereo frames beyond `max` samples.
+pub fn bounded_push(q: &mut VecDeque<f32>, pcm: &[f32], max: usize) {
     q.extend(pcm);
-    let excess = q.len().saturating_sub(MAX_QUEUE);
+    let excess = q.len().saturating_sub(max);
     let excess = excess + excess % 2; // keep L/R pairs aligned
     q.drain(..excess.min(q.len()));
 }
@@ -98,12 +136,13 @@ mod tests {
 
     #[test]
     fn queue_stays_bounded_and_keeps_the_newest_audio_aligned() {
+        let max = 200 * SAMPLES_PER_MS;
         let mut q = VecDeque::new();
         let chunk: Vec<f32> = (0..1920).map(|i| i as f32).collect(); // 20 ms stereo
         for _ in 0..100 {
-            bounded_push(&mut q, &chunk);
+            bounded_push(&mut q, &chunk, max);
         }
-        assert!(q.len() <= MAX_QUEUE, "{} > {MAX_QUEUE}", q.len());
+        assert!(q.len() <= max, "{} > {max}", q.len());
         assert_eq!(q.len() % 2, 0);
         assert_eq!(*q.back().unwrap(), 1919.0, "newest sample kept");
         assert_eq!(
@@ -111,5 +150,18 @@ mod tests {
             0,
             "front is a left sample"
         );
+    }
+
+    #[test]
+    fn decoder_turns_a_host_packet_into_20ms_of_stereo() {
+        let mut enc = crate::codec::opus_encoder().unwrap();
+        let tone: Vec<f32> = (0..960 * 2)
+            .map(|i| ((i / 2) as f32 * 0.06).sin() * 0.3)
+            .collect();
+        let mut packet = [0u8; 4000];
+        let n = enc.encode_float(&tone, &mut packet).unwrap();
+        let mut dec = SoundDecoder::new().unwrap();
+        assert_eq!(dec.decode(&packet[..n]).unwrap().len(), 960 * 2);
+        assert!(dec.decode(&[0xff; 3]).is_none(), "garbage is refused");
     }
 }

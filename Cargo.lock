@@ -6142,7 +6142,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-app"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "directories",
@@ -6168,7 +6168,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "argon2",
  "ed25519-dalek",
@@ -6191,7 +6191,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-host-agent"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6217,7 +6217,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-host-service"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "clap",
@@ -6230,7 +6230,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-host-settings"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "eframe",
  "egui",
@@ -6241,11 +6241,12 @@ dependencies = [
 
 [[package]]
 name = "rconn-media"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "ashpd",
  "block2 0.6.2",
+ "cpal",
  "dispatch2",
  "futures-util",
  "libc",
@@ -6272,7 +6273,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-mobile"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "axum",
@@ -6282,6 +6283,8 @@ dependencies = [
  "rconn-peer",
  "rconn-signaling",
  "rtc",
+ "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6291,7 +6294,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-peer"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "arboard",
@@ -6320,7 +6323,7 @@ dependencies = [
 
 [[package]]
 name = "rconn-signaling"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6362,14 +6365,13 @@ dependencies = [
 
 [[package]]
 name = "rconn-viewer"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "arboard",
  "bytemuck",
  "bytes",
  "clap",
- "cpal",
  "directories",
  "eframe",
  "egui",

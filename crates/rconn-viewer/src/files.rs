@@ -52,6 +52,8 @@ pub struct State {
     /// Why file transfer can't be used with this computer, once that is known.
     pub unavailable: Option<String>,
     pub transfers: Vec<Transfer>,
+    /// Downloads finished so far (the panel re-reads a local Downloads folder it shows).
+    pub downloaded: u64,
 }
 
 pub type Shared = Arc<Mutex<State>>;
@@ -159,6 +161,9 @@ pub async fn run(
                         .download(&path, &downloads_dir(), &progress)
                         .await
                         .map(|p| p.display().to_string());
+                    if result.is_ok() {
+                        state.lock().expect("files").downloaded += 1;
+                    }
                     finish(&state, &progress, result, &client);
                     done();
                 });
@@ -173,8 +178,22 @@ pub async fn run(
                     let result = client
                         .upload_into(&local, folder.as_deref(), &progress)
                         .await;
+                    let sent = result.is_ok();
                     finish(&state, &progress, result, &client);
                     done();
+                    // The file is there now: show it, if its folder is still the one shown
+                    // (the old listing stays up until the new one arrives).
+                    if let Some(dir) = folder.filter(|_| sent)
+                        && state.lock().expect("files").remote_dir == dir
+                        && let Ok(entries) = client.list(&dir).await
+                    {
+                        let mut s = state.lock().expect("files");
+                        if s.remote_dir == dir && s.entries.is_some() {
+                            s.entries = Some(entries);
+                        }
+                        drop(s);
+                        done();
+                    }
                 });
             }
         }
@@ -325,6 +344,10 @@ pub struct Panel {
     listed: bool,
     /// Opened at least once (the first time, it opens at [`START_DIR`]).
     opened: bool,
+    /// [`State::downloaded`] when the local folder was last read, and a re-read of the
+    /// folder shown being due (the old contents stay up meanwhile).
+    seen_downloads: u64,
+    reread_local: bool,
 }
 
 impl Panel {
@@ -342,6 +365,8 @@ impl Panel {
             remote_selected: Default::default(),
             listed: false,
             opened: false,
+            seen_downloads: 0,
+            reread_local: false,
         }
     }
 
@@ -389,13 +414,22 @@ impl Panel {
 
     /// The local folder's contents; `None` while they are being read.
     fn read_local(&mut self, ctx: &egui::Context) -> Option<&[LocalEntry]> {
-        if self.local.is_none() {
+        let downloaded = self.state.lock().expect("files").downloaded;
+        if downloaded != self.seen_downloads {
+            self.seen_downloads = downloaded;
+            // A download landed: show it if Downloads is the folder shown.
+            if self.local_dir == downloads_dir() {
+                self.reread_local = true;
+            }
+        }
+        if self.local.is_none() || self.reread_local {
             match &self.local_listing {
                 Some(l) if l.dir == self.local_dir => {
                     let done = l.result.lock().expect("local listing").take();
                     if done.is_some() {
                         self.local = done;
                         self.local_listing = None;
+                        self.reread_local = false;
                     }
                 }
                 _ => self.local_listing = Some(LocalListing::start(self.local_dir.clone(), ctx)),
@@ -407,6 +441,7 @@ impl Panel {
     fn set_local_dir(&mut self, dir: PathBuf) {
         self.local_dir = dir;
         self.local = None;
+        self.reread_local = false;
         self.local_selected.clear();
     }
 

@@ -10,6 +10,7 @@ use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use rconn_core::ids::HostId;
 use rconn_core::protocol::{Control, DataMessage, InputEvent, MouseButton};
 use rconn_media::copyrect::{self, Composed, Compositor};
+use rconn_media::playback::{Player, SoundDecoder};
 use rconn_media::video::{DecodedFrame, VideoDecoder};
 use rconn_peer::rtc::{PeerEvent, PeerOptions};
 use rconn_peer::session::open_viewer_session;
@@ -735,14 +736,13 @@ async fn session(
             if t.kind().await == rtc::rtp_transceiver::rtp_sender::RtpCodecKind::Audio {
                 let muted = muted.clone();
                 tokio::spawn(async move {
-                    let player = match crate::playback::Player::start() {
+                    let player = match Player::start(200) {
                         Ok(p) => p,
                         Err(e) => return tracing::warn!(error = %e, "no audio playback"),
                     };
-                    let Ok(mut dec) = rconn_media::codec::opus_decoder() else {
+                    let Ok(mut dec) = SoundDecoder::new() else {
                         return;
                     };
-                    let mut pcm = vec![0f32; 960 * 2 * 6];
                     while let Some(ev) = t.poll().await {
                         let TrackRemoteEvent::OnRtpPacket(pkt) = ev else {
                             continue;
@@ -750,8 +750,8 @@ async fn session(
                         if muted.load(std::sync::atomic::Ordering::Relaxed) {
                             continue;
                         }
-                        if let Ok(n) = dec.decode_float(&pkt.payload, &mut pcm, false) {
-                            player.push(&pcm[..n * 2]);
+                        if let Some(pcm) = dec.decode(&pkt.payload) {
+                            player.push(pcm);
                         }
                     }
                 });
@@ -1198,27 +1198,6 @@ pub fn fit(area: Rect, size: Vec2) -> Rect {
 
 const DANGER: Color32 = Color32::from_rgb(210, 70, 60);
 
-/// Key combinations offered in the toolbar's Keys menu (pressed in order, released in reverse).
-const COMBOS: [(&str, &[u16]); 10] = {
-    use rconn_core::hid::usage as u;
-    [
-        // (Windows hosts from 0.1.12 turn this into a real Ctrl+Alt+Delete.)
-        ("Ctrl+Alt+Del", &[u::CONTROL_LEFT, u::ALT_LEFT, u::DELETE]),
-        (
-            "Task Manager (Ctrl+Shift+Esc)",
-            &[u::CONTROL_LEFT, u::SHIFT_LEFT, u::ESCAPE],
-        ),
-        ("Windows key", &[u::META_LEFT]),
-        ("Alt+Tab", &[u::ALT_LEFT, u::TAB]),
-        ("Close window (Alt+F4)", &[u::ALT_LEFT, u::F1 + 3]),
-        ("Show desktop (Win+D)", &[u::META_LEFT, u::A + 3]),
-        ("Run (Win+R)", &[u::META_LEFT, u::A + 17]),
-        ("File Explorer (Win+E)", &[u::META_LEFT, u::A + 4]),
-        ("Print Screen", &[u::PRINT_SCREEN]),
-        ("Insert", &[u::INSERT]),
-    ]
-};
-
 impl ViewerApp {
     fn is_fullscreen(&self, ui: &egui::Ui) -> bool {
         self.chromeless
@@ -1289,11 +1268,8 @@ impl ViewerApp {
     }
 
     fn send_combo(&self, keys: &[u16]) {
-        for &k in keys {
-            self.send(key_event(k, true));
-        }
-        for &k in keys.iter().rev() {
-            self.send(key_event(k, false));
+        for (k, pressed) in rconn_core::hid::combo_events(keys) {
+            self.send(key_event(k, pressed));
         }
     }
 
@@ -1337,7 +1313,7 @@ impl ViewerApp {
         ui.label(egui::RichText::new(&self.name).strong());
         ui.separator();
         ui.menu_button("⌨ Keys", |ui| {
-            for (label, keys) in COMBOS {
+            for (label, keys) in rconn_core::hid::COMBOS {
                 if ui.button(label).clicked() {
                     self.send_combo(keys);
                     ui.close();

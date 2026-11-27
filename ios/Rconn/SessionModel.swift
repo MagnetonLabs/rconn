@@ -16,15 +16,24 @@ final class SessionModel: ObservableObject, Identifiable, SessionListener, @unch
     @Published var closedReason: String?
     /// The remote screen's size in pixels, once the first picture arrived.
     @Published var videoSize: CGSize = .zero
+    /// Playing the computer's sound (remembered for the next session).
+    @Published private(set) var soundOn: Bool
     private(set) var session: Session?
+    /// The Keys menu (the desktop viewer's list, from Rust).
+    let combos = keyCombos()
+    private(set) lazy var files = FilesModel(session: session)
 
     init(server: String, fingerprint: String?, computerID: String, password: String) {
         self.computerID = computerID
         self.server = server
+        let sound = UserDefaults.standard.object(forKey: "sound") as? Bool ?? true
+        soundOn = sound
+        if sound { AudioSession.activate() }
         let s = connectGuest(
             serverUrl: server, fingerprintPin: fingerprint, computerId: computerID,
             password: password, listener: self)
         session = s
+        s.setSound(on: sound)
         renderer.onNeedKeyframe = { [weak s] in s?.requestKeyframe() }
         renderer.onVideoSize = { [weak self] size in
             DispatchQueue.main.async { self?.videoSize = size }
@@ -33,6 +42,19 @@ final class SessionModel: ObservableObject, Identifiable, SessionListener, @unch
 
     func disconnect() {
         session?.disconnect()
+    }
+
+    /// Press entry `index` of the Keys menu on the computer.
+    func sendCombo(_ index: Int) {
+        session?.sendCombo(index: UInt32(index))
+    }
+
+    func toggleSound() {
+        soundOn.toggle()
+        UserDefaults.standard.set(soundOn, forKey: "sound")
+        if soundOn { AudioSession.activate() }
+        session?.setSound(on: soundOn)
+        if !soundOn { AudioSession.deactivate() }
     }
 
     /// Put this device's clipboard text on the computer's clipboard.
@@ -68,6 +90,7 @@ final class SessionModel: ObservableObject, Identifiable, SessionListener, @unch
         DispatchQueue.main.async {
             self.closedReason = reason
             self.session = nil
+            if self.soundOn { AudioSession.deactivate() }
             self.onClosedReason?(reason)
         }
     }
