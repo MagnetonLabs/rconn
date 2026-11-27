@@ -7,6 +7,7 @@
 use openh264::formats::YUVSource;
 
 /// An I420 picture (Y plane, then U, then V), fed straight to the encoder.
+#[derive(Clone)]
 pub struct I420 {
     width: usize,
     height: usize,
@@ -17,9 +18,22 @@ pub struct I420 {
 const MIN_BAND_ROWS: usize = 64;
 
 pub(crate) fn threads() -> usize {
-    std::thread::available_parallelism()
+    let all = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
-        .min(8)
+        .min(8);
+    THREADS_HERE
+        .with(|t| t.get())
+        .map_or(all, |n| n.clamp(1, all))
+}
+
+thread_local! {
+    static THREADS_HERE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Conversions and scaling on the calling thread use at most `n` cores from now on
+/// (`None`: all, up to 8): a capture thread working alongside an encoder leaves it some.
+pub fn limit_threads_here(n: Option<usize>) {
+    THREADS_HERE.with(|t| t.set(n));
 }
 
 impl I420 {
@@ -38,6 +52,28 @@ impl I420 {
 
     pub fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
+    }
+
+    /// Copy rows `rows` (an even range, clamped to the picture) of `src`, a picture of
+    /// the same size, into this one.
+    pub fn copy_rows_from(&mut self, src: &I420, rows: (usize, usize)) {
+        assert_eq!(
+            self.dimensions(),
+            src.dimensions(),
+            "pictures of other sizes"
+        );
+        let (w, h) = (self.width, self.height);
+        let (r0, r1) = (rows.0 & !1, rows.1.next_multiple_of(2).min(h));
+        if r1 <= r0 {
+            return;
+        }
+        let n = w * h;
+        self.data[r0 * w..r1 * w].copy_from_slice(&src.data[r0 * w..r1 * w]);
+        let half = w / 2;
+        let (c0, c1) = (r0 / 2 * half, r1 / 2 * half);
+        for plane in [n, n + n / 4] {
+            self.data[plane + c0..plane + c1].copy_from_slice(&src.data[plane + c0..plane + c1]);
+        }
     }
 
     /// The Y plane (`width` bytes per row).
@@ -644,6 +680,35 @@ impl YUVSource for I420 {
     fn v(&self) -> &[u8] {
         let n = self.width * self.height;
         &self.data[n + n / 4..]
+    }
+}
+
+#[cfg(test)]
+mod copy_rows_tests {
+    use super::*;
+
+    #[test]
+    fn copy_rows_brings_only_those_rows() {
+        let (w, h) = (8, 6);
+        let mut src = I420::new(w, h);
+        for (i, b) in src.data.iter_mut().enumerate() {
+            *b = (i % 251) as u8 + 1;
+        }
+        let mut dst = I420::new(w, h);
+        dst.copy_rows_from(&src, (2, 4));
+        let n = w * h;
+        for y in 0..h {
+            let want = (2..4).contains(&y);
+            assert_eq!(dst.data[y * w] == src.data[y * w], want, "luma row {y}");
+        }
+        for plane in [n, n + n / 4] {
+            for cy in 0..h / 2 {
+                let at = plane + cy * w / 2;
+                assert_eq!(dst.data[at] == src.data[at], cy == 1, "chroma row {cy}");
+            }
+        }
+        dst.copy_rows_from(&src, (0, h));
+        assert!(dst.data == src.data);
     }
 }
 

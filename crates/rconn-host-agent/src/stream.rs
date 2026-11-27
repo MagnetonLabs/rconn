@@ -38,6 +38,19 @@ pub struct StreamConfig {
     pub software: bool,
     /// The codec negotiated with the viewer ([`VideoSender::codec`]).
     pub codec: rconn_media::caps::VideoCodec,
+    /// Capture a frame ahead of the encoder, on a thread of its own (see
+    /// [`capture_ahead_from_env`]).
+    pub capture_ahead: bool,
+}
+
+/// `RCONN_CAPTURE_AHEAD=1`: capture a frame ahead of the encoder ([`pipe`]). Off by
+/// default: on a Windows 11 ARM VM without a GPU (8 vCPUs, 2992x1878), capturing and
+/// encoding one after the other fit in a 30 fps frame (6 + 15 ms a large change, 4 + 14
+/// ms typing), and side by side each took longer (12 + 23 ms) with nothing gained:
+/// 27.7 fps scrolling against 28.7, 30 ms from capture to send against 15. For a host
+/// where the two add up past a frame.
+pub fn capture_ahead_from_env() -> bool {
+    std::env::var("RCONN_CAPTURE_AHEAD").is_ok_and(|v| v == "1")
 }
 
 /// The viewer's requests to the encoder: an IDR frame (viewer joined, decoder lost
@@ -639,6 +652,46 @@ impl Pending {
     }
 }
 
+/// Capture a frame ahead of the encoder, on a thread of its own ([`pipe`])? When asked
+/// ([`StreamConfig::capture_ahead`]), and never for GPU surfaces: they go from the
+/// capturer to a hardware encoder as they are, on the stream thread.
+fn capture_ahead(cfg: &StreamConfig) -> bool {
+    if !cfg.capture_ahead {
+        return false;
+    }
+    // Asked of an encoder made on a thread of its own: the stream thread must make the
+    // capturer before anything else (DXGI binds it to the input desktop first).
+    let wants_surfaces = std::thread::scope(|s| {
+        s.spawn(|| {
+            let settings = EncoderSettings {
+                bitrate_bps: cfg.max_bitrate_bps,
+                max_fps: cfg.max_fps as f32,
+                threads: 0,
+                slice_bytes: None,
+            };
+            let enc = if cfg.software {
+                VideoEncoder::software(&cfg.openh264, settings)
+            } else {
+                VideoEncoder::new(&cfg.openh264, settings)
+            };
+            enc.is_ok_and(|mut e| {
+                e.set_codec(cfg.codec);
+                e.wants_surfaces()
+            })
+        })
+        .join()
+        .unwrap_or(true)
+    });
+    !wants_surfaces
+}
+
+/// Where pictures come from: the capturer itself, on the stream thread, or the capture
+/// thread a frame ahead.
+enum Source<'a> {
+    Inline(Box<dyn Capturer>),
+    Ahead(&'a pipe::Pipe),
+}
+
 /// One capturer's lifetime. `Ok(true)` if it produced frames before ending.
 fn run_generation(
     make: &(dyn Fn() -> Result<Box<dyn Capturer>> + Send + Sync),
@@ -646,8 +699,31 @@ fn run_generation(
     tx: &mpsc::Sender<(Vec<u8>, Instant)>,
 ) -> Result<bool> {
     let cfg = &ctx.cfg;
+    if !capture_ahead(cfg) {
+        return encode_loop(Source::Inline(make()?), ctx, tx);
+    }
+    let pipe = pipe::Pipe::new(Duration::from_secs(1) / cfg.max_fps.max(1));
+    std::thread::scope(|s| {
+        let capture = std::thread::Builder::new()
+            .name("rconn-capture".into())
+            .spawn_scoped(s, || pipe.capture(make, cfg.max_size))?;
+        let result = encode_loop(Source::Ahead(&pipe), ctx, tx);
+        pipe.stop();
+        if capture.join().is_err() {
+            tracing::error!("capture thread panicked");
+        }
+        result
+    })
+}
+
+/// Encode what `source` captures until the capture ends or the stream stops.
+fn encode_loop(
+    mut source: Source<'_>,
+    ctx: &Ctx,
+    tx: &mpsc::Sender<(Vec<u8>, Instant)>,
+) -> Result<bool> {
+    let cfg = &ctx.cfg;
     let budget = Duration::from_secs(1) / cfg.max_fps.max(1);
-    let mut cap = make()?;
     let settings = EncoderSettings {
         bitrate_bps: (ctx.target.get() as u32).min(cfg.max_bitrate_bps),
         max_fps: cfg.max_fps as f32,
@@ -670,7 +746,10 @@ fn run_generation(
     // Linux: VA-API, fed DMA-BUFs from the Wayland screen stream) gets them as they are:
     // no CPU conversion, and no half-size motion frames (a CPU saving it doesn't need).
     // Otherwise pictures are converted in memory, as before.
-    let surfaces = enc.wants_surfaces() && cap.use_surfaces(cfg.max_size);
+    let surfaces = match &mut source {
+        Source::Inline(cap) => enc.wants_surfaces() && cap.use_surfaces(cfg.max_size),
+        Source::Ahead(_) => false,
+    };
     let mut surface: Option<Surface> = None;
     let mut picture: Option<I420> = None;
     let mut small: Option<I420> = None;
@@ -749,6 +828,12 @@ fn run_generation(
         }
         // Wait for a change, but wake for a due batch, resend, or keyframe request.
         let link_due = link_free.checked_sub(LINK_AHEAD).unwrap_or(link_free);
+        // A capture under way may bring a change: re-encodes of the still picture wait.
+        let capture_due = match &source {
+            Source::Ahead(pipe) => pipe.capture_due(now),
+            Source::Inline(_) => None,
+        };
+        let still_due = capture_due.map_or(link_due, |c| c.max(link_due));
         let due = pending
             .as_ref()
             .map(|p| {
@@ -758,13 +843,16 @@ fn run_generation(
             .into_iter()
             .chain(resends.first().copied())
             // (Top-offs wait for the link too: a due time before it would poll.)
-            .chain((topoff_left > 0).then(|| (last_slot + BACKGROUND_INTERVAL).max(link_due)))
-            .chain(converging(converge, Instant::now()).then(|| (last_slot + budget).max(link_due)))
+            .chain((topoff_left > 0).then(|| (last_slot + BACKGROUND_INTERVAL).max(still_due)))
+            .chain(
+                converging(converge, Instant::now()).then(|| (last_slot + budget).max(still_due)),
+            )
             .chain(
                 refiner
                     .as_ref()
                     .filter(|_| refine_possible && !motion && enc.can_refine())
-                    .and_then(Refiner::due),
+                    .and_then(Refiner::due)
+                    .map(|d| capture_due.map_or(d, |c| c.max(d))),
             )
             .min();
         let timeout = due
@@ -772,22 +860,37 @@ fn run_generation(
             .unwrap_or(Duration::from_millis(100))
             .clamp(Duration::from_millis(1), Duration::from_millis(100));
         let t0 = Instant::now();
-        let got = if surfaces {
-            cap.next_surface(timeout).map(|r| {
-                r.map(|(s, c)| {
-                    surface = Some(s);
-                    c
-                })
-            })
-        } else {
-            cap.next_into(timeout, &mut picture, cfg.max_size)
+        let got = match &mut source {
+            Source::Inline(cap) => {
+                let got = if surfaces {
+                    cap.next_surface(timeout).map(|r| {
+                        r.map(|(s, c)| {
+                            surface = Some(s);
+                            c
+                        })
+                    })
+                } else {
+                    cap.next_into(timeout, &mut picture, cfg.max_size)
+                };
+                hints.extend(cap.take_moves());
+                if matches!(got, Ok(Some(_))) {
+                    stats.capture += t0.elapsed();
+                    stats.captures += 1;
+                }
+                got.map_err(pipe::Ended::Capture)
+            }
+            Source::Ahead(pipe) => {
+                let got = pipe.poll(timeout, &mut picture);
+                hints.extend(pipe.take_moves());
+                let (took, n) = pipe.capture_stats();
+                stats.capture += took;
+                stats.captures += n;
+                got
+            }
         };
-        hints.extend(cap.take_moves());
         hints.truncate(64);
         match got {
             Ok(Some(c)) => {
-                stats.capture += t0.elapsed();
-                stats.captures += 1;
                 if !produced {
                     let (w, h) = picture_size(&picture, &surface).unwrap_or((0, 0));
                     tracing::info!(
@@ -816,12 +919,13 @@ fn run_generation(
                     );
                 }
             }
-            Err(e) if produced => {
+            Err(pipe::Ended::Start(e)) => return Err(e),
+            Err(pipe::Ended::Capture(e)) if produced => {
                 // A capturer that worked and then failed: typically a desktop switch.
                 tracing::info!(error = %e, "capture lost (desktop switch?); restarting");
                 return Ok(true);
             }
-            Err(e) => return Err(e.into()),
+            Err(pipe::Ended::Capture(e)) => return Err(e.into()),
         }
         let Some((w, h)) = picture_size(&picture, &surface) else {
             continue;
@@ -961,8 +1065,14 @@ fn run_generation(
         let counted = enc.engine_name().starts_with("openh264");
         refine_possible = passes;
         // A still picture: sharpen it (see `TOPOFF_FRAMES`, `CONVERGE_QUIET`).
+        // (Not while a capture under way may bring a change: see `capture_due` above.)
+        let capture_soon = match &source {
+            Source::Ahead(pipe) => pipe.capture_due(now).is_some(),
+            Source::Inline(_) => false,
+        };
         let topoff = pending.is_none()
             && topoffs
+            && !capture_soon
             && if counted {
                 topoff_left > 0 && now >= last_slot + BACKGROUND_INTERVAL
             } else {
@@ -982,6 +1092,7 @@ fn run_generation(
                     && !motion
                     && !refine
                     && passes
+                    && !capture_soon
                     && pending.is_none() =>
             {
                 enc.can_refine().then(|| r.next(now)).flatten()
@@ -1005,6 +1116,20 @@ fn run_generation(
         if !encode_now {
             continue;
         }
+        // Captured ahead: the newest picture, with what changed since last told.
+        if pending.is_some()
+            && let Source::Ahead(pipe) = &source
+        {
+            let (unheard, resized) = pipe.take(&mut picture);
+            hints.extend(pipe.take_moves());
+            hints.truncate(64);
+            if let Some(c) = unheard {
+                pending = Some(Pending::merge(pending.take(), c));
+            }
+            if resized {
+                continue; // decided for the old size: again
+            }
+        }
         if let Some(t) = held_since.take() {
             stats.link_held += now - t;
         }
@@ -1014,6 +1139,9 @@ fn run_generation(
             stats.late_frames += 1;
         }
         last_slot = clock.started(now);
+        if let Source::Ahead(pipe) = &source {
+            pipe.next_slot(clock.next());
+        }
         if let Some(qp) = refine_qp {
             enc.refine_next(qp);
             if let Some(c) = composer.as_mut() {
@@ -1499,6 +1627,9 @@ impl Stats {
     }
 }
 
+#[path = "stream_pipe.rs"]
+mod pipe;
+
 #[cfg(all(test, windows))]
 #[path = "stream_live.rs"]
 mod live;
@@ -1521,6 +1652,7 @@ mod tests {
                 motion_half_res: false,
                 software: true,
                 codec: rconn_media::caps::VideoCodec::H264,
+                capture_ahead: false,
             },
             target: TargetBitrate::fixed(8_000_000.0),
             want_key: Arc::default(),
@@ -1558,12 +1690,24 @@ mod tests {
     /// pictures of the same content (each sharper), then nothing.
     #[test]
     fn a_still_scaled_picture_is_topped_off() {
+        topped_off(false);
+    }
+
+    /// The same with pictures captured a frame ahead ([`pipe`]): every change gets its
+    /// picture (no re-encode of the still one takes its slot), then the top-offs.
+    #[test]
+    fn a_still_scaled_picture_is_topped_off_when_captured_ahead() {
+        topped_off(true);
+    }
+
+    fn topped_off(ahead: bool) {
         let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
             return;
         };
         let keyframes = KeyframeRequests::default();
         keyframes.set_view_size(1280, 720);
-        let ctx = software_ctx(&lib, &keyframes);
+        let mut ctx = software_ctx(&lib, &keyframes);
+        ctx.cfg.capture_ahead = ahead;
         let (tx, mut rx) = mpsc::channel(4);
         let make = || -> Result<Box<dyn Capturer>> {
             Ok(Box::new(Changes {

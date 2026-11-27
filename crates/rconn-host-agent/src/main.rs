@@ -500,6 +500,7 @@ async fn serve_session(
         motion_half_res: cli.motion_half_res,
         software: false,
         codec: session.video.codec(),
+        capture_ahead: stream::capture_ahead_from_env(),
     };
     // Host sound runs alongside the picture; losing it never ends the session.
     if let (Some(audio_track), false) = (session.audio.take(), cli.no_audio) {
