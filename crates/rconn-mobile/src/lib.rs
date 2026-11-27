@@ -5,12 +5,17 @@
 //! video and the end of the session arrive on the app's [`SessionListener`]. Video is the
 //! host's H.264 as AVCC samples plus SPS/PPS, for `AVSampleBufferDisplayLayer` (hardware
 //! decode and display, no copies through Rust). Input goes the other way as protocol
-//! messages on the data channel.
+//! messages on the data channel. The host's sound plays from here ([`sound`]); files
+//! move on their own channel ([`files`]).
 
 // uniffi's generated FFI scaffolding is `unsafe extern "C"`; this crate's own code has none.
 #![allow(unsafe_code)]
 
+pub mod files;
 pub mod h264;
+pub mod sound;
+
+pub use files::{FileError, RemoteEntry, Transfer};
 
 use anyhow::{Result, anyhow};
 use bytes::BytesMut;
@@ -22,6 +27,7 @@ use rconn_peer::signaling::SignalingClient;
 use rconn_peer::trust::ServerTrust;
 use rconn_peer::video::VideoReceiver;
 use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -73,16 +79,44 @@ pub enum PointerButton {
     Middle,
 }
 
+/// One entry of the Keys menu: keys the phone can't type, such as Ctrl+Alt+Del.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct KeyCombo {
+    pub label: String,
+    /// USB HID usages, pressed in this order and released in reverse.
+    pub keys: Vec<u16>,
+}
+
+/// The Keys menu, as the desktop viewer has it ([`rconn_core::hid::COMBOS`]).
+#[uniffi::export]
+pub fn key_combos() -> Vec<KeyCombo> {
+    rconn_core::hid::COMBOS
+        .iter()
+        .map(|(label, keys)| KeyCombo {
+            label: (*label).into(),
+            keys: keys.to_vec(),
+        })
+        .collect()
+}
+
 enum Cmd {
     Send(DataMessage),
     Keyframe,
     Close,
 }
 
+/// What a session shares with its run loop besides commands.
+#[derive(Default)]
+struct Shared {
+    sound: Arc<sound::Sound>,
+    files: files::Files,
+}
+
 /// A running session. Dropping it disconnects.
 #[derive(uniffi::Object)]
 pub struct Session {
     cmds: mpsc::UnboundedSender<Cmd>,
+    shared: Arc<Shared>,
 }
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -126,10 +160,14 @@ pub fn online_computers(
         .iter()
         .map(|c| c.chars().filter(char::is_ascii_digit).collect())
         .collect();
-    let asked = tokio::time::timeout(
-        Duration::from_secs(8),
-        SignalingClient::presence(server_url.trim(), &trust, ids.clone()),
-    );
+    // The timer is made inside the runtime: made out here (the app's thread) it panics.
+    let asked = async {
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            SignalingClient::presence(server_url.trim(), &trust, ids.clone()),
+        )
+        .await
+    };
     match runtime().block_on(asked) {
         Ok(Ok(online)) => Some(
             computer_ids
@@ -162,6 +200,8 @@ pub fn connect_guest(
     let (cmds, rx) = mpsc::unbounded_channel();
     let pin = fingerprint_pin.filter(|p| !p.trim().is_empty());
     let trust = ServerTrust::from_fingerprint(pin.as_deref().map(str::trim));
+    let shared = Arc::new(Shared::default());
+    let ours = shared.clone();
     runtime().spawn(async move {
         let reason = match run(
             server_url.trim(),
@@ -170,16 +210,18 @@ pub fn connect_guest(
             password,
             &listener,
             rx,
+            &ours,
         )
         .await
         {
             Ok(reason) => reason,
             Err(e) => format!("{e:#}"),
         };
+        ours.files.end().await;
         tracing::info!(%reason, "session over");
         listener.on_closed(reason);
     });
-    Arc::new(Session { cmds })
+    Arc::new(Session { cmds, shared })
 }
 
 #[uniffi::export]
@@ -211,6 +253,69 @@ impl Session {
         self.input(InputEvent::Key { hid_usage, pressed });
     }
 
+    /// Entry `index` of [`key_combos`]: its keys pressed in order, released in reverse.
+    pub fn send_combo(&self, index: u32) {
+        let Some((_, keys)) = rconn_core::hid::COMBOS.get(index as usize) else {
+            return;
+        };
+        for (hid_usage, pressed) in rconn_core::hid::combo_events(keys) {
+            self.input(InputEvent::Key { hid_usage, pressed });
+        }
+    }
+
+    /// Play the computer's sound or not (on by default). Set up the app's audio session
+    /// before turning it on.
+    pub fn set_sound(&self, on: bool) {
+        self.shared.sound.set(on);
+    }
+
+    pub fn is_sound_on(&self) -> bool {
+        self.shared.sound.is_on()
+    }
+
+    /// What is in `folder` on the computer ("" is its shared folder, usually the home
+    /// folder): folders first, then files, by name.
+    pub async fn list_folder(&self, folder: String) -> Result<Vec<RemoteEntry>, FileError> {
+        let shared = self.shared.clone();
+        join(runtime().spawn(async move { shared.files.list(&folder).await })).await
+    }
+
+    /// Copy the computer's file `remote` (a path like `Downloads/report.pdf`) into the
+    /// local folder `dest_dir`, never replacing a file there. Returns the saved path.
+    pub async fn download(
+        &self,
+        remote: String,
+        dest_dir: String,
+        transfer: Arc<Transfer>,
+    ) -> Result<String, FileError> {
+        let shared = self.shared.clone();
+        join(runtime().spawn(async move {
+            shared
+                .files
+                .download(&remote, &PathBuf::from(dest_dir), &transfer)
+                .await
+        }))
+        .await
+    }
+
+    /// Copy the local file `local_path` into `folder` on the computer ("" its shared
+    /// folder). Returns where the computer saved it.
+    pub async fn upload(
+        &self,
+        local_path: String,
+        folder: String,
+        transfer: Arc<Transfer>,
+    ) -> Result<String, FileError> {
+        let shared = self.shared.clone();
+        join(runtime().spawn(async move {
+            shared
+                .files
+                .upload(&PathBuf::from(local_path), &folder, &transfer)
+                .await
+        }))
+        .await
+    }
+
     /// Type text on the computer, independent of its keyboard layout (soft keyboard).
     pub fn send_text(&self, text: String) {
         if !text.is_empty() {
@@ -240,7 +345,22 @@ impl Session {
     }
 }
 
+/// A file request's result from the runtime.
+async fn join<T>(task: tokio::task::JoinHandle<Result<T, FileError>>) -> Result<T, FileError> {
+    task.await.unwrap_or_else(|e| {
+        Err(FileError::Failed {
+            message: format!("file request stopped: {e}"),
+        })
+    })
+}
+
 impl Session {
+    /// Sound packets decoded so far (tests).
+    #[doc(hidden)]
+    pub fn sound_packets(&self) -> u64 {
+        self.shared.sound.decoded()
+    }
+
     fn input(&self, ev: InputEvent) {
         self.send(DataMessage::Input(ev));
     }
@@ -273,12 +393,14 @@ async fn run(
     password: String,
     listener: &Arc<dyn SessionListener>,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    shared: &Shared,
 ) -> Result<String> {
     let started = Instant::now();
     listener.on_status("connecting to the server…".into());
     let (sig, host) = SignalingClient::connect_guest(server, trust, computer_id).await?;
     listener.on_status("connecting to the computer…".into());
     let mut session = open_viewer_session(sig, host, PeerOptions::default()).await?;
+    shared.files.connected(session.peer.pc.clone());
     let asking = password.is_empty();
     let mut exchange = Exchange::new(password, &session).named("an iPhone or iPad");
     let dc = session.data.clone();
@@ -314,6 +436,7 @@ async fn run(
                         }
                         Step::Accepted => {
                             accepted = true;
+                            shared.files.allow();
                             if !got_picture.load(Ordering::Relaxed) {
                                 listener.on_status("waiting for the picture…".into());
                             }
@@ -348,8 +471,7 @@ async fn run(
                             started,
                         )));
                     } else {
-                        // No sound on iOS yet; keep the track drained.
-                        tasks.push(tokio::spawn(async move { while t.poll().await.is_some() {} }));
+                        tasks.push(tokio::spawn(sound::play(t, shared.sound.clone())));
                     }
                 }
                 Some(PeerEvent::State(s)) => {
@@ -437,5 +559,77 @@ async fn video(
                 pts_us: started.elapsed().as_micros() as u64,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> (Session, mpsc::UnboundedReceiver<Cmd>) {
+        let (cmds, rx) = mpsc::unbounded_channel();
+        let s = Session {
+            cmds,
+            shared: Arc::default(),
+        };
+        (s, rx)
+    }
+
+    #[test]
+    fn keys_menu_is_the_desktop_list() {
+        let combos = key_combos();
+        let labels: Vec<&str> = combos.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Ctrl+Alt+Del",
+                "Task Manager (Ctrl+Shift+Esc)",
+                "Windows key",
+                "Alt+Tab",
+                "Close window (Alt+F4)",
+                "Show desktop (Win+D)",
+                "Run (Win+R)",
+                "File Explorer (Win+E)",
+                "Print Screen",
+                "Insert",
+            ]
+        );
+        for (c, (_, keys)) in combos.iter().zip(rconn_core::hid::COMBOS) {
+            assert_eq!(c.keys, keys);
+        }
+    }
+
+    #[test]
+    fn a_combo_presses_in_order_and_releases_in_reverse() {
+        use rconn_core::hid::usage as u;
+        let (s, mut rx) = session();
+        s.send_combo(1); // Task Manager
+        s.send_combo(99); // no such entry: nothing
+        let mut keys = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            let Cmd::Send(DataMessage::Input(InputEvent::Key { hid_usage, pressed })) = cmd else {
+                panic!("not a key event");
+            };
+            keys.push((hid_usage, pressed));
+        }
+        assert_eq!(
+            keys,
+            [
+                (u::CONTROL_LEFT, true),
+                (u::SHIFT_LEFT, true),
+                (u::ESCAPE, true),
+                (u::ESCAPE, false),
+                (u::SHIFT_LEFT, false),
+                (u::CONTROL_LEFT, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn sound_starts_on_and_switches() {
+        let (s, _rx) = session();
+        assert!(s.is_sound_on());
+        s.set_sound(false);
+        assert!(!s.is_sound_on());
     }
 }

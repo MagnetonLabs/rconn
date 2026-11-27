@@ -5,6 +5,7 @@
 
 mod support;
 
+use rconn_core::hid::usage as u;
 use rconn_core::protocol::InputEvent;
 use rconn_media::video::VideoDecoder;
 use rconn_mobile::{PointerButton, SessionListener, VideoFrame, connect_guest};
@@ -23,6 +24,7 @@ async fn start() -> (String, String, Arc<support::HostLog>) {
         width: W,
         height: H,
         listen: "127.0.0.1:0".into(),
+        files_root: None,
     })
     .await
 }
@@ -49,6 +51,10 @@ impl SessionListener for App {
         assert!(c.is_none(), "on_closed called twice");
         *c = Some(reason);
     }
+}
+
+fn key(hid_usage: u16, pressed: bool) -> InputEvent {
+    InputEvent::Key { hid_usage, pressed }
 }
 
 async fn wait_for(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
@@ -100,8 +106,9 @@ async fn a_guest_sees_the_computer_and_controls_it() {
         session.send_key(rconn_core::hid::usage::A, false);
         session.send_text("hi".into());
         session.send_scroll(0.0, -3.0);
+        session.send_combo(0); // Ctrl+Alt+Del from the Keys menu
         wait_for("input on the host", Duration::from_secs(5), || {
-            host.input.lock().unwrap().len() >= 7
+            host.input.lock().unwrap().len() >= 13
         })
         .await;
         session.disconnect();
@@ -133,6 +140,12 @@ async fn a_guest_sees_the_computer_and_controls_it() {
                 },
                 InputEvent::Text("hi".into()),
                 InputEvent::Wheel { dx: 0.0, dy: -3.0 },
+                key(u::CONTROL_LEFT, true),
+                key(u::ALT_LEFT, true),
+                key(u::DELETE, true),
+                key(u::DELETE, false),
+                key(u::ALT_LEFT, false),
+                key(u::CONTROL_LEFT, false),
             ]
         );
         assert_eq!(*host.resizes.lock().unwrap(), [(1170, 2532)]);
@@ -191,4 +204,18 @@ async fn a_wrong_password_shows_nothing_and_says_why() {
     })
     .await
     .expect("test timed out");
+}
+
+/// The app asks from its own threads, outside any Tokio runtime (this used to panic).
+#[test]
+fn online_computers_answers_from_an_app_thread() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (url, id, _host) = rt.block_on(start());
+    let asked = id.clone();
+    let answer = std::thread::spawn(move || {
+        rconn_mobile::online_computers(url, None, vec![asked, "999 999 999".into()])
+    })
+    .join()
+    .expect("online_computers panicked");
+    assert_eq!(answer, Some(vec![id]));
 }

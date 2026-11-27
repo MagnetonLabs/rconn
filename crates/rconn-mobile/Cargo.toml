@@ -1,6 +1,6 @@
 [package]
 name = "rconn-mobile"
-description = "Viewer core for the iOS app: a guest session (computer ID + access password) behind a uniffi interface; H.264 out, input in."
+description = "Viewer core for the iOS app: a guest session (computer ID + access password) behind a uniffi interface; H.264 out, input in, sound played, files sent and fetched."
 license = "AGPL-3.0-only"
 version.workspace = true
 edition.workspace = true
@@ -24,6 +24,9 @@ bindgen = ["uniffi/cli"]
 rconn-core.workspace = true
 # The app owns the iOS clipboard (UIPasteboard), so no arboard.
 rconn-peer = { path = "../rconn-peer", default-features = false }
+# Opus decode and playback (cpal: CoreAudio on iOS), as the desktop viewer.
+rconn-media = { path = "../rconn-media", features = ["playback"] }
+thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -35,7 +38,7 @@ uniffi = "0.33.0"
 
 [dev-dependencies]
 axum = "0.8.9"
-rconn-media = { path = "../rconn-media" }
+tempfile.workspace = true
 rconn-signaling = { path = "../rconn-signaling" }
 
 [lints]
