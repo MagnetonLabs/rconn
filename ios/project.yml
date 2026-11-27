@@ -71,7 +71,6 @@ targets:
         # implemented in the app rather than taken from iOS: App Store Connect's export
         # compliance questions apply (no proprietary encryption; a French declaration only
         # for distribution in France).
-        ITSAppUsesNonExemptEncryption: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.rconn.ios
