@@ -213,6 +213,7 @@ fn live_loop() {
             motion_half_res: false,
             software: false,
             codec: rconn_media::caps::VideoCodec::H264,
+            capture_ahead: capture_ahead_from_env(),
         },
         target: TargetBitrate::fixed(f64::from(bps)),
         want_key: Arc::default(),

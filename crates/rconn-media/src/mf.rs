@@ -86,12 +86,16 @@ pub const MAX_QP: u8 = 32;
 /// top-off), each picture finer within the bitrate.
 pub const SOFTWARE_MAX_QP: u8 = 44;
 /// The widest picture given to Microsoft's software encoder (`RCONN_MF_MAX_WIDTH`
-/// overrides it). Wider pictures make larger keyframes (a 2992x1878 text screen: 218 KB
-/// against 174 KB at 2688 px). What it fails on, dense text scrolling (0.5 MB a picture
-/// at 2688 px, 1.2 MB at 2992 px, 17-18 dB either way; Windows 11 ARM VM,
-/// `encode_bench::probe_widths`), fails at any width: those pictures go to openh264 at
-/// half size (`stream::MF_OVERSIZE`).
-pub const SOFTWARE_MAX_WIDTH: usize = 2688;
+/// overrides it). A 2992x1878 screen goes at its own size: scaled to 2688 px its text
+/// was a blur (27 dB against the screen; 56-58 dB at its own size) and its scrolls cost
+/// more (a plain page scrolling 7 px a frame at 8 Mbps: 28 KB and 36 dB a picture at
+/// 2688x1686, 11 KB and 56 dB at 2992x1878: scaled, a scroll moves a fraction of a
+/// pixel, which its motion search matches badly). Its keyframes grow with the pixels
+/// (210 KB against 174 KB). What it fails on, dense text scrolling (0.5 MB a picture at
+/// 2688 px, 1.2 MB at 2992 px, 17-18 dB either way), fails at any width: those pictures
+/// go to openh264 at half size (`stream::MF_OVERSIZE`). (Windows 11 ARM VM,
+/// `encode_bench::probe_widths`; screens wider than 2992 px are unmeasured.)
+pub const SOFTWARE_MAX_WIDTH: usize = 3840;
 
 /// [`SOFTWARE_MAX_WIDTH`], or `RCONN_MF_MAX_WIDTH` (comparisons).
 pub fn software_max_width() -> usize {
