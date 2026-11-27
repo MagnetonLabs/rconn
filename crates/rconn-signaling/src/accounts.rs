@@ -59,16 +59,23 @@ impl Accounts {
     /// Check a password. Unknown users cost the same argon2 work as known ones, so response
     /// time doesn't reveal which usernames exist.
     pub fn verify(&self, username: &str, password: &str) -> Option<OperatorId> {
-        let (hash, id) = match self.0.get(username) {
-            Some(a) => (a.password_hash.as_str(), Some(a.operator_id)),
-            None => (dummy_hash(), None),
-        };
-        let parsed = PasswordHash::new(hash).ok()?;
-        let ok = Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok();
-        if ok { id } else { None }
+        let account = self.0.get(username);
+        let ok = verify_password(account.map(|a| a.password_hash.as_str()), password);
+        account.filter(|_| ok).map(|a| a.operator_id)
     }
+}
+
+/// Check `password` against a PHC hash. `None` (no such account) does the same argon2
+/// work against a dummy hash and answers false, so timing doesn't reveal who exists.
+pub fn verify_password(hash: Option<&str>, password: &str) -> bool {
+    let known = hash.is_some();
+    let Ok(parsed) = PasswordHash::new(hash.unwrap_or_else(|| dummy_hash())) else {
+        return false;
+    };
+    let ok = Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok();
+    known && ok
 }
 
 /// An argon2id PHC hash of `password` with a random salt.

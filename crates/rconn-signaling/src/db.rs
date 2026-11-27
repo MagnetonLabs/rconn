@@ -44,6 +44,33 @@ impl Role {
             Self::Viewer => "viewer",
         }
     }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Owner => 3,
+            Self::Admin => 2,
+            Self::Technician => 1,
+            Self::Viewer => 0,
+        }
+    }
+
+    /// Whether this role has at least `min`'s rights (owner > admin > technician > viewer).
+    pub fn at_least(self, min: Role) -> bool {
+        self.rank() >= min.rank()
+    }
+}
+
+impl serde::Serialize for Role {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Role {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 impl FromStr for Role {

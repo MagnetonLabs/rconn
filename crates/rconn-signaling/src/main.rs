@@ -159,6 +159,17 @@ struct ServeArgs {
     /// until the next month; 0 means no limit. Default: 1000 with --public, else 0.
     #[arg(long, env = "RCONN_TURN_MONTHLY_CAP_GB")]
     turn_monthly_cap_gb: Option<u64>,
+    /// The admin portal's public origin, e.g. https://app.rconn.app. Sign-in links point
+    /// here and portal requests must come from it. Without it, sign-in links are off.
+    #[arg(long, env = "RCONN_PORTAL_URL")]
+    portal_url: Option<String>,
+    /// Let anyone create a company in the portal (hosted sign-up).
+    #[arg(long, env = "RCONN_ALLOW_SIGNUP")]
+    allow_signup: bool,
+    /// Sender of portal email, e.g. "Rconn <login@rconn.app>". Mail goes out through
+    /// Resend when RESEND_API_KEY is set; otherwise it is written to the log.
+    #[arg(long, env = "RCONN_MAIL_FROM")]
+    mail_from: Option<String>,
 }
 
 #[tokio::main]
@@ -294,7 +305,18 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
         client_ip_header,
         turn_session_cap_mb,
         turn_monthly_cap_gb,
+        portal_url,
+        allow_signup,
+        mail_from,
     } = args;
+    if let Some(u) = &portal_url {
+        anyhow::ensure!(
+            (u.starts_with("https://") || u.starts_with("http://localhost"))
+                && u.trim_end_matches('/').matches('/').count() == 2,
+            "--portal-url must be an https origin without a path, like https://app.rconn.app"
+        );
+    }
+    let mailer = rconn_signaling::mail::from_env(mail_from.as_deref())?;
     let bind = bind.as_str();
     let nonzero = |v: u64| (v > 0).then_some(v);
     let session_cap = nonzero(turn_session_cap_mb.unwrap_or(if public { 4096 } else { 0 }))
@@ -406,10 +428,19 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
         auth = auth.with_turn(minter);
     }
     let audit_path = store.path().join("audit.jsonl");
-    let audit = rconn_signaling::audit::FileAudit::open(&audit_path)
+    let file_audit = rconn_signaling::audit::FileAudit::open(&audit_path)
         .with_context(|| format!("opening {}", audit_path.display()))?;
+    let mut db_audit = rconn_signaling::audit_db::DbAudit::spawn(db.clone());
+    if let Some(hosts) = &public_hosts {
+        db_audit = db_audit.ignoring_org(hosts.org_id());
+    }
+    let audit: Arc<dyn rconn_signaling::audit::AuditSink> =
+        Arc::new(rconn_signaling::audit::TeeAudit(vec![
+            Arc::new(file_audit),
+            Arc::new(db_audit),
+        ]));
     let auth = Arc::new(auth);
-    let state = AppState::with_audit(auth.clone(), Arc::new(audit));
+    let state = AppState::with_audit(auth.clone(), audit.clone());
     // Signed-in operators may turn their own computers into hosts from the app.
     state.allow_enrollment(org_id, ca);
     if let Some(hosts) = public_hosts {
@@ -432,6 +463,20 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
     let mut seen = rconn_signaling::reload::Seen::default();
     rconn_signaling::reload::reload_once(&db, &auth, &state, &mut seen).await?;
     let revoked = db.revoked_hosts().await?.len();
+    let master = Arc::new(master);
+    let portal = rconn_signaling::portal::PortalState::new(
+        db.clone(),
+        state.clone(),
+        master.clone(),
+        mailer,
+        audit,
+        rconn_signaling::portal::PortalConfig {
+            portal_url: portal_url.map(|u| u.trim_end_matches('/').to_owned()),
+            allow_signup,
+            ..Default::default()
+        },
+    );
+    rconn_signaling::portal::spawn_housekeeping(db.clone());
     {
         let (store, auth, state) = (DataDir::new(store.path()), auth.clone(), state.clone());
         tokio::spawn(async move {
@@ -450,7 +495,7 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
             }
         });
     }
-    let app = router(state);
+    let app = router(state).merge(rconn_signaling::portal::router(portal));
     let addr: std::net::SocketAddr = bind.parse().with_context(|| format!("--bind {bind}"))?;
     let handle = axum_server::Handle::new();
     let h = handle.clone();
