@@ -416,11 +416,10 @@ async fn control_messages_stay_prompt_during_a_large_transfer() {
             let mut rtts: Vec<Duration> = pings.iter().map(|p| p.0).collect();
             rtts.sort();
             let most_queued = pings.iter().map(|p| p.1).max().unwrap_or(0);
-            let wait_at = |mbit: f64| most_queued as f64 * 8.0 / (mbit * 1e6) * 1e3;
             let pct = |p: usize| rtts[(rtts.len() - 1) * p / 100];
             eprintln!(
                 "{}: 64 MB in {took:?} ({:.0} MB/s); {} pings, median {:?}, p95 {:?}, worst {:?}; \
-                 file data queued ahead of a ping: at most {} KB (on a 10 Mb/s link {:.0} ms, 2 Mb/s {:.0} ms)",
+                 file data queued ahead of a ping: at most {} KB",
                 if upload { "upload" } else { "download" },
                 64.0 / took.as_secs_f64(),
                 rtts.len(),
@@ -428,8 +427,6 @@ async fn control_messages_stay_prompt_during_a_large_transfer() {
                 pct(95),
                 rtts.last().unwrap(),
                 most_queued / 1024,
-                wait_at(10.0),
-                wait_at(2.0),
             );
             assert!(rtts.len() >= 5, "pings answered during the transfer");
             assert!(
@@ -437,12 +434,18 @@ async fn control_messages_stay_prompt_during_a_large_transfer() {
                 "input waited behind file data: {:?}",
                 rtts.last()
             );
-            if upload {
-                assert!(
-                    most_queued <= rconn_peer::files::HIGH_WATER,
-                    "{most_queued} bytes of file data ahead of input"
-                );
-            }
+            // What was queued, at the rate it drained: how long a message waited behind it
+            // (in flight or not), within QUEUE_TIME and a little slack for measuring. (The
+            // viewer sees only its own channel: during a download the queue is the host's,
+            // and the ping's round trip is the measure.) A long, slow path cannot be made
+            // on loopback; the budget's own tests model one.
+            let rate = 64.0 * MB as f64 / took.as_secs_f64();
+            let behind = Duration::from_secs_f64(most_queued as f64 / rate);
+            eprintln!("  at most {behind:?} of file data ahead of a ping");
+            assert!(
+                behind <= rconn_peer::files::QUEUE_TIME + Duration::from_millis(15),
+                "input waited {behind:?} behind file data"
+            );
         }
         assert_eq!(sha256_of(&dest.join("large.bin")), sha256_of(&src));
         rig.close().await;
