@@ -92,8 +92,12 @@ pub struct Feedback {
 
 /// Acknowledgements at most this often (each is a few bytes on the data channel).
 const ACK_EVERY: Duration = Duration::from_millis(100);
-/// A loss report is repeated after this, doubling, while the picture stays broken.
-const REPORT_AGAIN: Duration = Duration::from_millis(300);
+/// A loss report is repeated after this, doubling up to 8 s, while the picture stays
+/// broken and frames that build on the loss keep coming. Longer than a full-size keyframe
+/// takes (0.5 s just to encode on a slow host): a host sending copy instructions answers
+/// every report with a keyframe (0.1.6 to 0.1.10 do not dedupe them), and a repeat at
+/// 300 ms made two or three of them per loss.
+const REPORT_AGAIN: Duration = Duration::from_secs(1);
 
 /// Whether a frame should go to the decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +120,8 @@ pub struct Integrity {
     last_ack: Option<Instant>,
     last_report: Option<Instant>,
     reports: u32,
+    /// Frames arrived since the last loss report.
+    since_report: u32,
 }
 
 impl Integrity {
@@ -147,6 +153,13 @@ impl Integrity {
         self.last_report = None;
     }
 
+    /// Is the picture broken in a way the host is (or is about to be) told of with a
+    /// loss report, so a repair is coming? Not when nothing was ever intact: there is
+    /// nothing to repair from, and nothing to report.
+    pub fn awaiting_repair(&self) -> bool {
+        self.broken && self.newest_intact().is_some()
+    }
+
     fn breaks(&mut self) {
         if !self.broken {
             self.broken = true;
@@ -157,6 +170,7 @@ impl Integrity {
 
     /// A tagged frame arrived.
     pub fn frame(&mut self, tag: &FrameTag) -> Verdict {
+        self.since_report = self.since_report.saturating_add(1);
         // Older than one already seen (a late retransmission after a repair was asked
         // for): too late to show, and no news.
         if self
@@ -213,17 +227,20 @@ impl Integrity {
     pub fn poll(&mut self, now: Instant) -> Option<Feedback> {
         let decoded = self.newest_intact()?;
         if self.broken {
-            let gap = REPORT_AGAIN * 2u32.saturating_pow(self.reports.min(4));
+            let gap = REPORT_AGAIN * 2u32.saturating_pow(self.reports.min(3));
             if self
                 .last_report
-                .is_some_and(|t| now.saturating_duration_since(t) < gap)
+                .is_some_and(|t| now.saturating_duration_since(t) < gap || self.since_report == 0)
             {
+                // Too soon, or nothing new since: the host is making the repair (no
+                // frames while it encodes a keyframe), or the screen is still.
                 return None;
             }
             if self.last_report.is_some() {
                 self.reports += 1;
             }
             self.last_report = Some(now);
+            self.since_report = 0;
             return Some(Feedback {
                 decoded,
                 lost: true,
@@ -408,12 +425,16 @@ mod tests {
             })
         );
         assert_eq!(
-            g.poll(now + Duration::from_millis(100)),
+            g.poll(now + Duration::from_millis(300)),
             None,
-            "not again yet"
+            "not again before a keyframe could have come"
         );
-        assert!(g.poll(now + Duration::from_millis(300)).is_some(), "again");
+        assert!(g.awaiting_repair());
         assert_eq!(g.frame(&t(18)), Verdict::Skip);
+        assert!(
+            g.poll(now + Duration::from_secs(1)).is_some(),
+            "again: frames keep building on the loss"
+        );
         assert_eq!(
             g.frame(&t(16)),
             Verdict::Skip,
@@ -431,13 +452,49 @@ mod tests {
         };
         assert_eq!(g.frame(&good), Verdict::Decode);
         assert_eq!(g.frame(&t(21)), Verdict::Decode);
+        assert!(!g.awaiting_repair());
         assert_eq!(
-            g.poll(now + Duration::from_secs(1)),
+            g.poll(now + Duration::from_secs(2)),
             Some(Feedback {
                 decoded: 21,
                 lost: false
             })
         );
+    }
+
+    /// A report is not repeated while nothing new arrives: the host is encoding the
+    /// repair (or the screen is still), and to some hosts every report is a keyframe.
+    /// Once frames that build on the loss come again, it is.
+    #[test]
+    fn a_loss_report_waits_for_new_frames_before_it_is_repeated() {
+        let now = Instant::now();
+        let mut g = Integrity::default();
+        g.frame(&FrameTag { key: true, ..t(0) });
+        g.frame(&t(1));
+        assert!(g.poll(now).is_some_and(|f| !f.lost), "the ack");
+        assert_eq!(g.frame(&t(3)), Verdict::Skip, "2 lost");
+        let reports = |g: &mut Integrity, from: u64, to: u64| {
+            (from..to)
+                .step_by(50)
+                .filter(|&ms| g.poll(now + Duration::from_millis(ms)).is_some())
+                .count()
+        };
+        assert_eq!(reports(&mut g, 0, 10_000), 1, "one report, then silence");
+        assert_eq!(g.frame(&t(4)), Verdict::Skip);
+        assert_eq!(
+            reports(&mut g, 10_000, 10_100),
+            1,
+            "a new frame on the loss"
+        );
+        // Frames keep coming that build on it: again after 2, 4, 8, 8 s.
+        let mut at = Vec::new();
+        for (id, ms) in (10_100..40_000).step_by(50).enumerate() {
+            g.frame(&t(5 + id as u32));
+            if g.poll(now + Duration::from_millis(ms)).is_some() {
+                at.push(ms);
+            }
+        }
+        assert_eq!(at, [12_000, 16_000, 24_000, 32_000]);
     }
 
     #[test]

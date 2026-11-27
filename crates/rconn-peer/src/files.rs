@@ -3,22 +3,24 @@
 //!
 //! Everything streams: a file is read and written a chunk at a time, hashed as it goes,
 //! and at most [`TRANSFER_WINDOW`] bytes are unacknowledged, so memory stays small however
-//! large the file. The sender also waits while the connection's SCTP queue holds more than
-//! [`HIGH_WATER`] bytes: the queue is shared with the main channel, and a short one keeps
-//! input and control messages from waiting behind file data.
+//! large the file. The sender also keeps only a round trip plus [`QUEUE_TIME`] of its
+//! channel's data in SCTP (see [`Budget`]): both channels go through one ordered queue
+//! and share the link, so input and control messages wait at most that long behind file
+//! data, while a long fast path is still kept full.
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use rconn_core::files::{
     ACK_EVERY, FILE_CHUNK_BYTES, FILES_CHANNEL_LABEL, FILES_CHANNEL_PROTOCOL, FileEntry,
-    FileMessage, TRANSFER_WINDOW, numbered_name, relative_components, sanitize_file_name,
+    FileMessage, TRANSFER_WINDOW, numbered_name, put_name, put_target, relative_components,
+    sanitize_file_name,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{Notify, mpsc};
@@ -26,12 +28,30 @@ use tokio::task::{JoinHandle, JoinSet};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::PeerConnection;
 
-/// Bytes queued in SCTP (this channel's share) before a sender waits. Measured on
-/// loopback (tests/file_transfer.rs): 1 MiB let bursts overflow and cost a main-channel
-/// ping up to ~1 s (a retransmission timeout); 256 KiB kept the worst ping under 20 ms
-/// and moved data faster. The price is throughput on long paths: at most this much per
-/// round trip (about 5 MB/s at 50 ms).
-pub const HIGH_WATER: usize = 256 * 1024;
+/// How long a message on either channel may wait behind file data, beyond the round
+/// trip: file data in SCTP (queued or unacknowledged) is kept to the channel's drain rate
+/// x (round trip + this). 0.1.5-0.1.10 kept a flat 256 KiB, 1 s at 2 Mb/s; a flat 32 KiB
+/// would cap a 50 ms path at ~650 KB/s.
+pub const QUEUE_TIME: Duration = Duration::from_millis(30);
+/// The least file data kept in SCTP, whatever the rate.
+pub const MIN_QUEUED: usize = 32 * 1024;
+/// The most: fills a 50 ms path at ~80 Mb/s. More made this SCTP stack lose packets in
+/// bursts even on loopback (1 and 2 MiB: a ping waited ~1 s, a retransmission timeout;
+/// 768 KiB was the most that held).
+pub const MAX_QUEUED: usize = 512 * 1024;
+/// File content per Data message, at least (receivers take up to [`FILE_CHUNK_BYTES`]).
+const MIN_SEND_CHUNK: usize = 16 * 1024;
+/// The round-trip estimate is refreshed this often by draining the queue briefly:
+/// otherwise the queue this keeps would count as round trip and grow itself.
+const PROBE_EVERY: Duration = Duration::from_secs(5);
+/// About one SCTP packet of a message.
+const FIRST_PACKET: u64 = 1200;
+/// Rate samples are at least this far apart.
+const RATE_SAMPLE: Duration = Duration::from_millis(20);
+/// File data goes out at most this much faster than it drains: fast enough to find more
+/// room (x1.25 per round trip), slow enough that refilling an emptied path (after a probe)
+/// does not queue a whole limit's worth at once.
+const PACING_GAIN: f64 = 1.25;
 /// Inbound messages buffered per request. More than a window's worth of chunks, so a peer
 /// that honours the window never fills it; one that doesn't loses the request.
 const QUEUE: usize = 128;
@@ -60,11 +80,154 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// How much file data a channel may have in SCTP: its drain rate x (round trip +
+/// [`QUEUE_TIME`]), within [`MIN_QUEUED`]..[`MAX_QUEUED`]. A message sent now waits for
+/// what is queued beyond what the path holds in flight, so at most [`QUEUE_TIME`], and a
+/// long fast path still has a round trip's worth in flight.
+///
+/// Both are measured from the channel's buffered amount (bytes SCTP holds until the peer
+/// acknowledges them): the drain rate from how fast it is released (the fastest of the
+/// last few samples), the round trip from how long a message's first packet stays (the
+/// shortest lately).
+/// The data kept queued makes every message stay longer, so every [`PROBE_EVERY`] the
+/// limit drops to [`MIN_QUEUED`] for a round trip and a bit, the queue drains, and the
+/// messages sent then show the round trip itself (BBR's ProbeRTT). Sending is also paced
+/// at [`PACING_GAIN`] x the drain rate.
+#[derive(Debug, Default)]
+struct Budget {
+    /// Bytes handed to SCTP on this channel, ever.
+    sent: u64,
+    /// (`sent` before a message, when it was sent), oldest first.
+    messages: VecDeque<(u64, Instant)>,
+    /// Shortest stay this epoch and the last.
+    rtt_now: Option<Duration>,
+    rtt_before: Option<Duration>,
+    epoch: Option<Instant>,
+    probe_until: Option<Instant>,
+    /// (when, bytes/s), newest last.
+    rates: VecDeque<(Instant, f64)>,
+    /// Released bytes at the last rate sample, and when.
+    mark: Option<(Instant, u64)>,
+    /// Pacing budget, bytes, and when it was last refilled.
+    tokens: f64,
+    refilled: Option<Instant>,
+}
+
+impl Budget {
+    fn sent(&mut self, now: Instant, bytes: usize) {
+        if self.messages.len() >= 8192 {
+            self.messages.pop_front();
+        }
+        self.messages.push_back((self.sent, now));
+        self.sent += bytes as u64;
+        self.tokens -= bytes as f64;
+    }
+
+    fn rtt(&self) -> Option<Duration> {
+        match (self.rtt_now, self.rtt_before) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn probing(&self, now: Instant) -> bool {
+        self.probe_until.is_some_and(|t| now < t)
+    }
+
+    /// SCTP holds `outstanding` bytes of this channel now.
+    fn observe(&mut self, now: Instant, outstanding: usize) {
+        let released = self.sent.saturating_sub(outstanding as u64);
+        // How long a message's first packet stayed: its whole stay would also count the
+        // time the message itself takes to send, which is not path.
+        while let Some(&(start, at)) = self.messages.front() {
+            if start + FIRST_PACKET > released {
+                break;
+            }
+            self.messages.pop_front();
+            let stay = now.saturating_duration_since(at);
+            self.rtt_now = Some(self.rtt_now.map_or(stay, |r| r.min(stay)));
+        }
+        let epoch = *self.epoch.get_or_insert(now);
+        if now.saturating_duration_since(epoch) >= PROBE_EVERY {
+            self.epoch = Some(now);
+            self.rtt_before = self.rtt_now.take().or(self.rtt_before);
+            let rtt = self.rtt().unwrap_or(Duration::from_millis(50));
+            self.probe_until = Some(now + rtt + 2 * QUEUE_TIME);
+        }
+        let rtt = self.rtt().unwrap_or_default();
+        match self.mark {
+            Some((at, before)) if now.saturating_duration_since(at) >= rtt.max(RATE_SAMPLE) => {
+                if !self.probing(at) && !self.probing(now) {
+                    let dt = now.saturating_duration_since(at).as_secs_f64();
+                    self.rates
+                        .push_back((now, released.saturating_sub(before) as f64 / dt));
+                }
+                self.mark = Some((now, released));
+            }
+            Some(_) => {}
+            None => self.mark = Some((now, released)),
+        }
+        let keep = (rtt * 4).max(Duration::from_millis(200));
+        while self
+            .rates
+            .front()
+            .is_some_and(|&(t, _)| now.saturating_duration_since(t) > keep)
+        {
+            self.rates.pop_front();
+        }
+        let dt = self
+            .refilled
+            .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
+        self.refilled = Some(now);
+        match self.rate() {
+            Some(rate) => {
+                // Room for one message at least, or it would never go.
+                let burst = (rate * QUEUE_TIME.as_secs_f64() / 2.0).max(self.chunk(now) as f64);
+                self.tokens = (self.tokens + PACING_GAIN * rate * dt).min(burst);
+            }
+            None => self.tokens = MIN_QUEUED as f64,
+        }
+    }
+
+    /// The drain rate, bytes/s: the fastest of the recent samples.
+    fn rate(&self) -> Option<f64> {
+        self.rates
+            .iter()
+            .map(|&(_, r)| r)
+            .reduce(f64::max)
+            .filter(|&r| r > 0.0)
+    }
+
+    /// May `len` more bytes go to SCTP, which holds `outstanding` of this channel?
+    fn allows(&self, now: Instant, outstanding: usize, len: usize) -> bool {
+        outstanding == 0 || (outstanding + len <= self.limit(now) && self.tokens >= len as f64)
+    }
+
+    /// Bytes of file data SCTP may hold now.
+    fn limit(&self, now: Instant) -> usize {
+        if self.probing(now) {
+            return MIN_QUEUED;
+        }
+        let Some(rate) = self.rate() else {
+            return MIN_QUEUED;
+        };
+        let room = rate * (self.rtt().unwrap_or_default() + QUEUE_TIME).as_secs_f64();
+        (room as usize).clamp(MIN_QUEUED, MAX_QUEUED)
+    }
+
+    /// File content per Data message: a quarter of the limit, so several are in SCTP at
+    /// once.
+    fn chunk(&self, now: Instant) -> usize {
+        (self.limit(now) / 4).clamp(MIN_SEND_CHUNK, FILE_CHUNK_BYTES)
+    }
+}
+
 /// One file channel's sending side.
 struct Wire {
     dc: Arc<dyn DataChannel>,
     /// Woken on `OnBufferedAmountLow`.
     low: Notify,
+    budget: Mutex<Budget>,
 }
 
 impl Wire {
@@ -72,30 +235,49 @@ impl Wire {
         Self {
             dc,
             low: Notify::new(),
+            budget: Mutex::default(),
         }
     }
 
     async fn send(&self, m: &FileMessage) -> Result<()> {
         let b = m.encode()?;
+        let len = b.len();
         self.dc
             .send(BytesMut::from(&b[..]))
             .await
-            .map_err(|_| anyhow!(Stopped::Closed))
+            .map_err(|_| anyhow!(Stopped::Closed))?;
+        self.budget
+            .lock()
+            .expect("budget")
+            .sent(Instant::now(), len);
+        Ok(())
     }
 
-    /// Wait until SCTP has room for more file data.
-    async fn writable(&self) -> Result<()> {
+    /// File content to put in the next Data message.
+    fn chunk(&self) -> usize {
+        self.budget.lock().expect("budget").chunk(Instant::now())
+    }
+
+    /// Wait until SCTP has room for `len` more bytes of file data (see [`Budget`]).
+    async fn writable(&self, len: usize) -> Result<()> {
         loop {
             let queued = self
                 .dc
                 .outstanding_bytes()
                 .await
                 .map_err(|_| anyhow!(Stopped::Closed))?;
-            if queued <= HIGH_WATER {
+            let now = Instant::now();
+            let allowed = {
+                let mut b = self.budget.lock().expect("budget");
+                b.observe(now, queued);
+                b.allows(now, queued, len)
+            };
+            if allowed {
                 return Ok(());
             }
-            // The event may not come (it tracks a slightly different counter): poll too.
-            let _ = tokio::time::timeout(Duration::from_millis(10), self.low.notified()).await;
+            // The event may not come (it tracks a slightly different counter), and the
+            // limit moves: poll too.
+            let _ = tokio::time::timeout(Duration::from_millis(2), self.low.notified()).await;
         }
     }
 }
@@ -264,7 +446,7 @@ async fn send_content(
         if progress.is_some_and(|p| p.is_cancelled()) {
             return Err(Stopped::Cancelled.into());
         }
-        let want = (limit - sent).min(FILE_CHUNK_BYTES as u64) as usize;
+        let want = (limit - sent).min(wire.chunk() as u64) as usize;
         if want == 0 {
             break;
         }
@@ -273,7 +455,7 @@ async fn send_content(
             break;
         }
         hasher.update(&buf[..n]);
-        wire.writable().await?;
+        wire.writable(n).await?;
         wire.send(&FileMessage::Data {
             req,
             bytes: buf[..n].to_vec(),
@@ -301,7 +483,8 @@ pub type FreeSpace = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 pub struct ServeConfig {
     /// Every listed or sent path is inside this folder (symlinks included).
     pub root: PathBuf,
-    /// Where uploads are saved (created when first needed).
+    /// Where uploads without a folder are saved (created when first needed). An upload
+    /// that names a folder goes there instead, if it is one inside the root.
     pub inbox: PathBuf,
     pub free_space: Option<FreeSpace>,
     /// Names the session in audit lines.
@@ -346,7 +529,7 @@ pub async fn serve(dc: Arc<dyn DataChannel>, cfg: ServeConfig) {
         }
     };
     let _ = dc
-        .set_buffered_amount_low_threshold(HIGH_WATER as u32 / 2)
+        .set_buffered_amount_low_threshold(MIN_QUEUED as u32 / 2)
         .await;
     tracing::info!(target: "rconn_audit", session = %cfg.session, root = %root.display(), "file channel open");
     let host = Arc::new(Host {
@@ -582,14 +765,39 @@ impl Host {
         }
     }
 
+    /// Where an upload called `name` goes: the folder it names, which must exist and be a
+    /// folder inside the root (checked as List and Get are), or the inbox. Returns the
+    /// folder and the file name to create there (not yet sanitized).
+    async fn upload_dir<'a>(&self, name: &'a str) -> Result<(PathBuf, &'a str)> {
+        let Some((folder, file)) = put_target(name) else {
+            let inbox = self.cfg.inbox.clone();
+            fs::create_dir_all(&inbox).await.map_err(|e| {
+                anyhow!(
+                    "could not create the Rconn downloads folder: {}",
+                    io_text(&e)
+                )
+            })?;
+            return Ok((inbox, name));
+        };
+        let shown = if folder.is_empty() { "~" } else { folder };
+        let dir = self
+            .resolve(folder)
+            .await
+            .map_err(|e| anyhow!("can't save into {shown}: {e:#}"))?;
+        let meta = fs::metadata(&dir)
+            .await
+            .map_err(|e| anyhow!("can't save into {shown}: {}", io_text(&e)))?;
+        if !meta.is_dir() {
+            bail!("can't save into {shown}: it is not a folder");
+        }
+        Ok((dir, file))
+    }
+
     async fn put(&self, req: u32, name: &str, size: u64, mut control: mpsc::Receiver<FileMessage>) {
         let mut saved = String::new();
         let result: Result<(u64, [u8; 32])> = async {
-            let inbox = &self.cfg.inbox;
-            fs::create_dir_all(inbox)
-                .await
-                .map_err(|e| anyhow!("could not create the Rconn downloads folder: {}", io_text(&e)))?;
-            if let Some(free) = self.cfg.free_space.as_ref().and_then(|f| f(inbox.as_path()))
+            let (dir, file_name) = self.upload_dir(name).await?;
+            if let Some(free) = self.cfg.free_space.as_ref().and_then(|f| f(dir.as_path()))
                 && size.saturating_add(FREE_SPACE_RESERVE) > free
             {
                 bail!(
@@ -598,7 +806,7 @@ impl Host {
                     (size + FREE_SPACE_RESERVE) >> 20
                 );
             }
-            let (path, file) = create_unique(inbox, &sanitize_file_name(name)).await?;
+            let (path, file) = create_unique(&dir, &sanitize_file_name(file_name)).await?;
             let mut partial = Partial(Some(path.clone()));
             self.wire
                 .send(&FileMessage::Ack { req, received: 0 })
@@ -797,7 +1005,7 @@ impl FilesClient {
         .await
         .map_err(|_| anyhow!("the file channel did not open"))??;
         let _ = dc
-            .set_buffered_amount_low_threshold(HIGH_WATER as u32 / 2)
+            .set_buffered_amount_low_threshold(MIN_QUEUED as u32 / 2)
             .await;
         let client = Arc::new(Client {
             wire: Wire::new(dc),
@@ -821,6 +1029,12 @@ impl FilesClient {
             rx,
             client: self.client.clone(),
         })
+    }
+
+    /// Bytes this channel has handed to SCTP that the host has not acknowledged yet:
+    /// what a message on the main channel may queue behind on a slow link.
+    pub async fn queued(&self) -> usize {
+        self.client.wire.dc.outstanding_bytes().await.unwrap_or(0)
     }
 
     /// Why the channel is unusable, if it is (refused or closed).
@@ -915,9 +1129,21 @@ impl FilesClient {
     /// Copy a local file to the host (its Downloads/Rconn folder). Returns where the host
     /// saved it.
     pub async fn upload(&self, local: &Path, progress: &Progress) -> Result<String> {
+        self.upload_into(local, None, progress).await
+    }
+
+    /// Copy a local file into `folder` on the host (relative to its shared root, "" for
+    /// the root), or its Downloads/Rconn folder if `None`. Hosts before 0.1.11 always use
+    /// Downloads/Rconn. Returns where the host saved it.
+    pub async fn upload_into(
+        &self,
+        local: &Path,
+        folder: Option<&str>,
+        progress: &Progress,
+    ) -> Result<String> {
         let mut route = self.start()?;
         let req = route.req;
-        let result = self.upload_inner(&mut route, local, progress).await;
+        let result = self.upload_inner(&mut route, local, folder, progress).await;
         if result.is_err() {
             let _ = self.client.wire.send(&FileMessage::Cancel { req }).await;
         }
@@ -928,6 +1154,7 @@ impl FilesClient {
         &self,
         route: &mut Route,
         local: &Path,
+        folder: Option<&str>,
         progress: &Progress,
     ) -> Result<String> {
         let req = route.req;
@@ -942,6 +1169,10 @@ impl FilesClient {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".into());
+        let name = match folder {
+            Some(f) => put_name(f, &name),
+            None => name,
+        };
         let mut file = fs::File::open(local)
             .await
             .map_err(|e| anyhow!("{}: {}", local.display(), io_text(&e)))?;
@@ -1003,4 +1234,105 @@ async fn read_replies(client: Arc<Client>) {
     }
     drop(refused);
     client.routes.lock().expect("routes").clear();
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// One sender through a bottleneck of `link_bps` with round trip `rtt`, as SCTP with
+    /// no window of its own would see it (the worst case for waiting: all data is either
+    /// queued at the sender or at the bottleneck, ahead of anything sent after it). Data
+    /// leaves the bottleneck at the link rate; SCTP releases it a round trip later.
+    /// Returns (throughput bytes/s, waits a message sent then would have had, sorted),
+    /// after the first second.
+    fn run(link_bps: f64, rtt: Duration, fixed: Option<usize>) -> (f64, Vec<Duration>) {
+        let t0 = Instant::now();
+        let rate = link_bps / 8.0;
+        let mut b = Budget::default();
+        let (mut sent, mut left) = (0f64, 0f64);
+        // (when, bytes that had left the bottleneck by then)
+        let mut history: VecDeque<(Instant, f64)> = VecDeque::new();
+        let (mut waits, mut left_at_1s) = (Vec::new(), 0.0);
+        let secs = 12;
+        for ms in 0..secs * 1000u32 {
+            let now = t0 + Duration::from_millis(u64::from(ms));
+            left = (left + rate / 1000.0).min(sent);
+            history.push_back((now, left));
+            while history.len() > 1 && history[1].0 + rtt <= now {
+                history.pop_front();
+            }
+            let released = history
+                .front()
+                .filter(|&&(t, _)| t + rtt <= now)
+                .map_or(0.0, |&(_, l)| l);
+            loop {
+                let outstanding = (sent - released) as usize;
+                b.observe(now, outstanding);
+                let (allowed, chunk) = match fixed {
+                    Some(f) => (outstanding + MIN_SEND_CHUNK <= f, MIN_SEND_CHUNK),
+                    None => {
+                        let chunk = b.chunk(now);
+                        (b.allows(now, outstanding, chunk), chunk)
+                    }
+                };
+                if !allowed && outstanding > 0 {
+                    break;
+                }
+                sent += chunk as f64;
+                b.sent(now, chunk);
+            }
+            if ms == 1000 {
+                left_at_1s = left;
+            }
+            if ms > 1000 {
+                waits.push(Duration::from_secs_f64((sent - left) / rate));
+            }
+        }
+        waits.sort();
+        ((left - left_at_1s) / f64::from(secs - 1), waits)
+    }
+
+    /// The path the 32 KB limit was too slow for: 50 ms, 50 Mb/s. The budget keeps it
+    /// full while a message waits ~30 ms behind file data; a flat 32 KB moved ~650 KB/s.
+    /// `--nocapture` prints the table.
+    #[test]
+    fn a_long_fast_path_is_kept_full_with_30_ms_of_queue() {
+        for (mbit, rtt_ms) in [(50.0, 50), (50.0, 10), (10.0, 50), (200.0, 20)] {
+            let rtt = Duration::from_millis(rtt_ms);
+            let (fast, waits) = run(mbit * 1e6, rtt, None);
+            let (flat, _) = run(mbit * 1e6, rtt, Some(MIN_QUEUED));
+            let pct = |p: usize| waits[(waits.len() - 1) * p / 100];
+            println!(
+                "{mbit:>3} Mb/s, {rtt_ms:>2} ms: {:.2} MB/s (flat 32 KB: {:.2} MB/s, link {:.2}); \
+                 a message waits median {:?}, p99 {:?}, worst {:?}",
+                fast / 1e6,
+                flat / 1e6,
+                mbit / 8.0,
+                pct(50),
+                pct(99),
+                waits.last().unwrap()
+            );
+            let link = mbit * 1e6 / 8.0;
+            let fills = (MAX_QUEUED as f64 / rtt.as_secs_f64()).min(link);
+            assert!(fast >= 0.85 * fills, "{fast:.0} B/s of {fills:.0}");
+            assert!(
+                pct(99) <= QUEUE_TIME + Duration::from_millis(10),
+                "{:?}",
+                pct(99)
+            );
+        }
+        let (fast, _) = run(50e6, Duration::from_millis(50), None);
+        assert!(fast > 5.0 * 650e3, "{fast:.0} B/s");
+        // Below ~5 Mb/s the 32 KB floor is more than a round trip plus 30 ms: messages
+        // wait for the floor's excess (the old flat 256 KB was 1 s at 2 Mb/s).
+        let (slow, waits) = run(2e6, Duration::from_millis(50), None);
+        println!(
+            "  2 Mb/s, 50 ms: {:.2} MB/s; a message waits median {:?}, worst {:?} (the 32 KB floor)",
+            slow / 1e6,
+            waits[waits.len() / 2],
+            waits.last().unwrap()
+        );
+        assert!(*waits.last().unwrap() < Duration::from_millis(150));
+    }
 }

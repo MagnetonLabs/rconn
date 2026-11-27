@@ -358,6 +358,102 @@ async fn a_100_mb_file_round_trips_both_ways_with_matching_sha256() {
     .expect("test timed out");
 }
 
+/// The main channel's round trip (ping to pong) during a large transfer each way, and
+/// how much file data a message on it could queue behind: on loopback the link is never
+/// the limit, so the bytes queued are what tells how long input would wait on a slow one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_messages_stay_prompt_during_a_large_transfer() {
+    tokio::time::timeout(Duration::from_secs(300), async {
+        let rig = rig(true, true).await;
+        let src = rig.viewer.path().join("large.bin");
+        noise_file(&src, 64 * MB);
+        std::fs::copy(&src, rig.host_root.path().join("large.bin")).unwrap();
+        let dc = rig.session.data.clone();
+        let dest = rig.viewer.path().join("dl");
+        for upload in [true, false] {
+            let progress = Progress::new();
+            let pings = async {
+                let mut out: Vec<(Duration, usize)> = Vec::new();
+                for n in 0u64.. {
+                    if progress.total() > 0 && progress.done() >= progress.total() {
+                        break;
+                    }
+                    let queued = rig.files.queued().await;
+                    let ping = DataMessage::Control(Control::Ping(n)).encode().unwrap();
+                    let sent = Instant::now();
+                    dc.send(BytesMut::from(&ping[..])).await.unwrap();
+                    loop {
+                        match dc.poll().await {
+                            Some(DataChannelEvent::OnMessage(m))
+                                if DataMessage::decode(&m.data).ok()
+                                    == Some(DataMessage::Control(Control::Pong(n))) =>
+                            {
+                                break;
+                            }
+                            Some(_) => {}
+                            None => return out,
+                        }
+                    }
+                    out.push((sent.elapsed(), queued));
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                out
+            };
+            let t = Instant::now();
+            let transfer = async {
+                if upload {
+                    rig.files.upload(&src, &progress).await.map(|_| ())
+                } else {
+                    rig.files
+                        .download("large.bin", &dest, &progress)
+                        .await
+                        .map(|_| ())
+                }
+            };
+            let (pings, done) = tokio::join!(pings, transfer);
+            done.unwrap();
+            let took = t.elapsed();
+            let mut rtts: Vec<Duration> = pings.iter().map(|p| p.0).collect();
+            rtts.sort();
+            let most_queued = pings.iter().map(|p| p.1).max().unwrap_or(0);
+            let pct = |p: usize| rtts[(rtts.len() - 1) * p / 100];
+            eprintln!(
+                "{}: 64 MB in {took:?} ({:.0} MB/s); {} pings, median {:?}, p95 {:?}, worst {:?}; \
+                 file data queued ahead of a ping: at most {} KB",
+                if upload { "upload" } else { "download" },
+                64.0 / took.as_secs_f64(),
+                rtts.len(),
+                pct(50),
+                pct(95),
+                rtts.last().unwrap(),
+                most_queued / 1024,
+            );
+            assert!(rtts.len() >= 5, "pings answered during the transfer");
+            assert!(
+                *rtts.last().unwrap() < Duration::from_millis(100),
+                "input waited behind file data: {:?}",
+                rtts.last()
+            );
+            // What was queued, at the rate it drained: how long a message waited behind it
+            // (in flight or not), within QUEUE_TIME and a little slack for measuring. (The
+            // viewer sees only its own channel: during a download the queue is the host's,
+            // and the ping's round trip is the measure.) A long, slow path cannot be made
+            // on loopback; the budget's own tests model one.
+            let rate = 64.0 * MB as f64 / took.as_secs_f64();
+            let behind = Duration::from_secs_f64(most_queued as f64 / rate);
+            eprintln!("  at most {behind:?} of file data ahead of a ping");
+            assert!(
+                behind <= rconn_peer::files::QUEUE_TIME + Duration::from_millis(15),
+                "input waited {behind:?} behind file data"
+            );
+        }
+        assert_eq!(sha256_of(&dest.join("large.bin")), sha256_of(&src));
+        rig.close().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_mid_transfer_removes_the_partial_file_on_both_sides() {
     tokio::time::timeout(Duration::from_secs(120), async {
@@ -477,6 +573,97 @@ async fn paths_outside_the_shared_folder_are_refused() {
                 "{name}"
             );
         }
+        rig.close().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// An upload goes into the folder the viewer names (the one its Files panel shows), with
+/// the same inside-the-root checks as listings and downloads; a plain name (viewers
+/// before 0.1.11) still goes to Downloads/Rconn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploads_land_in_the_chosen_folder_and_never_outside_the_root() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let rig = rig(true, true).await;
+        let root = rig.host_root.path();
+        std::fs::create_dir_all(root.join("Projects").join("Q3")).unwrap();
+        std::fs::write(root.join("inside.txt"), b"ok").unwrap();
+        let note = rig.viewer.path().join("plan.txt");
+        std::fs::write(&note, b"the plan").unwrap();
+        let up = |folder: Option<&str>| {
+            let (files, note, folder) = (&rig.files, note.clone(), folder.map(str::to_owned));
+            async move {
+                files
+                    .upload_into(&note, folder.as_deref(), &Progress::new())
+                    .await
+            }
+        };
+
+        // Into a subfolder, twice: never replacing a file there.
+        assert_eq!(
+            up(Some("Projects/Q3")).await.unwrap(),
+            "Projects/Q3/plan.txt"
+        );
+        assert_eq!(
+            up(Some("Projects\\Q3/")).await.unwrap(),
+            "Projects/Q3/plan (2).txt"
+        );
+        assert_eq!(
+            std::fs::read(root.join("Projects").join("Q3").join("plan.txt")).unwrap(),
+            b"the plan"
+        );
+        // Into the root.
+        assert_eq!(up(Some("")).await.unwrap(), "plan.txt");
+        // A plain name: the inbox, as before.
+        assert_eq!(up(None).await.unwrap(), "Downloads/Rconn/plan.txt");
+        assert_eq!(
+            rig.files.upload(&note, &Progress::new()).await.unwrap(),
+            "Downloads/Rconn/plan (2).txt"
+        );
+
+        let before = files_in(root);
+        for bad in [
+            "..",
+            "Projects/../..",
+            "../outside",
+            "/etc",
+            "C:\\Windows",
+            "\\\\server\\share",
+            "missing",
+            "inside.txt",
+        ] {
+            let err = up(Some(bad)).await.unwrap_err();
+            assert!(stopped(&err).is_none(), "{bad}: {err:#}");
+            assert!(
+                format!("{err:#}").contains("can't save into"),
+                "{bad}: {err:#}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
+            symlink(outside.path(), root.join("out")).unwrap();
+            symlink(root.join("Projects"), root.join("in")).unwrap();
+            let err = up(Some("out")).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("inside the shared folder"),
+                "{err:#}"
+            );
+            assert!(
+                files_in(outside.path()).is_empty(),
+                "nothing written outside"
+            );
+            // A link that stays inside is fine; the host says where it really went.
+            assert_eq!(up(Some("in")).await.unwrap(), "Projects/plan.txt");
+        }
+        let mut after = files_in(root);
+        after.retain(|n| n != "out" && n != "in");
+        assert_eq!(
+            after, before,
+            "nothing new at the root from the refused uploads"
+        );
         rig.close().await;
     })
     .await

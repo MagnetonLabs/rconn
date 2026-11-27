@@ -104,6 +104,7 @@ fn run(make_decoder: &dyn Fn() -> VideoDecoder, loss: Loss, busy: bool) -> Outco
                             need.data(now);
                         }
                         for au in rx.push(p) {
+                            need.frame(now);
                             match dec.decode(&au) {
                                 Ok(Some(f)) => {
                                     need.picture();

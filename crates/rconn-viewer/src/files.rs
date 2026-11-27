@@ -3,8 +3,10 @@
 //!
 //! The UI sends [`Cmd`]s to [`run`] on the session's runtime and reads [`State`] back. The
 //! file channel ([`FilesClient`]) opens on the first command, once the session is allowed
-//! in; downloads go to this computer's Downloads folder, uploads to the remote
-//! Downloads/Rconn. Both ends check every file's SHA-256.
+//! in; downloads go to this computer's Downloads folder, uploads into the remote folder
+//! the panel shows (it opens at the remote Downloads; hosts before 0.1.11, and uploads
+//! before any folder was shown, use the remote Downloads/Rconn). Both ends check every
+//! file's SHA-256.
 
 use egui::{Color32, RichText};
 use rconn_core::files::FileEntry;
@@ -19,11 +21,17 @@ use webrtc::peer_connection::PeerConnection;
 pub enum Cmd {
     /// Show this remote folder ("" is the shared root).
     List(String),
+    /// Show this remote folder, or the root if it can't be listed (where the panel opens).
+    Open(String),
     /// Copy this remote file into the local Downloads folder.
     Download(String),
-    /// Copy this local file to the remote computer.
-    Upload(PathBuf),
+    /// Copy this local file into this remote folder ("" the root; `None`: the remote
+    /// Downloads/Rconn).
+    Upload(PathBuf, Option<String>),
 }
+
+/// The remote folder the panel opens at.
+pub const START_DIR: &str = "Downloads";
 
 /// One transfer, as the panel shows it.
 pub struct Transfer {
@@ -92,8 +100,16 @@ pub async fn run(
             },
         };
         let (client, state, done) = (client.clone(), state.clone(), repaint.clone());
+        // Opening: a listing that falls back to the root.
+        let (cmd, fallback) = match cmd {
+            Cmd::Open(dir) => {
+                let fallback = !dir.is_empty();
+                (Cmd::List(dir), fallback)
+            }
+            other => (other, false),
+        };
         match cmd {
-            Cmd::List(dir) => {
+            Cmd::List(mut dir) | Cmd::Open(mut dir) => {
                 {
                     let mut s = state.lock().expect("files");
                     s.remote_dir.clone_from(&dir);
@@ -101,7 +117,23 @@ pub async fn run(
                     s.listing_error = None;
                 }
                 tokio::spawn(async move {
-                    let result = client.list(&dir).await;
+                    let mut result = client.list(&dir).await;
+                    if fallback && result.is_err() && client.refused().is_none() {
+                        // No such folder there: the root.
+                        let still_shown = {
+                            let mut s = state.lock().expect("files");
+                            let shown = s.remote_dir == dir;
+                            if shown {
+                                s.remote_dir.clear();
+                            }
+                            shown
+                        };
+                        if !still_shown {
+                            return;
+                        }
+                        dir.clear();
+                        result = client.list(&dir).await;
+                    }
                     let mut s = state.lock().expect("files");
                     if s.remote_dir == dir {
                         match result {
@@ -131,14 +163,16 @@ pub async fn run(
                     done();
                 });
             }
-            Cmd::Upload(local) => {
+            Cmd::Upload(local, folder) => {
                 let name = local
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let progress = start(&state, true, name);
                 tokio::spawn(async move {
-                    let result = client.upload(&local, &progress).await;
+                    let result = client
+                        .upload_into(&local, folder.as_deref(), &progress)
+                        .await;
                     finish(&state, &progress, result, &client);
                     done();
                 });
@@ -206,6 +240,16 @@ pub fn parent(dir: &str) -> String {
     }
 }
 
+/// Where an upload into `folder` lands, as the panel names remote folders: `~/Projects`,
+/// `~` for the root, the remote Downloads/Rconn for `None`.
+pub fn remote_place(folder: Option<&str>) -> String {
+    match folder {
+        None => "~/Downloads/Rconn".into(),
+        Some("") => "~".into(),
+        Some(f) => format!("~/{}", f.trim_end_matches('/')),
+    }
+}
+
 /// `dir/name` as a remote path.
 pub fn join(dir: &str, name: &str) -> String {
     if dir.is_empty() {
@@ -215,18 +259,72 @@ pub fn join(dir: &str, name: &str) -> String {
     }
 }
 
+/// A local folder entry: name, is a folder, size.
+type LocalEntry = (String, bool, u64);
+
+/// A local folder being read on its own thread (a network share or a folder of 100 000
+/// files must not stall the window, and with it the remote screen and input).
+struct LocalListing {
+    dir: PathBuf,
+    result: Arc<Mutex<Option<Vec<LocalEntry>>>>,
+}
+
+impl LocalListing {
+    fn start(dir: PathBuf, ctx: &egui::Context) -> Self {
+        let result = Arc::new(Mutex::new(None));
+        let (slot, ctx, path) = (result.clone(), ctx.clone(), dir.clone());
+        let spawned = std::thread::Builder::new()
+            .name("files-local-list".into())
+            .spawn(move || {
+                let listed = read_dir_sorted(&path);
+                *slot.lock().expect("local listing") = Some(listed);
+                ctx.request_repaint();
+            });
+        if spawned.is_err() {
+            *result.lock().expect("local listing") = Some(Vec::new());
+        }
+        Self { dir, result }
+    }
+}
+
+/// `dir`'s entries, folders first, then by name.
+fn read_dir_sorted(dir: &Path) -> Vec<LocalEntry> {
+    let mut v: Vec<LocalEntry> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let m = std::fs::metadata(e.path()).ok()?;
+                    Some((
+                        e.file_name().to_string_lossy().into_owned(),
+                        m.is_dir(),
+                        m.len(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
+    v
+}
+
 /// The panel's UI side, one per tab.
 pub struct Panel {
     pub open: bool,
     cmds: mpsc::UnboundedSender<Cmd>,
     pub state: Shared,
     local_dir: PathBuf,
-    /// The local folder's contents (name, is_dir, size), read when it changes.
-    local: Option<Vec<(String, bool, u64)>>,
+    /// The local folder's contents, once read (off the UI thread: [`LocalListing`]).
+    local: Option<Vec<LocalEntry>>,
+    local_listing: Option<LocalListing>,
     local_selected: std::collections::BTreeSet<String>,
     remote_selected: std::collections::BTreeSet<String>,
     /// Listed at least once since the panel opened.
     listed: bool,
+    /// Opened at least once (the first time, it opens at [`START_DIR`]).
+    opened: bool,
 }
 
 impl Panel {
@@ -239,9 +337,11 @@ impl Panel {
                 .map(|d| d.home_dir().to_path_buf())
                 .unwrap_or_else(std::env::temp_dir),
             local: None,
+            local_listing: None,
             local_selected: Default::default(),
             remote_selected: Default::default(),
             listed: false,
+            opened: false,
         }
     }
 
@@ -260,11 +360,20 @@ impl Panel {
             .count()
     }
 
-    /// Send files dropped on the window; returns how many.
+    /// The remote folder uploads go to: the one the right-hand pane shows, once it has
+    /// been listed; until then (or if it can't be), `None`: the remote Downloads/Rconn.
+    pub fn upload_folder(&self) -> Option<String> {
+        let s = self.state.lock().expect("files");
+        (s.entries.is_some() && s.listing_error.is_none() && s.unavailable.is_none())
+            .then(|| s.remote_dir.clone())
+    }
+
+    /// Send files dropped on the window (into [`Self::upload_folder`]); returns how many.
     pub fn upload(&mut self, paths: Vec<PathBuf>) -> usize {
         let n = paths.len();
+        let folder = self.upload_folder();
         for p in paths {
-            self.send(Cmd::Upload(p));
+            self.send(Cmd::Upload(p, folder.clone()));
         }
         if n > 0 {
             self.open = true;
@@ -278,29 +387,21 @@ impl Panel {
         self.send(Cmd::List(dir));
     }
 
-    fn read_local(&mut self) -> &[(String, bool, u64)] {
+    /// The local folder's contents; `None` while they are being read.
+    fn read_local(&mut self, ctx: &egui::Context) -> Option<&[LocalEntry]> {
         if self.local.is_none() {
-            let mut v: Vec<(String, bool, u64)> = std::fs::read_dir(&self.local_dir)
-                .map(|rd| {
-                    rd.flatten()
-                        .filter_map(|e| {
-                            let m = std::fs::metadata(e.path()).ok()?;
-                            Some((
-                                e.file_name().to_string_lossy().into_owned(),
-                                m.is_dir(),
-                                m.len(),
-                            ))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            v.sort_by(|a, b| {
-                b.1.cmp(&a.1)
-                    .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-            });
-            self.local = Some(v);
+            match &self.local_listing {
+                Some(l) if l.dir == self.local_dir => {
+                    let done = l.result.lock().expect("local listing").take();
+                    if done.is_some() {
+                        self.local = done;
+                        self.local_listing = None;
+                    }
+                }
+                _ => self.local_listing = Some(LocalListing::start(self.local_dir.clone(), ctx)),
+            }
         }
-        self.local.as_deref().unwrap_or_default()
+        self.local.as_deref()
     }
 
     fn set_local_dir(&mut self, dir: PathBuf) {
@@ -314,7 +415,12 @@ impl Panel {
         if !self.open {
             return None;
         }
-        if !self.listed {
+        if !self.opened {
+            self.opened = true;
+            self.listed = true;
+            self.remote_selected.clear();
+            self.send(Cmd::Open(START_DIR.into()));
+        } else if !self.listed {
             let dir = self.state.lock().expect("files").remote_dir.clone();
             self.list_remote(dir);
         }
@@ -341,9 +447,10 @@ impl Panel {
             );
             ui.separator();
         }
+        let to = remote_place(self.upload_folder().as_deref());
         ui.label(
             RichText::new(format!(
-                "Drop files on the window to send them to {computer} (they land in Downloads/Rconn there). Downloads go to {}.",
+                "Files you send or drop on the window go to {to} on {computer}: the folder shown on the right. Downloads go to {}.",
                 downloads_dir().display()
             ))
             .color(Color32::GRAY)
@@ -351,14 +458,14 @@ impl Panel {
         );
         ui.add_space(4.0);
         ui.columns(2, |cols| {
-            self.local_pane(&mut cols[0]);
+            self.local_pane(&mut cols[0], computer);
             self.remote_pane(&mut cols[1], computer, unavailable.is_some());
         });
         ui.separator();
         self.transfers(ui);
     }
 
-    fn local_pane(&mut self, ui: &mut egui::Ui) {
+    fn local_pane(&mut self, ui: &mut egui::Ui, computer: &str) {
         ui.strong("💻 This computer");
         ui.horizontal(|ui| {
             if ui
@@ -379,13 +486,17 @@ impl Panel {
             );
         });
         let mut enter = None;
-        let entries = self.read_local().to_vec();
+        let entries = self.read_local(ui.ctx()).map(<[_]>::to_vec);
         egui::ScrollArea::vertical()
             .id_salt("local-files")
             .max_height(220.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (name, is_dir, size) in &entries {
+                let Some(entries) = &entries else {
+                    ui.spinner();
+                    return;
+                };
+                for (name, is_dir, size) in entries {
                     ui.horizontal(|ui| {
                         if *is_dir {
                             if ui.selectable_label(false, format!("📁 {name}")).clicked() {
@@ -410,9 +521,12 @@ impl Panel {
             self.set_local_dir(dir);
         }
         let n = self.local_selected.len();
+        let to = remote_place(self.upload_folder().as_deref());
         if ui
             .add_enabled(n > 0, egui::Button::new(format!("Send {n} ➡")))
-            .on_hover_text("Copy the selected files to the remote computer's Downloads/Rconn")
+            .on_hover_text(format!(
+                "Copy the selected files to {to} on {computer} (the folder shown on the right)"
+            ))
             .clicked()
         {
             let paths: Vec<PathBuf> = std::mem::take(&mut self.local_selected)
@@ -583,5 +697,86 @@ mod tests {
         assert_eq!(parent(""), "");
         assert_eq!(join("", "a.txt"), "a.txt");
         assert_eq!(join("Documents", "a.txt"), "Documents/a.txt");
+        assert_eq!(
+            remote_place(Some("Documents/Reports")),
+            "~/Documents/Reports"
+        );
+        assert_eq!(remote_place(Some("")), "~");
+        assert_eq!(remote_place(None), "~/Downloads/Rconn");
+    }
+
+    /// Uploads go to the folder the right-hand pane shows, once it is listed; the panel
+    /// opens at the remote Downloads.
+    #[test]
+    fn uploads_follow_the_folder_shown() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Shared::default();
+        let mut panel = Panel::new(tx, state.clone());
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            panel.open = true;
+            panel.show(ctx, "pc");
+        });
+        out.textures_delta.clear();
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Open(d)) if d == START_DIR));
+        // Nothing listed yet: the inbox.
+        panel.upload(vec!["a.txt".into()]);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Upload(_, None))));
+        {
+            let mut s = state.lock().unwrap();
+            s.remote_dir = "Downloads".into();
+            s.entries = Some(Vec::new());
+        }
+        panel.upload(vec!["a.txt".into()]);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Upload(_, Some(d))) if d == "Downloads"));
+        {
+            let mut s = state.lock().unwrap();
+            s.remote_dir = String::new();
+        }
+        panel.upload(vec!["a.txt".into()]);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Upload(_, Some(d))) if d.is_empty()));
+        state.lock().unwrap().listing_error = Some("no such folder".into());
+        panel.upload(vec!["a.txt".into()]);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Upload(_, None))));
+    }
+
+    /// The local pane's folder is read on its own thread: the first frame shows a
+    /// spinner instead of waiting for the disk, a later one the entries.
+    #[test]
+    fn the_local_folder_is_read_off_the_ui_thread() {
+        let dir = std::env::temp_dir().join(format!("rconn-local-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Sub")).unwrap();
+        std::fs::write(dir.join("b.txt"), b"bb").unwrap();
+        std::fs::write(dir.join("A.txt"), b"a").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut panel = Panel::new(tx, Shared::default());
+        panel.set_local_dir(dir.clone());
+        let ctx = egui::Context::default();
+        let started = std::time::Instant::now();
+        let mut listed = panel.read_local(&ctx).map(<[_]>::to_vec);
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        while listed.is_none() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "never listed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            listed = panel.read_local(&ctx).map(<[_]>::to_vec);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // Folders first, then by name; a folder's size is whatever the OS says.
+        let got: Vec<(String, bool, Option<u64>)> = listed
+            .unwrap()
+            .into_iter()
+            .map(|(n, d, s)| (n, d, (!d).then_some(s)))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Sub".to_owned(), true, None),
+                ("A.txt".to_owned(), false, Some(1)),
+                ("b.txt".to_owned(), false, Some(2)),
+            ]
+        );
     }
 }

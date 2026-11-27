@@ -16,14 +16,18 @@
 //!
 //! * **Delay:** trendline filter over 5 ms send groups (20-group window, adaptive
 //!   threshold 6-600), libwebrtc's constants.
-//! * **Backoff base:** 0.85 x the delivered rate, where "delivered" is the larger of the
-//!   acknowledged rate and the rate packet *trains* (packets the pacer sent back-to-back)
-//!   arrived at. A keyframe is such a train, so a burst measures the link instead of
-//!   collapsing the estimate to what an idle screen happened to send.
+//! * **Backoff base:** 0.85 x a rate that measured the link, never more than half the
+//!   estimate per backoff. Measured means: the acknowledged rate while the network
+//!   delivered clearly less than was sent (a queue grew), or the rate a packet *train*
+//!   (packets the pacer sent back-to-back: a keyframe, an update) arrived at, taken from
+//!   its median packet gap so a receiver that stalled mid-train (a busy viewer or VM
+//!   stamping a bunch of packets late) does not read as a slow link. A rate measured
+//!   while application-limited (all that was sent arrived) says nothing about capacity.
 //! * **ALR (application-limited region):** detected with an interval budget at 65 % of the
 //!   estimate (enter above 80 % unused, leave below 50 %). While application-limited the
-//!   estimate neither grows past 1.5 x the delivered rate nor backs off to it: an overuse
-//!   signal without a fresh train costs 15 %, not 85 % of the estimate.
+//!   estimate never grows past 1.5 x the delivered rate, and an overuse signal that no
+//!   measurement backs is held, not cut: jitter on a screen sending 0.3 Mb/s once took a
+//!   25 Mb/s estimate to 1.5. A link that really shrank shows at the next burst.
 //! * **Loss:** libwebrtc's classic rule (< 2 % may grow, 2-10 % hold, > 10 % cut by half
 //!   the loss fraction).
 //! * **Large-drop recovery:** after a drop to <= 66 % of the recent peak, once delay has
@@ -62,6 +66,12 @@ const BETA: f64 = 0.85;
 const INCREASE_PER_SECOND: f64 = 1.08;
 const RATE_WINDOW: Duration = Duration::from_millis(500);
 const TRAIN_MIN_PACKETS: usize = 8;
+/// Below this share of the send rate, what arrived measures the link (a queue grew)...
+const LINK_LIMITED: f64 = 0.8;
+/// ...if it also grew by at least this much: more than jitter does.
+const LINK_LIMITED_GROWTH: Duration = Duration::from_millis(50);
+/// A backoff not backed by a queue that grew never takes more than half the estimate.
+const MAX_CUT: f64 = 0.5;
 const TRAIN_MAX_AGE: Duration = Duration::from_secs(1);
 
 const ALR_USAGE: f64 = 0.65;
@@ -315,10 +325,11 @@ pub struct Bwe {
     last_decrease: Option<Instant>,
     /// Exponentially averaged delivered rate at backoffs: the link's known ceiling.
     capacity: Option<f64>,
-    /// Arrived packets (remote arrival time, bytes), newest last.
-    arrivals: VecDeque<(Duration, usize)>,
-    /// Rates packet trains arrived at, with when they were measured.
-    trains: VecDeque<(Instant, f64)>,
+    /// Arrived packets (remote arrival time, departure, bytes), newest last.
+    arrivals: VecDeque<(Duration, Instant, usize)>,
+    /// Packet trains: when measured, the rate first to last packet arrived at, and the
+    /// rate from the median packet gap.
+    trains: VecDeque<(Instant, f64, f64)>,
     alr: Alr,
     /// (when, packets, lost) per report batch.
     loss_window: VecDeque<(Instant, usize, usize)>,
@@ -392,27 +403,70 @@ impl Bwe {
     }
 
     fn acked_rate(&self, window: Duration) -> Option<f64> {
-        let (newest, _) = *self.arrivals.back()?;
-        let (oldest, _) = *self.arrivals.front()?;
+        let (newest, _, _) = *self.arrivals.back()?;
+        let (oldest, _, _) = *self.arrivals.front()?;
         let span = newest
             .saturating_sub(oldest)
             .clamp(Duration::from_millis(100), window);
         let bytes: usize = self
             .arrivals
             .iter()
-            .filter(|&&(a, _)| newest.saturating_sub(a) <= window)
-            .map(|(_, b)| b)
+            .filter(|&&(a, _, _)| newest.saturating_sub(a) <= window)
+            .map(|(_, _, b)| b)
             .sum();
         Some(bytes as f64 * 8.0 / span.as_secs_f64())
     }
 
-    /// Median of the trains measured within `window`.
+    /// Did the packets that arrived within `window` arrive clearly slower than they were
+    /// sent? Then a queue grew, and their arrival rate is the link's. If they arrived
+    /// about as fast as they left, the sender was the limit and the rate says nothing.
+    fn link_limited(&self, window: Duration) -> bool {
+        let Some(&(newest, _, _)) = self.arrivals.back() else {
+            return false;
+        };
+        let recent: Vec<_> = self
+            .arrivals
+            .iter()
+            .filter(|&&(a, _, _)| newest.saturating_sub(a) <= window)
+            .collect();
+        let (Some(&&(first_arrival, d0, _)), true) = (recent.first(), recent.len() >= 10) else {
+            return false;
+        };
+        let (sent_from, sent_to) = recent
+            .iter()
+            .fold((d0, d0), |(a, b), &&(_, d, _)| (a.min(d), b.max(d)));
+        // Short spans are all jitter.
+        let floor = Duration::from_millis(100);
+        let arrived = newest.saturating_sub(first_arrival).max(floor);
+        let sent = sent_to.duration_since(sent_from).max(floor);
+        sent.as_secs_f64() < LINK_LIMITED * arrived.as_secs_f64()
+            && arrived.saturating_sub(sent) >= LINK_LIMITED_GROWTH
+    }
+
+    /// Median of the trains measured within `window` (first to last packet).
     fn train_rate(&self, now: Instant, window: Duration) -> Option<f64> {
+        self.median_train(now, window, |span, _| span)
+    }
+
+    /// What recent trains say the link carries at least: per train the larger of its
+    /// first-to-last rate and its median-gap rate, so neither a receiver that stalled
+    /// mid-train (one long gap) nor jitter that bunched packets makes a fast link look
+    /// slow. Through a real bottleneck both are the link's rate. Median over trains.
+    fn train_capacity(&self, now: Instant, window: Duration) -> Option<f64> {
+        self.median_train(now, window, f64::max)
+    }
+
+    fn median_train(
+        &self,
+        now: Instant,
+        window: Duration,
+        rate: impl Fn(f64, f64) -> f64,
+    ) -> Option<f64> {
         let mut r: Vec<f64> = self
             .trains
             .iter()
-            .filter(|&&(t, _)| now.saturating_duration_since(t) <= window)
-            .map(|&(_, r)| r)
+            .filter(|&&(t, _, _)| now.saturating_duration_since(t) <= window)
+            .map(|&(_, span, gap)| rate(span, gap))
             .collect();
         if r.is_empty() {
             return None;
@@ -425,13 +479,24 @@ impl Bwe {
         let mut sent_bits = 0.0;
         let pacing = self.estimate * PACING_FACTOR;
         let mut train: Vec<&PacketReport> = Vec::new();
-        let finish = |train: &mut Vec<&PacketReport>, trains: &mut VecDeque<(Instant, f64)>| {
+        let finish = |train: &mut Vec<&PacketReport>,
+                      trains: &mut VecDeque<(Instant, f64, f64)>| {
             if train.len() >= TRAIN_MIN_PACKETS
                 && let (Some(a), Some(b)) = (train[0].arrival, train[train.len() - 1].arrival)
                 && b > a + Duration::from_millis(2)
             {
                 let bytes: usize = train[1..].iter().map(|r| r.size).sum();
-                trains.push_back((now, bytes as f64 * 8.0 / (b - a).as_secs_f64()));
+                let span = bytes as f64 * 8.0 / (b - a).as_secs_f64();
+                // Packets a stalled receiver stamped late arrive as one bunch after one
+                // long gap; through a bottleneck the gaps are even.
+                let mut gaps: Vec<Duration> = train
+                    .windows(2)
+                    .filter_map(|w| Some(w[1].arrival?.saturating_sub(w[0].arrival?)))
+                    .collect();
+                gaps.sort();
+                let gap = gaps[gaps.len() / 2].max(Duration::from_micros(50));
+                let per_packet = bytes as f64 * 8.0 / (train.len() - 1) as f64;
+                trains.push_back((now, span, per_packet / gap.as_secs_f64()));
             }
             train.clear();
         };
@@ -442,7 +507,7 @@ impl Bwe {
                 continue;
             };
             self.trend.packet(r.departure, arrival);
-            self.arrivals.push_back((arrival, r.size));
+            self.arrivals.push_back((arrival, r.departure, r.size));
             // Back-to-back at the pacer: the gap one packet takes at the pacing rate,
             // with slack.
             let gap_limit =
@@ -456,11 +521,11 @@ impl Bwe {
             train.push(r);
         }
         finish(&mut train, &mut self.trains);
-        if let Some(&(newest, _)) = self.arrivals.back() {
+        if let Some(&(newest, _, _)) = self.arrivals.back() {
             while self
                 .arrivals
                 .front()
-                .is_some_and(|&(a, _)| newest.saturating_sub(a) > RATE_WINDOW)
+                .is_some_and(|&(a, _, _)| newest.saturating_sub(a) > RATE_WINDOW)
             {
                 self.arrivals.pop_front();
             }
@@ -468,7 +533,7 @@ impl Bwe {
         while self
             .trains
             .front()
-            .is_some_and(|&(t, _)| now.saturating_duration_since(t) > TRAIN_MAX_AGE)
+            .is_some_and(|&(t, _, _)| now.saturating_duration_since(t) > TRAIN_MAX_AGE)
         {
             self.trains.pop_front();
         }
@@ -544,23 +609,40 @@ impl Bwe {
                 {
                     // Already cut for this episode.
                 } else {
-                    let fresh_train = self.train_rate(now, DECREASE_WINDOW).is_some();
+                    let train = self.train_capacity(now, DECREASE_WINDOW);
                     let delivered = self.delivered(now, DECREASE_WINDOW);
-                    let target = match delivered {
-                        Some(d) if fresh_train || !self.alr.active => BETA * d,
-                        // Application-limited, nothing measured the link lately: what was
-                        // delivered says nothing about capacity.
-                        _ => BETA * self.estimate,
+                    // What measured the link, if anything did.
+                    let queue_grew = self.link_limited(DECREASE_WINDOW);
+                    let measured = if queue_grew || !self.alr.active {
+                        // Less arrived than was sent: the link's rate. Or sending about
+                        // what the estimate allows, and it all arrived: the link is
+                        // about full.
+                        delivered
+                    } else {
+                        // Application-limited: only a burst that arrived slower than the
+                        // estimate allows measured the link. Otherwise what arrived is
+                        // what was sent: hold; a link that really shrank shows at the
+                        // next burst.
+                        train.filter(|&t| t < self.estimate)
                     };
-                    if target < self.estimate {
-                        if let Some(d) = delivered.filter(|_| fresh_train || !self.alr.active) {
+                    if let Some(d) = measured {
+                        // Only a queue that grew may cut deeper than half at once (the
+                        // link really shrank: waiting a round trip per halving would
+                        // leave the queue standing for seconds).
+                        let floor = if queue_grew {
+                            0.0
+                        } else {
+                            MAX_CUT * self.estimate
+                        };
+                        let target = (BETA * d).max(floor);
+                        if target < self.estimate {
                             // Averaged, but a sample far below means the link changed.
                             self.capacity = Some(match self.capacity {
                                 Some(c) if d >= 0.7 * c => 0.95 * c + 0.05 * d,
                                 _ => d,
                             });
+                            self.estimate = target;
                         }
-                        self.estimate = target;
                     }
                     self.last_change = Some(now);
                     self.last_decrease = Some(now);
@@ -748,6 +830,8 @@ mod tests {
             capacity: Box::new(move |_| link),
             one_way: Duration::from_millis(20),
             loss: 0.0,
+            jitter: Duration::ZERO,
+            stalls: vec![],
             content: Box::new(|t| {
                 if t < 8.0 {
                     Content::Busy
@@ -787,6 +871,8 @@ mod tests {
             }),
             one_way: Duration::from_millis(20),
             loss: 0.0,
+            jitter: Duration::ZERO,
+            stalls: vec![],
             content: Box::new(|_| Content::Busy),
             keyframes: vec![],
             start_bps: 8.0 * MB,
@@ -821,6 +907,8 @@ mod tests {
             capacity: Box::new(|_| 10.0 * MB),
             one_way: Duration::from_millis(20),
             loss,
+            jitter: Duration::ZERO,
+            stalls: vec![],
             content: Box::new(|_| Content::Busy),
             keyframes: vec![],
             start_bps: 8.0 * MB,
@@ -841,6 +929,8 @@ mod tests {
             capacity: Box::new(|_| 20.0 * MB),
             one_way: Duration::from_millis(10),
             loss: 0.0,
+            jitter: Duration::ZERO,
+            stalls: vec![],
             content: Box::new(|_| Content::Busy),
             keyframes: vec![],
             start_bps: 8.0 * MB,
@@ -851,6 +941,107 @@ mod tests {
         println!("reaches 15 Mb/s after {t:?} s");
         assert!(t.is_some_and(|t| t <= 15.0));
         assert!(new.max_queue_between(20.0, 30.0) < 100.0);
+    }
+
+    /// What the logs showed (21354 -> 437 kb/s, 25000 -> 1489 kb/s while sending
+    /// 0.2-0.5 Mb/s): an application-limited screen (typing, a small update each second)
+    /// on a fast link whose packets arrive with jitter. Nothing is congested, so the
+    /// estimate must not collapse to what the screen happened to send.
+    #[test]
+    fn an_application_limited_jittered_stream_keeps_the_estimate() {
+        let start = 20.0 * MB;
+        let s = Scenario {
+            seconds: 40,
+            capacity: Box::new(|_| 50.0 * MB),
+            one_way: Duration::from_millis(15),
+            loss: 0.0,
+            jitter: Duration::from_millis(10),
+            // The viewer stops reading for 120 ms every 2.5 s, now and then just as an
+            // update arrives: that update's train seems to arrive at ~2 Mb/s.
+            stalls: (0..16)
+                .map(|k| (1.0 + 2.5 * k as f64 + 0.017, 0.12))
+                .collect(),
+            content: Box::new(|_| Content::Trickle(1500)),
+            // A 30 KB update every second: a train of 25 packets.
+            keyframes: (1..40).map(|t| (t as f64, 30_000)).collect(),
+            start_bps: start,
+        };
+        let new = run(bwe(start), &s, NEW);
+        print("new", &new);
+        let low = new.min_between(2.0, 40.0);
+        println!(
+            "app-limited, jitter and read stalls: lowest estimate {:.2} Mb/s ({:.0}% of the start)",
+            low / MB,
+            low / start * 100.0
+        );
+        assert!(
+            low >= 0.5 * start,
+            "collapsed without congestion: {:.2} Mb/s",
+            low / MB
+        );
+    }
+
+    /// The other side of the above: a link that really shrinks (20 -> 2 Mb/s) is followed
+    /// within about a second: under a busy screen, with and without jitter, and under an
+    /// application-limited one (typing, a 100 KB update each second) whose viewer stalls
+    /// now and then, where the next update's train shows the new link.
+    #[test]
+    fn a_real_capacity_drop_is_followed_within_a_second() {
+        let stalls: Vec<(f64, f64)> = (0..8)
+            .map(|k| (1.0 + 2.5 * k as f64 + 0.017, 0.12))
+            .collect();
+        let cases = [
+            ("busy", Duration::ZERO, vec![], Content::Busy, vec![]),
+            (
+                "busy, 20 ms jitter",
+                Duration::from_millis(20),
+                vec![],
+                Content::Busy,
+                vec![],
+            ),
+            (
+                "application-limited, jitter, stalls",
+                Duration::from_millis(10),
+                stalls,
+                Content::Trickle(1500),
+                (1..20).map(|t| (t as f64, 100_000)).collect(),
+            ),
+        ];
+        for (name, jitter, stalls, content, keyframes) in cases {
+            let s = Scenario {
+                seconds: 20,
+                capacity: Box::new(|t| if t < 10.0 { 20.0 * MB } else { 2.0 * MB }),
+                one_way: Duration::from_millis(15),
+                loss: 0.0,
+                jitter,
+                stalls,
+                content: Box::new(move |_| content),
+                keyframes,
+                start_bps: 15.0 * MB,
+            };
+            let new = run(bwe(s.start_bps), &s, NEW);
+            print("new", &new);
+            let before = new.at(9.9);
+            let followed = new.below(10.0, 2.5 * MB).map(|t| t - 10.0);
+            println!(
+                "{name}: {:.1} Mb/s before, at or below 2.5 Mb/s {followed:?} s after the drop, worst queue after 12 s {:.0} ms",
+                before / MB,
+                new.max_queue_between(12.0, 20.0)
+            );
+            assert!(
+                before >= 12.0 * MB,
+                "{name}: converged to {:.1}",
+                before / MB
+            );
+            assert!(
+                followed.is_some_and(|d| d <= 1.2),
+                "{name}: slow to follow a real drop: {followed:?}"
+            );
+            assert!(
+                new.max_queue_between(12.0, 20.0) < 200.0,
+                "{name}: queue left standing"
+            );
+        }
     }
 
     #[test]

@@ -818,15 +818,25 @@ async fn session(
                         stages.host(t.host_us);
                         rx.set_early_after_gaps(true);
                         if integrity.frame(t) == rconn_peer::frames::Verdict::Skip {
-                            continue; // builds on a lost frame: wait for the repair
+                            // Builds on a lost frame: wait for the repair. While the host
+                            // has been told (a loss report), its repair is what fixes
+                            // this, not a keyframe on top.
+                            if !integrity.awaiting_repair() {
+                                need.frame(Instant::now());
+                            }
+                            continue;
                         }
                     }
                     None if integrity.active() => {
                         integrity.untagged();
+                        if !integrity.awaiting_repair() {
+                            need.frame(Instant::now());
+                        }
                         continue;
                     }
                     None => {}
                 }
+                need.frame(Instant::now());
                 let (bits, ops) = copyrect::split_in(codec, &au);
                 match dec.decode(&bits) {
                     Ok(Some(mut f)) => {
@@ -1644,7 +1654,11 @@ impl ViewerApp {
                 ui.painter().text(
                     area.center(),
                     egui::Align2::CENTER_CENTER,
-                    format!("Drop to send to {} (Downloads/Rconn)", self.name),
+                    format!(
+                        "Drop to send to {} ({})",
+                        self.name,
+                        crate::files::remote_place(self.files.upload_folder().as_deref())
+                    ),
                     egui::FontId::proportional(22.0),
                     Color32::WHITE,
                 );

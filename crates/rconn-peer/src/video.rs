@@ -8,8 +8,9 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 pub use rconn_core::codec::VideoCodec;
 use rtc::interceptor::{
-    BandwidthEstimator, CongestionControlBuilder, EstimatorStats, PacerBuilder, PacketReport,
-    Registry, Slot, TwccReceiverBuilder, TwccSenderBuilder,
+    BandwidthEstimator, CongestionControlBuilder, EstimatorStats, Interceptor, PacerBuilder,
+    PacerInterceptor, PacketReport, Registry, Slot, StreamInfo, TaggedPacket, TwccReceiverBuilder,
+    TwccSenderBuilder,
 };
 use rtc::media::Sample;
 use rtc::media::io::sample_builder::SampleBuilder;
@@ -92,10 +93,110 @@ pub const MAX_BITRATE_BPS: f64 = 25_000_000.0;
 pub const ENCODER_SHARE: f64 = 0.9;
 /// What sound takes of the estimate (Opus at its usual rate), bits/s.
 const AUDIO_BPS: f64 = 64_000.0;
-/// The most the pacer sends back-to-back, bits: four full packets. `rtc`'s default is
-/// 100 ms of the rate, a line-rate burst of ~125 KB at 10 Mb/s after any idle moment,
-/// which the bottleneck queues and the delay detector reads as congestion.
-pub const PACER_BURST_BITS: f64 = 4.0 * 1200.0 * 8.0;
+/// The least the pacer may send back-to-back, bits: four full packets.
+pub const PACER_MIN_BURST_BITS: f64 = 4.0 * 1200.0 * 8.0;
+/// The pacer's burst in time at its rate (see [`pacer_burst_bits`]).
+pub const PACER_BURST_TIME: Duration = Duration::from_millis(20);
+
+/// How much the pacer may send back-to-back at `pacing_bps`: 20 ms of the rate, at least
+/// four packets.
+///
+/// `rtc`'s default is 100 ms of the rate: a line-rate burst of ~125 KB at 10 Mb/s after
+/// any idle moment, which the bottleneck queues and the delay detector reads as
+/// congestion. 0.1.6-0.1.10 used four packets flat, which caps the rate at four packets
+/// per wake-up of the driver: on a host whose timers tick every 15.6 ms (Windows by
+/// default) that is ~2.5 Mb/s whatever the estimate, and a 500 KB keyframe took 1.6 s.
+pub fn pacer_burst_bits(pacing_bps: f64) -> f64 {
+    (pacing_bps * PACER_BURST_TIME.as_secs_f64()).max(PACER_MIN_BURST_BITS)
+}
+
+/// `rtc`'s pacer with its burst following the rate ([`pacer_burst_bits`]); its own
+/// burst, once configured, is fixed.
+struct Pacer {
+    inner: PacerInterceptor,
+    /// The rate the burst was last set for.
+    burst_for: f64,
+}
+
+impl Pacer {
+    fn new(pacing_bps: f64) -> Self {
+        Self {
+            inner: PacerBuilder::new()
+                .with_target_bitrate(pacing_bps)
+                .with_burst_bits(pacer_burst_bits(pacing_bps))
+                .build(),
+            burst_for: pacing_bps,
+        }
+    }
+
+    /// Re-derive the burst after the rate changed.
+    fn follow_rate(&mut self) {
+        let rate = self.inner.pacer().target_bitrate();
+        if rate != self.burst_for {
+            let bucket = self
+                .inner
+                .pacer()
+                .clone()
+                .with_burst_bits(pacer_burst_bits(rate));
+            *self.inner.pacer_mut() = bucket;
+            self.burst_for = rate;
+        }
+    }
+}
+
+impl rtc::sansio::Protocol<TaggedPacket, TaggedPacket, ()> for Pacer {
+    type Rout = TaggedPacket;
+    type Wout = TaggedPacket;
+    type Eout = ();
+    type Error = rtc::shared::error::Error;
+    type Time = Instant;
+
+    fn handle_read(&mut self, msg: TaggedPacket) -> Result<(), Self::Error> {
+        // The estimate reaches the pacer on the read leg (see `PacerInterceptor`).
+        let r = self.inner.handle_read(msg);
+        self.follow_rate();
+        r
+    }
+    fn poll_read(&mut self) -> Option<TaggedPacket> {
+        self.inner.poll_read()
+    }
+    fn handle_write(&mut self, msg: TaggedPacket) -> Result<(), Self::Error> {
+        self.inner.handle_write(msg)
+    }
+    fn poll_write(&mut self) -> Option<TaggedPacket> {
+        self.inner.poll_write()
+    }
+    fn handle_event(&mut self, evt: ()) -> Result<(), Self::Error> {
+        self.inner.handle_event(evt)
+    }
+    fn poll_event(&mut self) -> Option<()> {
+        self.inner.poll_event()
+    }
+    fn handle_timeout(&mut self, now: Instant) -> Result<(), Self::Error> {
+        self.inner.handle_timeout(now)
+    }
+    fn poll_timeout(&mut self) -> Option<Instant> {
+        self.inner.poll_timeout()
+    }
+    fn close(&mut self) -> Result<(), Self::Error> {
+        self.inner.close()
+    }
+}
+
+impl Interceptor for Pacer {
+    fn bind_local_stream(&mut self, info: &StreamInfo) {
+        self.inner.bind_local_stream(info);
+    }
+    fn unbind_local_stream(&mut self, info: &StreamInfo) {
+        self.inner.unbind_local_stream(info);
+    }
+    fn bind_remote_stream(&mut self, info: &StreamInfo) {
+        self.inner.bind_remote_stream(info);
+    }
+    fn unbind_remote_stream(&mut self, info: &StreamInfo) {
+        self.inner.unbind_remote_stream(info);
+    }
+}
 /// How often the viewer reports arrivals (`rtc`'s default is 100 ms).
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -370,15 +471,9 @@ pub fn media_stack(extra: &[VideoCodec]) -> Result<(MediaEngine, Registry, Targe
             CongestionControlBuilder::new(estimator).build(),
         )
         .with(Slot::TwccSender, TwccSenderBuilder::new().build())
-        .with(
-            Slot::Pacer,
-            // Start at the starting estimate, not `rtc`'s 1 Mb/s: the first keyframe goes
-            // out before any feedback.
-            PacerBuilder::new()
-                .with_target_bitrate(pacing)
-                .with_burst_bits(PACER_BURST_BITS)
-                .build(),
-        )
+        // Start at the starting estimate, not `rtc`'s 1 Mb/s: the first keyframe goes out
+        // before any feedback.
+        .with(Slot::Pacer, Pacer::new(pacing))
         .with(
             Slot::TwccReceiver,
             TwccReceiverBuilder::new()
@@ -723,7 +818,8 @@ impl VideoReceiver {
 /// How long the viewer waits for a missing packet before giving up on its frame.
 pub const LOSS_GIVE_UP: Duration = Duration::from_millis(250);
 
-/// Video arriving without a picture for this long: ask for a keyframe.
+/// Complete frames without a picture for this long, or video data that stopped this long
+/// without a picture: ask for a keyframe.
 pub const STALL: Duration = Duration::from_secs(1);
 /// Requests after a picture came: at most this often (each costs a full-size encode).
 const RETRY_AFTER_PICTURE: Duration = Duration::from_millis(300);
@@ -732,16 +828,23 @@ const RETRY_AFTER_PICTURE: Duration = Duration::from_millis(300);
 const RETRY_MAX: Duration = Duration::from_secs(4);
 
 /// When the viewer asks the host for a keyframe: after lost packets or a decode error,
-/// and whenever video keeps arriving with no picture coming out of it. Some decoders say
-/// nothing when a picture can't be made (VideoToolbox, given frames that build on a
-/// keyframe it never saw, returns no error and no picture), so a lost keyframe after the
-/// host changed screen size froze the picture for good: nothing ever asked for another.
+/// and whenever video keeps coming with no picture out of it. Some decoders say nothing
+/// when a picture can't be made (VideoToolbox, given frames that build on a keyframe it
+/// never saw, returns no error and no picture), so a lost keyframe after the host changed
+/// screen size froze the picture for good: nothing ever asked for another.
+///
+/// "No picture" is timed from the first *complete* frame that gave none, or from the
+/// last packet when packets stop without one (a keyframe that lost a packet on a still
+/// screen): not from the first packet. A full-size keyframe can take more than a second
+/// to arrive, and asking for another while it does only queued more of them.
 #[derive(Debug, Default)]
 pub struct KeyframeNeed {
     /// Packets were lost or a frame failed to decode, not yet asked about.
     owed: bool,
-    /// Video has arrived since the last picture, since then.
-    waiting_since: Option<Instant>,
+    /// The first complete frame since the last picture.
+    frame_since: Option<Instant>,
+    /// The newest video data since the last picture.
+    last_data: Option<Instant>,
     last_request: Option<Instant>,
     /// Requests since the last picture.
     unanswered: u32,
@@ -755,21 +858,27 @@ impl KeyframeNeed {
 
     /// Video data (an RTP packet with payload) arrived.
     pub fn data(&mut self, now: Instant) {
-        self.waiting_since.get_or_insert(now);
+        self.last_data = Some(now);
+    }
+
+    /// A complete frame came out of the reassembly (before decoding it).
+    pub fn frame(&mut self, now: Instant) {
+        self.frame_since.get_or_insert(now);
     }
 
     /// A picture came out of the decoder.
     pub fn picture(&mut self) {
-        self.waiting_since = None;
+        self.frame_since = None;
+        self.last_data = None;
         self.unanswered = 0;
     }
 
     /// Should the viewer ask for a keyframe now? Call after every packet and on a timer
     /// (a lost keyframe on a still screen is followed by no packets at all).
     pub fn poll(&mut self, now: Instant) -> bool {
-        let stalled = self
-            .waiting_since
-            .is_some_and(|t| now.saturating_duration_since(t) >= STALL);
+        let over =
+            |t: Option<Instant>| t.is_some_and(|t| now.saturating_duration_since(t) >= STALL);
+        let stalled = over(self.frame_since) || over(self.last_data);
         if !self.owed && !stalled {
             return false;
         }
@@ -803,10 +912,11 @@ mod keyframe_need_tests {
         let t0 = Instant::now();
         let mut k = KeyframeNeed::default();
         k.picture();
-        // P-frames of a stream whose keyframe was lost: data, no picture, no error.
+        // P-frames of a stream whose keyframe was lost: frames, no picture, no error.
         let mut asked = Vec::new();
         for t in (0..12_000).step_by(50) {
             k.data(ms(t0, t));
+            k.frame(ms(t0, t));
             if k.poll(ms(t0, t)) {
                 asked.push(t);
             }
@@ -839,6 +949,40 @@ mod keyframe_need_tests {
         assert!(k.poll(ms(t0, 1000)), "the timer finds it");
     }
 
+    /// A full-size keyframe on a slow link: packets for 3 s, no complete frame yet. Asking
+    /// for another meanwhile only queues another one behind it.
+    #[test]
+    fn a_keyframe_still_arriving_is_not_asked_for_again() {
+        let t0 = Instant::now();
+        let mut k = KeyframeNeed::default();
+        for t in (0..3_000).step_by(5) {
+            k.data(ms(t0, t));
+            assert!(!k.poll(ms(t0, t)), "asked at {t} ms while it arrived");
+        }
+        k.frame(ms(t0, 3_000));
+        k.picture();
+        assert!(!k.poll(ms(t0, 10_000)));
+    }
+
+    /// The clock starts at the first complete frame that gave no picture.
+    #[test]
+    fn the_stall_counts_from_a_complete_frame_without_a_picture() {
+        let t0 = Instant::now();
+        let mut k = KeyframeNeed::default();
+        for t in (0..2_000).step_by(5) {
+            k.data(ms(t0, t)); // a big frame arriving
+        }
+        let mut asked = Vec::new();
+        for t in (2_000..4_000).step_by(33) {
+            k.data(ms(t0, t));
+            k.frame(ms(t0, t)); // complete, but the decoder makes nothing of them
+            if k.poll(ms(t0, t)) {
+                asked.push(t);
+            }
+        }
+        assert_eq!(asked, [3_023], "1 s after the first complete frame");
+    }
+
     #[test]
     fn a_loss_inside_the_throttle_is_remembered_not_dropped() {
         let t0 = Instant::now();
@@ -863,12 +1007,126 @@ mod keyframe_need_tests {
         // An error on every frame at 30 fps, no picture for 10 s (a slow link).
         for t in (0..10_000).step_by(33) {
             k.data(ms(t0, t));
+            k.frame(ms(t0, t));
             k.lost();
             if k.poll(ms(t0, t)) {
                 asked.push(t);
             }
         }
         assert_eq!(asked, [0, 1023, 3036, 7062], "not every 300 ms");
+    }
+}
+
+#[cfg(test)]
+mod pacer_tests {
+    use super::*;
+    use rtc::interceptor::{Attribute, AttributedPacket, Packet};
+    use rtc::sansio::Protocol;
+    use rtc::shared::{TransportContext, TransportMessage};
+
+    const KEYFRAME_BYTES: usize = 500_000;
+    const PAYLOAD: usize = 1188; // 1200 bytes with the RTP header
+
+    fn rtp(now: Instant, seq: u16) -> TaggedPacket {
+        TransportMessage {
+            now,
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtp(rtc::rtp::Packet {
+                header: rtc::rtp::header::Header {
+                    version: 2,
+                    sequence_number: seq,
+                    ssrc: 1,
+                    ..Default::default()
+                },
+                payload: Bytes::from(vec![0u8; PAYLOAD]),
+            })),
+        }
+    }
+
+    /// Queue a 500 KB keyframe at once and run the pacer as the driver does: woken at its
+    /// deadline, by a timer that fires on the next tick of `tick`. How long until the
+    /// last packet leaves.
+    fn drain<P>(pacer: &mut P, tick: Duration) -> Duration
+    where
+        P: Protocol<TaggedPacket, TaggedPacket, (), Wout = TaggedPacket, Time = Instant>,
+        P::Error: std::fmt::Debug,
+    {
+        let t0 = Instant::now();
+        let n = KEYFRAME_BYTES.div_ceil(PAYLOAD + 12);
+        for i in 0..n {
+            pacer.handle_write(rtp(t0, i as u16)).expect("queued");
+        }
+        let (mut out, mut now) = (0, t0);
+        while out < n {
+            while pacer.poll_write().is_some() {
+                out += 1;
+            }
+            if out == n {
+                break;
+            }
+            let due = pacer.poll_timeout().expect("packets queued: a deadline");
+            let ticks = (due.saturating_duration_since(t0).as_secs_f64() / tick.as_secs_f64())
+                .ceil()
+                .max(1.0);
+            now = (t0 + tick.mul_f64(ticks)).max(now + tick.min(Duration::from_micros(100)));
+            pacer.handle_timeout(now).expect("timeout");
+        }
+        now - t0
+    }
+
+    /// The burst follows the rate both ways.
+    #[test]
+    fn the_burst_follows_the_rate() {
+        let mut p = Pacer::new(1_000_000.0);
+        assert_eq!(p.inner.pacer().burst_bits(), PACER_MIN_BURST_BITS);
+        let estimate = |bps| TransportMessage {
+            now: Instant::now(),
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtcp(vec![])).with(
+                Attribute::TargetBitrateChanged {
+                    bits_per_second: bps,
+                },
+            ),
+        };
+        p.handle_read(estimate(25_000_000.0)).expect("read");
+        assert_eq!(p.inner.pacer().burst_bits(), 25_000_000.0 * 0.020);
+        p.handle_read(estimate(1_500_000.0)).expect("read");
+        assert_eq!(p.inner.pacer().burst_bits(), PACER_MIN_BURST_BITS);
+        assert!(p.poll_read().is_some(), "the feedback goes on");
+    }
+
+    /// A 500 KB keyframe through the pacer, four-packet burst (0.1.6-0.1.10) against
+    /// 20 ms of the rate, on 1 ms timers (macOS, Linux) and 15.6 ms ones (Windows by
+    /// default). `--nocapture` prints the table.
+    #[test]
+    fn a_keyframe_drains_at_the_pacing_rate_on_coarse_timers() {
+        for estimate in [10_000_000.0, 25_000_000.0] {
+            let rate = estimate * PACING_FACTOR;
+            let ideal = Duration::from_secs_f64(KEYFRAME_BYTES as f64 * 8.0 / rate);
+            for tick in [Duration::from_millis(1), Duration::from_micros(15_625)] {
+                let mut old = PacerBuilder::new()
+                    .with_target_bitrate(rate)
+                    .with_burst_bits(PACER_MIN_BURST_BITS)
+                    .build();
+                let before = drain(&mut old, tick);
+                let after = drain(&mut Pacer::new(rate), tick);
+                println!(
+                    "estimate {:>2} Mb/s, timer {:>4.1} ms: 4-packet burst {:>5} ms, 20 ms burst {:>4} ms (at the pacing rate: {} ms)",
+                    estimate / 1e6,
+                    tick.as_secs_f64() * 1e3,
+                    before.as_millis(),
+                    after.as_millis(),
+                    ideal.as_millis()
+                );
+                assert!(
+                    after <= ideal.mul_f64(1.1) + tick,
+                    "{after:?}, at the pacing rate {ideal:?}"
+                );
+                if tick > Duration::from_millis(10) {
+                    assert!(before > ideal * 3, "the old cap: {before:?}");
+                }
+            }
+        }
     }
 }
 
