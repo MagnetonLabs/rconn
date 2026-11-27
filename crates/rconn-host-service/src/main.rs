@@ -6,6 +6,8 @@
 mod console;
 mod paths;
 #[cfg(windows)]
+mod sas;
+#[cfg(windows)]
 mod service;
 
 use anyhow::Result;

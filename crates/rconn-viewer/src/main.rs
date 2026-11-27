@@ -72,10 +72,10 @@ enum Cmd {
         seconds: u64,
         #[arg(long)]
         snapshot: Option<std::path::PathBuf>,
-        /// Test aid: tap one key `SECONDS:HID` (HID usage, hex ok) after connecting,
-        /// e.g. `5:0x29` for Escape.
+        /// Test aid: tap a key or chord `SECONDS:HID[+HID…]` (HID usages, hex ok) after
+        /// connecting, e.g. `5:0x29` for Escape or `5:0xE0+0xE2+0x4C` for Ctrl+Alt+Delete.
         #[arg(long, value_parser = parse_tap)]
-        tap_key: Option<(u64, u16)>,
+        tap_key: Option<(u64, Vec<u16>)>,
         /// Test aid: after 2 s, ask the host to fit its screen to `WIDTHxHEIGHT`, as a
         /// viewer window of that size would.
         #[arg(long, value_parser = parse_size)]
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
                     relay_only: *relay_only,
                     video_codecs: rconn_media::caps::viewer_codecs(),
                 },
-                *tap_key,
+                tap_key.clone(),
                 *fit,
                 guest,
             )
@@ -474,11 +474,11 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
     ))
 }
 
-fn parse_tap(s: &str) -> Result<(u64, u16), String> {
-    let (secs, hid) = s.split_once(':').ok_or("expected SECONDS:HID")?;
-    let hid = hid.trim_start_matches("0x");
-    Ok((
-        secs.parse().map_err(|e| format!("{e}"))?,
-        u16::from_str_radix(hid, 16).map_err(|e| format!("{e}"))?,
-    ))
+fn parse_tap(s: &str) -> Result<(u64, Vec<u16>), String> {
+    let (secs, keys) = s.split_once(':').ok_or("expected SECONDS:HID[+HID…]")?;
+    let keys = keys
+        .split('+')
+        .map(|k| u16::from_str_radix(k.trim_start_matches("0x"), 16).map_err(|e| format!("{e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((secs.parse().map_err(|e| format!("{e}"))?, keys))
 }

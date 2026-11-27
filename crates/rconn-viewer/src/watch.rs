@@ -25,7 +25,7 @@ pub async fn run(
     snapshot: Option<PathBuf>,
     openh264: &Path,
     opts: PeerOptions,
-    tap_key: Option<(u64, u16)>,
+    tap_key: Option<(u64, Vec<u16>)>,
     fit: Option<(u32, u32)>,
     guest: Option<crate::access::GuestLogin>,
 ) -> Result<()> {
@@ -50,12 +50,15 @@ pub async fn run(
     // sent before our decoder existed).
     let dc = session.data.clone();
     let (kf_tx, mut kf_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    // Test aid: tap one key (HID usage) N seconds after the channel opens.
-    if let Some((after, hid_usage)) = tap_key {
+    // Test aid: tap a key or chord (HID usages, pressed in order, released in reverse)
+    // N seconds after the channel opens.
+    if let Some((after, keys)) = tap_key {
         let dc = session.data.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(after)).await;
-            for pressed in [true, false] {
+            let presses = keys.iter().map(|&k| (k, true));
+            let releases = keys.iter().rev().map(|&k| (k, false));
+            for (hid_usage, pressed) in presses.chain(releases) {
                 if let Ok(b) =
                     DataMessage::Input(rconn_core::protocol::InputEvent::Key { hid_usage, pressed })
                         .encode()
@@ -64,7 +67,7 @@ pub async fn run(
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            println!("tapped key {hid_usage:#04x} at +{after} s");
+            println!("tapped {keys:x?} at +{after} s");
         });
     }
     // Test aid: ask the host to fit its screen to WxH, as a viewer window would.

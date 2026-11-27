@@ -197,6 +197,9 @@ fn run_service() -> Result<()> {
             | ServiceControlAccept::SESSION_CHANGE,
     )?;
     tracing::info!("service running");
+    let _ = std::thread::Builder::new()
+        .name("sas".into())
+        .spawn(crate::sas::serve);
     supervise(&stop_rx);
     set(ServiceState::Stopped, ServiceControlAccept::empty())?;
     Ok(())
