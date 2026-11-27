@@ -42,16 +42,13 @@ pub fn enabled() -> bool {
     std::env::var("RCONN_COPY_RECTS").map_or(true, |v| v != "0" && v != "off")
 }
 
-/// Whether a host offers copy instructions. By default only Windows hosts do: there the
-/// capture reports window moves, so drags save 29–55%. Elsewhere drags cost 7–20% more,
+/// Whether a host offers copy instructions: only with `RCONN_COPY_RECTS=1`. On Windows the
+/// capture reports window moves (drags save 29-55%), but in live sessions copies covered
+/// 0-6.6% of what was sent, and with them every reported loss costs a keyframe (a repair
+/// of the decoded picture can't bring back lost copies). Elsewhere drags cost 7-20% more,
 /// and copied areas stay at the sharpness they were first sent at.
-/// `RCONN_COPY_RECTS=1` turns it on anywhere, `=0` off.
 pub fn host_enabled() -> bool {
-    match std::env::var("RCONN_COPY_RECTS").as_deref() {
-        Ok("0" | "off") => false,
-        Ok(_) => true,
-        Err(_) => cfg!(windows),
-    }
+    matches!(std::env::var("RCONN_COPY_RECTS").as_deref(), Ok(v) if v != "0" && v != "off")
 }
 
 /// A move must cover this many rows to be worth an instruction.

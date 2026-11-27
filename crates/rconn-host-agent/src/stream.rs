@@ -81,10 +81,12 @@ impl KeyframeRequests {
     }
 }
 
-/// How often the encoder follows the bandwidth estimate (changes are live and cheap).
-const RETARGET_EVERY: Duration = Duration::from_millis(200);
-/// ...or this often, where a bitrate change costs a keyframe (Microsoft's software Media
-/// Foundation encoder).
+/// How often the encoder may follow the bandwidth estimate (changes are live and cheap,
+/// but each upsets the rate controller for a few frames: a 200 ms period made 99 changes
+/// in 115 s of a live session).
+const RETARGET_EVERY: Duration = Duration::from_secs(1);
+/// ...or this often, where a bitrate change costs a keyframe (an engine seen to answer
+/// changes with one, [`VideoEncoder::bitrate_change_costs_keyframe`]).
 const COSTLY_RETARGET_EVERY: Duration = Duration::from_secs(2);
 
 /// Encode rate for small background changes (spinner, caret) when nobody is interacting.
@@ -102,8 +104,27 @@ const MOTION_CHANGE: f32 = 0.25;
 const MOTION_FRAMES: u32 = 6;
 /// ...which ends after this long without such a frame.
 const MOTION_SETTLE: Duration = Duration::from_millis(1000);
+/// Changes covering at least this share of the screen, coming one after another (each
+/// within [`ANIMATION_GAP`] of the last, [`ANIMATION_FRAMES`] of them), are something
+/// playing that someone watches (a video in a window, a terminal printing): the full
+/// rate, input or not. A spinner or a blinking caret stays batched.
+const ANIMATION_CHANGE: f32 = 0.005;
+const ANIMATION_FRAMES: u32 = 4;
+const ANIMATION_GAP: Duration = Duration::from_millis(250);
 /// A new capture's first keyframe is sent again after this long if nothing followed it.
 const STILL_REPEAT: Duration = Duration::from_secs(1);
+/// The first keyframe's repeats only go out on a stream this quiet: while frames flow, a
+/// viewer missing the keyframe sees the gap and asks.
+const RESEND_QUIET: Duration = Duration::from_millis(250);
+/// A loss report from before the last keyframe (or repair) is about frames that keyframe
+/// already replaced: ignored for this long after it went out, plus its time on the link.
+/// (Later, the keyframe may have been lost too: the report counts.)
+const RESYNC_GRACE: Duration = Duration::from_millis(500);
+/// A new picture waits while what was already sent needs more than this to leave at the
+/// encoder's bitrate: an encoder that overshoots (Microsoft's software encoder scrolling:
+/// 575 KB pictures at 8 Mbps) then costs frame rate, never a growing delay (a queue
+/// that freezes the picture for seconds).
+const LINK_AHEAD: Duration = Duration::from_millis(100);
 /// Only screens this large (in pixels) are halved during motion.
 const MOTION_MIN_PIXELS: usize = 2_500_000;
 
@@ -230,126 +251,31 @@ impl ViewScale {
 /// Scaled pictures may be coarse while they move (openh264 allows a higher quantizer for
 /// them): once the screen is still, the same picture is encoded this many times more, each
 /// sharper (720p text after a scroll: 25.5 dB, then 31 dB after 6;
-/// `encode_bench::sharpness_after_scrolling`).
-const TOPOFF_FRAMES: u32 = 6;
+/// `encode_bench::sharpness_after_scrolling`). Engines that take refinement passes at
+/// any size (Media Foundation) get those instead.
+pub(crate) const TOPOFF_FRAMES: u32 = 6;
+/// Microsoft's software encoder's rate control sharpens a still picture in bursts (a
+/// large picture every 8-12 re-encodes, nearly empty ones between): it is re-encoded at
+/// the full rate until it has made no large picture (half a frame's share of the
+/// bitrate) for this long... (2688x1686 text after scrolling: 19.7 dB, 33.8 dB after 3 s
+/// at 8 Mbps; a still caret: no large pictures, done after this long)
+pub(crate) const CONVERGE_QUIET: Duration = Duration::from_millis(600);
+/// ...or for this long in all.
+pub(crate) const CONVERGE_MAX: Duration = Duration::from_secs(6);
 
 /// With [`ViewScale::Refine`], a still screen gets one full-size picture after this long.
 const REFINE_AFTER: Duration = Duration::from_secs(2);
 /// Scaling to less than this share of the screen's width is worth a size switch (each
 /// costs a keyframe); closer to full size, the full picture is sent.
 const VIEW_SCALE_BELOW: f32 = 0.9;
-/// Encoding taking this share of the frame interval (averaged) counts as CPU-bound: the
-/// encoder then gets fewer pixels ([`CpuCap`]).
-const CPU_BOUND: f64 = 0.7;
-/// [`CpuCap`] aims at this share of the frame interval when it lowers the size...
-const CPU_AIM: f64 = 0.5;
-/// ...and raises it again when encoding takes less than this share for a while.
-const CPU_IDLE: f64 = 0.25;
-/// [`CpuCap`] never goes below this many pixels (1280x720): below that, text can't be read
-/// on a large window, whatever the frame rate.
-const MIN_CAP_PIXELS: usize = 1280 * 720;
-/// A screen still for this long goes out at the viewer's size, not the CPU cap's: sharp
-/// once it stops moving (the cap is for motion).
-const SHARP_AFTER: Duration = Duration::from_millis(1500);
-
-/// Keeps an encoder that can't keep up within the frame interval by capping the pixels
-/// it gets, whatever size the viewer shows the picture at: openh264 on a 4-vCPU VM took
-/// 85-143 ms a picture at 2992x1878 (4-5 fps), 11-16 ms at 1152x722 (23-30 fps).
-#[derive(Debug, Default)]
-struct CpuCap {
-    max_pixels: Option<usize>,
-    /// Encoder time per picture (ms, moving average) at `size`, over `samples` pictures.
-    avg_ms: f64,
-    size: (usize, usize),
-    samples: u32,
-}
-
-impl CpuCap {
-    /// A picture of `size` took `ms` to encode; frames are due every `budget_ms`.
-    /// Keyframes aren't counted: every size switch starts with one (much slower than the
-    /// pictures that follow), and counting it made each cut look too slow and led to the
-    /// next, down to the floor.
-    fn note(
-        &mut self,
-        size: (usize, usize),
-        ms: f64,
-        key: bool,
-        budget_ms: f64,
-        screen_pixels: usize,
-    ) {
-        if size != self.size {
-            *self = Self {
-                max_pixels: self.max_pixels,
-                size,
-                ..Self::default()
-            };
-        }
-        if key {
-            return;
-        }
-        self.avg_ms = if self.samples == 0 {
-            ms
-        } else {
-            self.avg_ms * 0.9 + ms * 0.1
-        };
-        self.samples += 1;
-        let pixels = size.0 * size.1;
-        if self.samples >= 10 && self.avg_ms > budget_ms * CPU_BOUND {
-            let fit = (pixels as f64 * budget_ms * CPU_AIM / self.avg_ms) as usize;
-            let max = fit
-                .min(self.max_pixels.unwrap_or(usize::MAX))
-                .max(MIN_CAP_PIXELS);
-            if self.max_pixels != Some(max) {
-                tracing::info!(
-                    encode_ms = format!("{:.1}", self.avg_ms),
-                    at = format!("{}x{}", size.0, size.1),
-                    max_pixels = max,
-                    "encoder can't keep up; sending fewer pixels"
-                );
-            }
-            self.max_pixels = Some(max);
-            self.samples = 0; // measure the new size
-        } else if self.samples >= 15
-            && self.avg_ms < budget_ms * CPU_IDLE
-            && let Some(max) = self.max_pixels
-        {
-            let up = max * 3 / 2;
-            self.max_pixels = (up < screen_pixels).then_some(up);
-            self.samples = 0;
-        }
-    }
-
-    fn capped(&self) -> bool {
-        self.max_pixels.is_some()
-    }
-
-    /// `target` (the size to encode a `w` x `h` screen at; `None`: full), made smaller
-    /// if it has more pixels than the cap.
-    fn apply(
-        &self,
-        (w, h): (usize, usize),
-        target: Option<(usize, usize)>,
-    ) -> Option<(usize, usize)> {
-        let Some(max) = self.max_pixels else {
-            return target;
-        };
-        let (tw, th) = target.unwrap_or((w, h));
-        if tw * th <= max {
-            return target;
-        }
-        let s = (max as f64 / (w * h) as f64).sqrt();
-        view_target(
-            (w, h),
-            Some(((w as f64 * s) as usize, (h as f64 * s) as usize)),
-        )
-        .or(target)
-    }
-}
 
 /// The size to encode a `w` x `h` screen at for a viewer showing it `view` large, or
 /// `None` for the full size. Same shape as the screen; width a multiple of 16 (a size
 /// that changes by a few pixels would cost a keyframe for nothing), height even; at most
 /// a quarter of the screen's width.
+///
+/// The size only follows the viewer: never how long frames take to encode (a CPU cap
+/// that did took a 2992x1878 screen down to 752x472, unreadable).
 pub(crate) fn view_target(
     (w, h): (usize, usize),
     view: Option<(usize, usize)>,
@@ -367,6 +293,185 @@ pub(crate) fn view_target(
         .min(w & !1);
     let th = ((tw * h + w / 2) / w) & !1;
     (th >= 16).then_some((tw, th))
+}
+
+/// `target` (a size for a `w` x `h` screen, `None`: full), no wider than `limit`, the
+/// widest picture the encoder handles well ([`VideoEncoder::width_limit`]). Same shape.
+pub(crate) fn fit_width(
+    (w, h): (usize, usize),
+    target: Option<(usize, usize)>,
+    limit: Option<usize>,
+) -> Option<(usize, usize)> {
+    let Some(limit) = limit else {
+        return target;
+    };
+    if target.unwrap_or((w, h)).0 <= limit {
+        return target;
+    }
+    let tw = limit & !15;
+    Some((tw, ((tw * h + w / 2) / w) & !1))
+}
+
+/// When the next frame may start: frames start at most once per `budget`, measured from
+/// the start of the frame before (not its end: a 15 ms encode at 30 fps then still makes
+/// 30 fps, where stamping after encoding made it 1000 / (33 + 15) = 21). A frame later
+/// than a whole slot starts a new grid: missed slots are skipped, never caught up.
+struct FrameClock {
+    budget: Duration,
+    next: Instant,
+}
+
+impl FrameClock {
+    fn new(budget: Duration, now: Instant) -> Self {
+        Self { budget, next: now }
+    }
+
+    /// The earliest start of the next frame.
+    fn next(&self) -> Instant {
+        self.next
+    }
+
+    /// A frame started (its picture taken, its encode about to begin) at `now`.
+    fn started(&mut self, now: Instant) {
+        let slot = if now < self.next + self.budget {
+            self.next
+        } else {
+            now
+        };
+        self.next = slot + self.budget;
+    }
+}
+
+/// Is something playing (see [`ANIMATION_CHANGE`])?
+#[derive(Default)]
+struct Animation {
+    streak: u32,
+    last: Option<Instant>,
+}
+
+impl Animation {
+    /// A capture changed this share of the screen.
+    fn note(&mut self, now: Instant, changed: f32) {
+        if changed < ANIMATION_CHANGE {
+            return;
+        }
+        let close = self.last.is_some_and(|l| now - l <= ANIMATION_GAP);
+        self.streak = if close { self.streak + 1 } else { 1 };
+        self.last = Some(now);
+    }
+
+    fn playing(&self, now: Instant) -> bool {
+        self.streak >= ANIMATION_FRAMES && self.last.is_some_and(|l| now - l <= ANIMATION_GAP)
+    }
+}
+
+/// Is frame `a` before frame `b` (ids wrap)?
+fn precedes(a: u32, b: u32) -> bool {
+    (b.wrapping_sub(a) as i32) > 0
+}
+
+/// The last frame that resynchronized the viewer (a keyframe, or a loss repair), so that
+/// reports of losses it already answered don't make another one.
+#[derive(Default)]
+struct Resync {
+    id: u32,
+    until: Option<Instant>,
+    /// The same for the last keyframe: a request for one meanwhile was made before it
+    /// arrived.
+    key_until: Option<Instant>,
+}
+
+impl Resync {
+    /// Frame `id` (`bytes` long, a keyframe or a repair) went out at `now` and replaces
+    /// everything before it.
+    fn sent(&mut self, id: u32, now: Instant, bytes: usize, bps: f64, key: bool) {
+        let link = Duration::from_secs_f64((bytes as f64 * 8.0 / bps.max(1.0) * 1.5).min(3.0));
+        self.id = id;
+        self.until = Some(now + RESYNC_GRACE + link);
+        if key {
+            self.key_until = self.until;
+        }
+    }
+
+    /// A loss after frame `decoded`: already answered?
+    fn answered(&self, decoded: u32, now: Instant) -> bool {
+        self.until.is_some_and(|u| now < u) && precedes(decoded, self.id)
+    }
+
+    /// A keyframe asked for: is one still on its way?
+    fn key_on_its_way(&self, now: Instant) -> bool {
+        self.key_until.is_some_and(|u| now < u)
+    }
+}
+
+/// Why a keyframe went out (counted in the stats log).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyCause {
+    /// A new encoder or capture: its first picture.
+    Start,
+    /// The viewer asked (`RequestKeyframe`: it joined, or has no picture).
+    Request,
+    /// A loss the viewer reported, not repairable otherwise.
+    Loss,
+    /// The first picture again, in case the viewer missed it.
+    Resend,
+    /// The encoded size changed.
+    Size,
+    /// A bitrate change (on an engine that answers them with one).
+    Retarget,
+    /// The encoder decided on its own.
+    Encoder,
+}
+
+impl KeyCause {
+    const ALL: [KeyCause; 7] = [
+        KeyCause::Start,
+        KeyCause::Request,
+        KeyCause::Loss,
+        KeyCause::Resend,
+        KeyCause::Size,
+        KeyCause::Retarget,
+        KeyCause::Encoder,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            KeyCause::Start => "start",
+            KeyCause::Request => "request",
+            KeyCause::Loss => "loss",
+            KeyCause::Resend => "resend",
+            KeyCause::Size => "size",
+            KeyCause::Retarget => "retarget",
+            KeyCause::Encoder => "encoder",
+        }
+    }
+}
+
+/// Keyframes by cause, as "loss:2 size:1" ("-" for none).
+#[derive(Default)]
+struct KeyCauses([u32; KeyCause::ALL.len()]);
+
+impl KeyCauses {
+    fn add(&mut self, cause: KeyCause) {
+        self.0[cause as usize] += 1;
+    }
+}
+
+impl std::fmt::Display for KeyCauses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut any = false;
+        for c in KeyCause::ALL {
+            let n = self.0[c as usize];
+            if n > 0 {
+                write!(f, "{}{}:{n}", if any { " " } else { "" }, c.name())?;
+                any = true;
+            }
+        }
+        if !any {
+            f.write_str("-")?;
+        }
+        Ok(())
+    }
 }
 
 /// Time encoded frames spend waiting for the session task, and being packetized and
@@ -485,8 +590,9 @@ fn run_generation(
     enc.start_frame_ids_at(first_id);
     // A hardware encoder that reads the capturer's GPU surfaces (macOS VideoToolbox;
     // Windows: a D3D11-aware Media Foundation encoder, fed by the GPU's video processor;
-    // Linux: VA-API, fed DMA-BUFs from the Wayland screen stream) gets them as they are: no CPU conversion, and no half-size motion frames (a CPU
-    // saving it doesn't need). Otherwise pictures are converted in memory, as before.
+    // Linux: VA-API, fed DMA-BUFs from the Wayland screen stream) gets them as they are:
+    // no CPU conversion, and no half-size motion frames (a CPU saving it doesn't need).
+    // Otherwise pictures are converted in memory, as before.
     let surfaces = enc.wants_surfaces() && cap.use_surfaces(cfg.max_size);
     let mut surface: Option<Surface> = None;
     let mut picture: Option<I420> = None;
@@ -500,9 +606,11 @@ fn run_generation(
     // The last picture out was scaled; the full-size one after it (`Refine`) is sent.
     let mut sent_scaled = false;
     let mut refined = false;
-    // Top-off pictures still due for the last scaled picture with a change in it.
+    // Top-off pictures still due for the last scaled picture with a change in it
+    // (openh264), or since when (and the last large one) a still picture is re-encoded
+    // until the encoder stops sharpening it (Microsoft's software encoder).
     let mut topoff_left = 0u32;
-    let mut cpu_cap = CpuCap::default();
+    let mut converge: Option<(Instant, Instant)> = None;
     // Copy instructions (scrolls and moves as copies), once the viewer asks for them.
     // Pictures only: GPU surfaces go to the encoder untouched.
     let mut composer: Option<Composer> = None;
@@ -510,10 +618,24 @@ fn run_generation(
     let mut motion = false;
     let mut big_streak = 0u32;
     let mut last_big = Instant::now();
+    // Captures in a row changing a large area (frames may wait for the link meanwhile).
+    let mut captured_big = 0u32;
+    // The CPU encoder is Microsoft's software one, and it has made a picture of a large
+    // change far above the bitrate (a scroll: its motion search fails): large areas
+    // moving then go to openh264 at half size (`VideoEncoder::set_motion_input`).
+    let mut mf_main = false;
+    let mut mf_struggles = false;
+    // The widest picture the main CPU encoder handles well (kept while another engine
+    // takes the moving pictures).
+    let mut width_limit: Option<usize> = None;
+    let mut animation = Animation::default();
     let mut pending: Option<Pending> = None;
     let mut produced = false;
     let started = Instant::now();
-    let mut last_encode = Instant::now() - Duration::from_secs(1);
+    let mut clock = FrameClock::new(budget, Instant::now());
+    // Start of the last frame encoded (background batching counts from it).
+    let mut last_start = Instant::now() - Duration::from_secs(1);
+    let mut last_sent: Option<Instant> = None;
     let mut retarget_at = Instant::now() + RETARGET_EVERY;
     let mut last_change = Instant::now();
     let mut warned = false;
@@ -528,32 +650,48 @@ fn run_generation(
     let mut stats = Stats::default();
     // Refinement passes over a still screen (build to lossless).
     let mut refiner = refine::enabled().then(|| Refiner::new(Instant::now()));
+    // A refinement pass could be made at the size last chosen (only then is its due
+    // time a reason to wake: one never acted on would poll the capturer every 1 ms).
+    let mut refine_possible = false;
+    let mut resync = Resync::default();
+    // Why the keyframe being asked for is wanted, until one comes out.
+    let mut owed_key: Option<KeyCause> = None;
+    let mut last_size: Option<(usize, usize)> = None;
+    // When what was sent has left at the encoder's bitrate (see `LINK_AHEAD`), and since
+    // when a change has been held back for it.
+    let mut link_free = Instant::now();
+    let mut held_since: Option<Instant> = None;
 
     while !ctx.stop.load(Ordering::Relaxed) {
         // Never take frames faster than max_fps: the OS keeps collecting changes meanwhile.
-        let next_slot = last_encode + budget;
         let now = Instant::now();
-        if now < next_slot {
-            std::thread::sleep(next_slot - now);
+        if now < clock.next() {
+            std::thread::sleep(clock.next() - now);
         }
         // Wait for a change, but wake for a due batch, resend, or keyframe request.
+        let link_due = link_free.checked_sub(LINK_AHEAD).unwrap_or(link_free);
         let due = pending
             .as_ref()
             .map(|p| {
-                last_encode
+                (last_start
                     + if p.changed >= BIG_CHANGE {
                         MEDIUM_INTERVAL
                     } else {
                         BACKGROUND_INTERVAL
-                    }
+                    })
+                .max(link_due)
             })
             .into_iter()
             .chain(resends.first().copied())
-            // (Only passes the encoder can make: a due time it never acts on would spin.)
+            // (Top-offs wait for the link too: a due time before it would poll.)
+            .chain((topoff_left > 0).then(|| (last_start + BACKGROUND_INTERVAL).max(link_due)))
+            .chain(
+                converging(converge, Instant::now()).then(|| (last_start + budget).max(link_due)),
+            )
             .chain(
                 refiner
                     .as_ref()
-                    .filter(|_| !motion && enc.can_refine())
+                    .filter(|_| refine_possible && !motion && enc.can_refine())
                     .and_then(Refiner::due),
             )
             .min();
@@ -591,6 +729,12 @@ fn run_generation(
                 warned = false;
                 last_change = Instant::now();
                 refined = false;
+                animation.note(last_change, c.changed);
+                captured_big = if c.changed >= MOTION_CHANGE {
+                    captured_big + 1
+                } else {
+                    0
+                };
                 if let Some(r) = refiner.as_mut() {
                     r.changed(last_change);
                 }
@@ -619,59 +763,82 @@ fn run_generation(
         let now = Instant::now();
         // The viewer's feedback: acknowledgements confirm long-term references (and that
         // this capture's first keyframe arrived: no repeats of it needed); a loss is
-        // repaired at once, from a long-term reference where the encoder has one.
+        // repaired at once, from a long-term reference where the encoder has one. A loss
+        // from before the last keyframe or repair is one that frame already answered
+        // (the viewer repeats its report until a picture comes): not answered twice.
         let (mut repair, mut lost_key) = (false, false);
         for f in std::mem::take(&mut *ctx.feedback.lock().expect("feedback")) {
             if f.lost {
                 stats.losses += 1;
-                if ctx.copy_rects.load(Ordering::Relaxed) {
+                if resync.answered(f.decoded, now) {
+                    stats.answered += 1;
+                } else if ctx.copy_rects.load(Ordering::Relaxed) {
                     // The viewer's composed picture also missed the lost frames' copy
                     // instructions, which a repair of the decoded canvas does not bring
                     // back: a whole picture (keyframe, shown as is) resyncs both.
                     lost_key = true;
-                } else {
+                } else if !repair {
                     enc.request_ltr_recovery(f.decoded);
                     repair = true;
                 }
             } else {
                 enc.ltr_acked(f.decoded);
-                if sent_any && f.decoded >= first_id && !resends.is_empty() {
+                if sent_any && !precedes(f.decoded, first_id) && !resends.is_empty() {
                     resends.clear(); // the viewer has this capture's picture
                     repeat_if_still = false;
                 }
             }
         }
-        let mut force = ctx.want_key.swap(false, Ordering::Relaxed) || lost_key;
+        let mut requested = ctx.want_key.swap(false, Ordering::Relaxed);
+        if requested && resync.key_on_its_way(now) {
+            // Asked before the keyframe just sent could arrive (a large one takes a
+            // while); if it was lost, the viewer asks again.
+            requested = false;
+            stats.answered += 1;
+        }
+        let mut force = requested || lost_key;
+        let mut cause = if requested {
+            Some(KeyCause::Request)
+        } else if lost_key {
+            Some(KeyCause::Loss)
+        } else {
+            None
+        };
         if resends.first().is_some_and(|&t| now >= t) {
-            resends.remove(0);
-            force = true;
+            if link_free + RESEND_QUIET > now {
+                // The keyframe is still on its way (a large one takes a while at the
+                // bitrate), and so is the viewer's word that it arrived: ask again later.
+                let later = link_free + RESEND_QUIET;
+                for t in resends.iter_mut().filter(|t| **t < later) {
+                    *t = later;
+                }
+            } else {
+                resends.remove(0);
+                // Frames flowing: a viewer without the picture sees the gap and asks.
+                if last_sent.is_none_or(|t| now - t >= RESEND_QUIET) {
+                    force = true;
+                    cause = cause.or(Some(KeyCause::Resend));
+                }
+            }
         }
         if composer.is_none() && !surfaces && ctx.copy_rects.load(Ordering::Relaxed) {
             composer = Some(Composer::for_codec(cfg.codec)); // its first picture is whole
         }
         if force {
             enc.request_keyframe();
+            owed_key = owed_key.or(cause);
             if let Some(c) = composer.as_mut() {
                 c.request_full();
             }
         }
-        // A CPU encoder (or one that can't keep up) gets the picture at the size the
-        // viewer shows it, and no more pixels than it can encode in time; GPU surfaces go
-        // to a hardware encoder as they are.
-        // Still for a while: the viewer's size, uncapped (and full size if that is what
-        // the viewer shows, where refinement passes then sharpen it further).
-        let calm = pending.is_none() && last_change.elapsed() >= SHARP_AFTER;
-        let mut target =
-            (!surfaces && view_scale != ViewScale::Off && (enc.is_software() || cpu_cap.capped()))
-                .then(|| {
-                    let view = view_target((w, h), ctx.view_size());
-                    if calm {
-                        view
-                    } else {
-                        cpu_cap.apply((w, h), view)
-                    }
-                })
-                .flatten();
+        // A CPU encoder gets the picture at the size the viewer shows it (no wider than it
+        // encodes well); GPU surfaces go to a hardware encoder as they are.
+        if !motion {
+            width_limit = enc.width_limit();
+        }
+        let mut target = (!surfaces && view_scale != ViewScale::Off && enc.is_software())
+            .then(|| fit_width((w, h), view_target((w, h), ctx.view_size()), width_limit))
+            .flatten();
         // `Refine`: a still screen gets one sharp full-size picture, then stays so
         // until it changes.
         let refine = view_scale == ViewScale::Refine
@@ -688,10 +855,10 @@ fn run_generation(
         }
         // Not with copy instructions: they keep scrolls cheap at full size, and a size
         // switch costs a keyframe. Not at the viewer's size either (smaller already).
+        mf_main |= !surfaces && width_limit.is_some();
         let may_halve = !surfaces
             && composer.is_none()
-            && target.is_none()
-            && cfg.motion_half_res
+            && ((target.is_none() && cfg.motion_half_res) || (mf_main && mf_struggles))
             && w * h >= MOTION_MIN_PIXELS;
         // Motion over: one sharp full-size picture.
         let sharpen = motion && last_big.elapsed() >= MOTION_SETTLE;
@@ -699,11 +866,11 @@ fn run_generation(
             motion = false;
             big_streak = 0;
         }
-        // Full rate while someone interacts or a big area moves; background animation
-        // gets fewer frames (each full-screen encode costs the same, however small the
-        // change).
+        // Full rate while someone interacts, a big area moves or something plays;
+        // background animation gets fewer frames (each full-screen encode costs the
+        // same, however small the change).
         let changed = pending.as_ref().map_or(0.0, |p| p.changed);
-        let urgent = interactive() || changed >= MOTION_CHANGE;
+        let urgent = interactive() || changed >= MOTION_CHANGE || animation.playing(now);
         let interval = if urgent {
             budget
         } else if changed >= BIG_CHANGE {
@@ -711,16 +878,30 @@ fn run_generation(
         } else {
             BACKGROUND_INTERVAL.max(budget)
         };
-        // A still picture at the viewer's size: sharpen it (see `TOPOFF_FRAMES`).
-        let topoff = topoff_left > 0
-            && pending.is_none()
-            && target.is_some()
-            && now >= last_encode + BACKGROUND_INTERVAL;
-        if pending.is_some() || target.is_none() {
+        // A still picture is sharpened by refinement passes where the engine codes a
+        // frame at a chosen quantizer (openh264 at full size only: its camera mode, at
+        // the viewer's size, gets top-offs), else by top-offs where a software encoder's
+        // rate control codes each re-encode finer (Microsoft's software encoder, which
+        // ignores quantizer changes while encoding).
+        let passes =
+            enc.can_refine() && (target.is_none() || !enc.engine_name().starts_with("openh264"));
+        let topoffs = !passes && !surfaces && enc.is_software();
+        let counted = enc.engine_name().starts_with("openh264");
+        refine_possible = passes;
+        // A still picture: sharpen it (see `TOPOFF_FRAMES`, `CONVERGE_QUIET`).
+        let topoff = pending.is_none()
+            && topoffs
+            && if counted {
+                topoff_left > 0 && now >= last_start + BACKGROUND_INTERVAL
+            } else {
+                converging(converge, now)
+            };
+        if pending.is_some() || !topoffs {
             topoff_left = 0;
+            converge = None;
         }
-        // A refinement pass: only over a still, full-size picture (a scaled one gets the
-        // top-off above), and never instead of a keyframe, a repair or a change.
+        // A refinement pass: only over a still picture, and never instead of a keyframe,
+        // a repair or a change.
         let refine_qp = match refiner.as_mut() {
             Some(r)
                 if !force
@@ -728,23 +909,35 @@ fn run_generation(
                     && !sharpen
                     && !motion
                     && !refine
-                    && target.is_none()
+                    && passes
                     && pending.is_none() =>
             {
                 enc.can_refine().then(|| r.next(now)).flatten()
             }
             _ => None,
         };
+        // Changes and top-offs wait for the link (keyframes, repairs and refinement
+        // passes don't: the refiner paces itself).
+        let link_busy = link_free > now + LINK_AHEAD;
+        let change_due = pending.is_some() && now >= last_start + interval;
+        if link_busy && change_due {
+            held_since.get_or_insert(now);
+        }
         let encode_now = force
             || repair
             || sharpen
             || refine
-            || topoff
+            || (topoff && !link_busy)
             || refine_qp.is_some()
-            || (pending.is_some() && now >= last_encode + interval);
+            || (change_due && !link_busy);
         if !encode_now {
             continue;
         }
+        if let Some(t) = held_since.take() {
+            stats.link_held += now - t;
+        }
+        clock.started(now);
+        last_start = now;
         if let Some(qp) = refine_qp {
             enc.refine_next(qp);
             if let Some(c) = composer.as_mut() {
@@ -754,14 +947,9 @@ fn run_generation(
             }
         }
 
+        let mut retargeted = false;
         if now >= retarget_at {
             let costly = enc.bitrate_change_costs_keyframe();
-            retarget_at = now
-                + if costly {
-                    COSTLY_RETARGET_EVERY
-                } else {
-                    RETARGET_EVERY
-                };
             let want = (ctx.target.get() as u32).clamp(300_000, cfg.max_bitrate_bps);
             let current = enc.settings().bitrate_bps;
             let move_it = if costly {
@@ -771,33 +959,49 @@ fn run_generation(
             };
             if move_it {
                 tracing::debug!(
-                    from_kbps = enc.settings().bitrate_bps / 1000,
+                    from_kbps = current / 1000,
                     to_kbps = want / 1000,
                     "retarget encoder (live)"
                 );
                 enc.set_bitrate(want);
                 stats.retargets += 1;
+                retargeted = true;
+                // At most one change per period (checked again each frame until then).
+                retarget_at = now
+                    + if costly {
+                        COSTLY_RETARGET_EVERY
+                    } else {
+                        RETARGET_EVERY
+                    };
             }
         }
         let p = pending.take();
         let rows = p.as_ref().map_or((0, 0), |p| p.rows);
-        if p.as_ref().is_some_and(|p| p.changed >= MOTION_CHANGE) {
+        let big = p.as_ref().is_some_and(|p| p.changed >= MOTION_CHANGE);
+        if big {
             last_big = now;
             big_streak += 1;
         } else if p.is_some() {
             big_streak = 0;
         }
-        if may_halve && !motion && big_streak >= MOTION_FRAMES {
+        if may_halve
+            && !motion
+            && (big_streak >= MOTION_FRAMES || (mf_main && big && captured_big >= 2))
+        {
             motion = true;
         }
+        enc.set_motion_input(motion && may_halve);
         let t0 = Instant::now();
+        let mut size = (w, h);
         let encoded = match (&surface, &picture) {
             (Some(s), _) => enc.encode_surface(s)?,
             (None, Some(pic)) if motion && may_halve => {
                 pic.half_into(&mut small);
                 enc.set_scaled_input(true);
                 stats.half += 1;
-                enc.encode_yuv(small.as_ref().expect("allocated by half_into"), None)?
+                let half = small.as_ref().expect("allocated by half_into");
+                size = half.dimensions();
+                enc.encode_yuv(half, None)?
             }
             (None, Some(full)) => {
                 // The picture to send: the screen, or scaled down to the viewer's size.
@@ -819,13 +1023,18 @@ fn run_generation(
                         (full, rows)
                     }
                 };
+                size = pic.dimensions();
                 sent_scaled = target.is_some();
                 enc.set_scaled_input(sent_scaled);
                 if topoff {
-                    topoff_left -= 1;
+                    topoff_left = topoff_left.saturating_sub(1);
                     stats.topoffs += 1;
-                } else if sent_scaled && p.is_some() {
-                    topoff_left = TOPOFF_FRAMES;
+                } else if topoffs && p.is_some() {
+                    if counted {
+                        topoff_left = TOPOFF_FRAMES;
+                    } else {
+                        converge = Some((now, now));
+                    }
                 }
                 match composer.as_mut() {
                     Some(c) => {
@@ -865,28 +1074,22 @@ fn run_generation(
         };
         let took = t0.elapsed();
         stats.encode += took;
-        // Calm pictures are sharpening, not keeping up: not the cap's business.
-        if !surfaces && view_scale != ViewScale::Off && !calm {
-            let key = encoded.is_some() && enc.last_frame().key;
-            let size = target
-                .or(motion
-                    .then(|| small.as_ref().map(|s| s.dimensions()))
-                    .flatten())
-                .unwrap_or((w, h));
-            cpu_cap.note(
-                size,
-                took.as_secs_f64() * 1e3,
-                key,
-                budget.as_secs_f64() * 1e3,
-                w * h,
-            );
-        }
-        last_encode = Instant::now();
         if urgent {
             stats.urgent += 1;
         }
         if let Some(au) = encoded {
             let info = enc.last_frame();
+            let large = enc.settings().bitrate_bps as usize / 8 / cfg.max_fps.max(1) as usize / 2;
+            if let Some(c) = converge.as_mut().filter(|_| topoff && au.len() >= large) {
+                c.1 = now; // still sharpening
+            }
+            if mf_main && big && !motion && !info.key && au.len() > 8 * large && !mf_struggles {
+                tracing::info!(
+                    bytes = au.len(),
+                    "large changes over the bitrate on this encoder; moving areas go at half size"
+                );
+                mf_struggles = true;
+            }
             if let Some(r) = refiner.as_mut() {
                 let target = enc.settings().bitrate_bps;
                 r.sent(
@@ -904,7 +1107,36 @@ fn run_generation(
             }
             ctx.next_id
                 .store(info.id.wrapping_add(1), Ordering::Relaxed);
-            stats.keys += u32::from(info.key);
+            if info.key {
+                // Why: asked for (and owed until now), else what changed.
+                let cause = owed_key.take().unwrap_or(if !sent_any {
+                    KeyCause::Start
+                } else if last_size != Some(size) {
+                    KeyCause::Size
+                } else if repair {
+                    KeyCause::Loss // nothing to repair from
+                } else if retargeted {
+                    KeyCause::Retarget
+                } else {
+                    KeyCause::Encoder
+                });
+                stats.keys += 1;
+                stats.key_causes.add(cause);
+            }
+            if last_size.is_some_and(|s| s != size) {
+                stats.size_switches += 1;
+            }
+            last_size = Some(size);
+            stats.size = Some(size);
+            if info.key || info.recovers_from.is_some() {
+                resync.sent(
+                    info.id,
+                    Instant::now(),
+                    au.len(),
+                    ctx.target.get(),
+                    info.key,
+                );
+            }
             stats.repairs += u32::from(info.recovers_from.is_some());
             let host_us = p
                 .as_ref()
@@ -931,6 +1163,8 @@ fn run_generation(
                     bytes = au.len(),
                     key = enc.last_was_key(),
                     engine = enc.engine_name(),
+                    w = size.0,
+                    h = size.1,
                     "first frame encoded, sending"
                 );
             } else if !sent_any {
@@ -946,10 +1180,22 @@ fn run_generation(
                 repeat_if_still = false;
             }
             sent_any = true;
+            let sent_at = Instant::now();
+            if let (Some(l), Some(p)) = (last_sent, &p) {
+                // How long the viewer waited for this change: since the frame before, or
+                // since it happened if the screen was idle until then.
+                stats.max_gap = stats.max_gap.max(sent_at - l.max(p.captured_at));
+            }
+            last_sent = Some(sent_at);
+            let bps = f64::from(enc.settings().bitrate_bps.max(1));
+            link_free =
+                link_free.max(sent_at) + Duration::from_secs_f64(au.len() as f64 * 8.0 / bps);
             stats.bytes += au.len();
             stats.frames += 1;
             if let Some(p) = &p {
-                stats.latency += p.captured_at.elapsed();
+                let latency = p.captured_at.elapsed();
+                stats.latency += latency;
+                stats.max_latency = stats.max_latency.max(latency);
                 stats.changed += f64::from(p.changed);
             }
             if tx.blocking_send((au, Instant::now())).is_err() {
@@ -964,9 +1210,16 @@ fn run_generation(
             // under load): its change still has to reach the viewer, with the next frame.
             pending = Some(p);
         }
-        stats.maybe_log((w, h), &ctx.target, &ctx.sending);
+        stats.maybe_log((w, h), &ctx.target, &ctx.sending, enc.engine_name());
     }
     Ok(produced)
+}
+
+/// Is a still picture being re-encoded until the encoder stops sharpening it (since
+/// `.0`, the last large picture at `.1`)?
+fn converging(converge: Option<(Instant, Instant)>, now: Instant) -> bool {
+    converge
+        .is_some_and(|(since, large)| now - large < CONVERGE_QUIET && now - since < CONVERGE_MAX)
 }
 
 /// The size of the current picture: a converted one, or a GPU surface (even part).
@@ -1014,7 +1267,7 @@ pub(crate) fn cpu_times() -> (f64, f64) {
 #[derive(Default)]
 struct Stats {
     frames: u32,
-    /// Frames sent at the full rate (interaction or a big change).
+    /// Frames sent at the full rate (interaction, a big change, something playing).
     urgent: u32,
     /// Frames sent at half size (motion).
     half: u32,
@@ -1023,11 +1276,14 @@ struct Stats {
     /// Still pictures re-sent to sharpen them (`TOPOFF_FRAMES`).
     topoffs: u32,
     captures: u32,
-    /// Keyframes, loss repairs from long-term references, losses the viewer reported,
-    /// live bitrate changes.
+    /// Keyframes (and why), loss repairs from long-term references, losses the viewer
+    /// reported, its losses and keyframe requests an earlier keyframe or repair had
+    /// answered already, live bitrate changes.
     keys: u32,
+    key_causes: KeyCauses,
     repairs: u32,
     losses: u32,
+    answered: u32,
     retargets: u32,
     /// Refinement passes over a still screen, and their bytes.
     refines: u32,
@@ -1036,6 +1292,15 @@ struct Stats {
     capture: Duration,
     encode: Duration,
     latency: Duration,
+    /// The longest a change waited to go out (capture to send), and the longest the
+    /// viewer waited for one (since the frame before, or since the change if idle).
+    max_latency: Duration,
+    max_gap: Duration,
+    /// Time changes waited for the link to drain (an encoder above its bitrate).
+    link_held: Duration,
+    /// The size of the last picture encoded, and how often it changed.
+    size: Option<(usize, usize)>,
+    size_switches: u32,
     changed: f64,
     /// Share of the screen sent as copy instructions instead of pixels (summed per frame).
     moved: f64,
@@ -1045,7 +1310,13 @@ struct Stats {
 }
 
 impl Stats {
-    fn maybe_log(&mut self, (w, h): (usize, usize), target: &TargetBitrate, sending: &SendClock) {
+    fn maybe_log(
+        &mut self,
+        (w, h): (usize, usize),
+        target: &TargetBitrate,
+        sending: &SendClock,
+        engine: &str,
+    ) {
         if self.since.is_none() {
             self.since = Some(Instant::now());
             self.cpu_at_start = cpu_times();
@@ -1058,9 +1329,16 @@ impl Stats {
         let pct = |now: f64, then: f64| format!("{:.0}", (now - then) / secs * 100.0);
         let n = f64::from(self.frames.max(1));
         let per = |d: Duration, n: f64| format!("{:.1}", d.as_secs_f64() * 1000.0 / n);
+        let ms = |d: Duration| format!("{:.0}", d.as_secs_f64() * 1000.0);
         let (queue_ms, write_ms) = sending.take();
         tracing::info!(
+            // The screen, and what was encoded (its last size; how often it changed).
             size = format!("{w}x{h}"),
+            encoded = self
+                .size
+                .map_or("-".into(), |(ew, eh)| format!("{ew}x{eh}")),
+            size_switches = self.size_switches,
+            engine,
             fps = format!("{:.1}", f64::from(self.frames) / secs),
             urgent_fps = format!("{:.1}", f64::from(self.urgent) / secs),
             half_size_fps = format!("{:.1}", f64::from(self.half) / secs),
@@ -1072,15 +1350,20 @@ impl Stats {
             capture_ms = per(self.capture, f64::from(self.captures.max(1))),
             encode_ms = per(self.encode, n),
             capture_to_send_ms = per(self.latency, n),
+            max_latency_ms = ms(self.max_latency),
+            max_gap_ms = ms(self.max_gap),
+            link_held_ms = ms(self.link_held),
             // Stages after the encoder: waiting for the session task, then packetizing
             // into RTP and queueing at the pacer.
             queue_ms = format!("{queue_ms:.1}"),
             write_ms = format!("{write_ms:.1}"),
             bwe_kbps = format!("{:.0}", target.estimate() / 1000.0),
             encoder_kbps = format!("{:.0}", target.get() / 1000.0),
-            keyframes_per_min = format!("{:.1}", f64::from(self.keys) * 60.0 / secs),
+            keyframes = self.keys,
+            key_causes = %self.key_causes,
             repairs = self.repairs,
             losses = self.losses,
+            answered = self.answered,
             retargets = self.retargets,
             refines = self.refines,
             refine_kbps = format!("{:.0}", self.refine_bytes as f64 * 8.0 / secs / 1000.0),
@@ -1230,52 +1513,6 @@ mod tests {
         assert!(sizes[11..].iter().all(|&s| s == (1920, 1080)), "{sizes:?}");
     }
 
-    /// An encoder taking 90 ms a picture at 2992x1878 is capped until it takes about
-    /// half the 33 ms interval; one with time to spare gets the full screen back.
-    #[test]
-    fn a_slow_encoder_gets_fewer_pixels_and_a_fast_one_more() {
-        let screen = (2992, 1878);
-        let px = screen.0 * screen.1;
-        let mut cap = CpuCap::default();
-        for _ in 0..10 {
-            cap.note(screen, 90.0, false, 33.3, px);
-        }
-        let to = cap.apply(screen, None).expect("capped");
-        assert!(to.0 * to.1 <= px * 20 / 100, "{to:?}");
-        assert_eq!(to.0 * screen.1 / to.1 / 8, screen.0 / 8, "same shape");
-        // A viewer showing it even smaller wins.
-        assert_eq!(cap.apply(screen, Some((640, 400))), Some((640, 400)));
-        // Fast at the capped size: the cap rises step by step and goes.
-        for _ in 0..20 {
-            for _ in 0..60 {
-                let size = cap.apply(screen, None).unwrap_or(screen);
-                cap.note(size, 5.0, false, 33.3, px);
-            }
-        }
-        assert!(!cap.capped());
-    }
-
-    /// Keyframes (every size switch starts with one) never lower the cap, and a slow
-    /// encoder is never cut below the floor.
-    #[test]
-    fn keyframes_dont_count_and_the_cap_has_a_floor() {
-        let screen = (2992, 1878);
-        let px = screen.0 * screen.1;
-        let mut cap = CpuCap::default();
-        for _ in 0..30 {
-            cap.note(screen, 400.0, true, 33.3, px);
-        }
-        assert!(!cap.capped());
-        for _ in 0..10 {
-            for _ in 0..10 {
-                let size = cap.apply(screen, None).unwrap_or(screen);
-                cap.note(size, 500.0, false, 33.3, px);
-            }
-        }
-        let to = cap.apply(screen, None).expect("capped");
-        assert!(to.0 * to.1 >= MIN_CAP_PIXELS * 9 / 10, "{to:?}");
-    }
-
     #[test]
     fn view_target_keeps_the_shape_and_skips_small_savings() {
         let screen = (1920, 1080);
@@ -1293,5 +1530,390 @@ mod tests {
             view_target(screen, Some((1275, 717))),
             view_target(screen, Some((1272, 716)))
         );
+    }
+
+    /// The CPU encoder's width limit: a wider target (or the full screen) is narrowed to
+    /// it, same shape; narrower ones and no limit are left alone.
+    #[test]
+    fn fit_width_narrows_only_past_the_limit() {
+        let screen = (2992, 1878);
+        assert_eq!(fit_width(screen, None, None), None);
+        assert_eq!(fit_width(screen, None, Some(2688)), Some((2688, 1686)));
+        assert_eq!(
+            fit_width(screen, Some((1920, 1206)), Some(2688)),
+            Some((1920, 1206))
+        );
+        assert_eq!(fit_width((1920, 1080), None, Some(2688)), None);
+    }
+
+    /// Frames start once per budget from the start of the one before, whatever the
+    /// encode took (under the budget): 30 fps, where stamping after the encode gave 21.
+    /// A frame later than a whole slot starts a new grid (no burst to catch up).
+    #[test]
+    fn the_frame_clock_counts_from_frame_starts() {
+        let budget = Duration::from_secs(1) / 30;
+        let t0 = Instant::now();
+        let mut clock = FrameClock::new(budget, t0);
+        let mut now = t0;
+        let mut starts = Vec::new();
+        for _ in 0..30 {
+            now = now.max(clock.next()) + Duration::from_millis(2); // capture
+            starts.push(now);
+            clock.started(now);
+            now += Duration::from_millis(15); // encode
+        }
+        let fps = 29.0 / (starts[29] - starts[0]).as_secs_f64();
+        assert!((29.0..=31.0).contains(&fps), "{fps:.1} fps");
+        // An encode of 45 ms: frames back to back, never two in one slot.
+        let mut clock = FrameClock::new(budget, t0);
+        let mut now = t0;
+        let mut starts = Vec::new();
+        for _ in 0..10 {
+            now = now.max(clock.next());
+            starts.push(now);
+            clock.started(now);
+            now += Duration::from_millis(45);
+        }
+        assert!(
+            starts
+                .windows(2)
+                .all(|w| w[1] - w[0] >= Duration::from_millis(45))
+        );
+        // Idle for a second, then a change: the next frame waits a whole budget.
+        let idle = now + Duration::from_secs(1);
+        clock.started(idle);
+        assert_eq!(clock.next(), idle + budget);
+    }
+
+    /// Something playing (a video in a window) is noticed after a few changes in a row;
+    /// a blinking caret (twice a second) and a tiny spinner are not.
+    #[test]
+    fn sustained_changes_count_as_playing() {
+        let t0 = Instant::now();
+        let mut video = Animation::default();
+        for k in 0..6 {
+            video.note(t0 + Duration::from_millis(40 * k), 0.05);
+        }
+        let last = t0 + Duration::from_millis(200);
+        assert!(video.playing(last));
+        assert!(!video.playing(last + Duration::from_millis(300)), "stopped");
+        let mut caret = Animation::default();
+        for k in 0..6 {
+            caret.note(t0 + Duration::from_millis(500 * k), 0.01);
+        }
+        assert!(!caret.playing(t0 + Duration::from_millis(2500)));
+        let mut spinner = Animation::default();
+        for k in 0..30 {
+            spinner.note(t0 + Duration::from_millis(33 * k), 0.0005);
+        }
+        assert!(!spinner.playing(t0 + Duration::from_millis(990)));
+    }
+
+    /// A loss reported from before the last keyframe is one that keyframe answered (the
+    /// viewer repeats its report until a picture comes); later, or after the grace, a
+    /// report counts.
+    fn soon_after(t: Instant) -> Instant {
+        t + Duration::from_millis(300)
+    }
+
+    #[test]
+    fn losses_from_before_a_keyframe_are_answered() {
+        let t0 = Instant::now();
+        let mut resync = Resync::default();
+        assert!(!resync.answered(5, t0), "nothing sent yet");
+        // A 100 KB keyframe, id 10, at 8 Mbps: 100 ms on the link.
+        resync.sent(10, t0, 100_000, 8e6, true);
+        assert!(resync.key_on_its_way(soon_after(t0)));
+        let soon = t0 + Duration::from_millis(300);
+        assert!(resync.answered(9, soon));
+        assert!(!resync.answered(10, soon), "a loss after the keyframe");
+        assert!(!resync.answered(12, soon));
+        assert!(
+            !resync.answered(9, t0 + Duration::from_secs(2)),
+            "the keyframe was lost too"
+        );
+        // Ids wrap.
+        resync.sent(2, t0, 1000, 8e6, false);
+        assert!(resync.answered(u32::MAX - 1, soon));
+    }
+
+    #[test]
+    fn key_causes_read_as_counts() {
+        let mut k = KeyCauses::default();
+        assert_eq!(k.to_string(), "-");
+        k.add(KeyCause::Loss);
+        k.add(KeyCause::Size);
+        k.add(KeyCause::Loss);
+        assert_eq!(k.to_string(), "loss:2 size:1");
+    }
+
+    /// The first keyframe's repeats only go out while the stream is quiet: none while
+    /// the screen keeps changing past their times (300 ms, 1 s, 2.5 s).
+    #[test]
+    fn first_frame_repeats_never_interrupt_motion() {
+        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let keyframes = KeyframeRequests::default();
+        let mut ctx = software_ctx(&lib, &keyframes);
+        ctx.cfg.max_fps = 10;
+        let (tx, mut rx) = mpsc::channel(4);
+        // Changes at 10 fps for longer than the test runs.
+        let make = || -> Result<Box<dyn Capturer>> {
+            Ok(Box::new(Changes {
+                pattern: TestPattern::new(640, 360, 10),
+                changes: usize::MAX,
+            }))
+        };
+        let mut keys = 0;
+        std::thread::scope(|s| {
+            let worker = s.spawn(|| {
+                let tx = tx;
+                run_generation(&make, &ctx, &tx)
+            });
+            // Past the last repeat's time (2.5 s).
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(3000));
+                ctx.stop.store(true, Ordering::Relaxed);
+            });
+            while let Some((au, _)) = rx.blocking_recv() {
+                let tag = frames::read(rconn_media::caps::VideoCodec::H264, &au).expect("tagged");
+                keys += u32::from(tag.key);
+            }
+            drop(rx);
+            worker.join().unwrap().unwrap();
+        });
+        assert_eq!(keys, 1, "only the first frame");
+    }
+
+    /// Still at first for this long (the first keyframe drains), in [`host_loop`].
+    const SETTLE: Duration = Duration::from_millis(2500);
+
+    /// A synthetic desktop ([`crate::encode_bench`]'s) still for [`SETTLE`], changing at
+    /// 30 fps for `moving`, then still: what `run_generation` gets from a capturer that
+    /// reports changed areas.
+    struct Scripted {
+        desk: crate::encode_bench::Desktop,
+        scenario: crate::encode_bench::Scenario,
+        started: Option<Instant>,
+        moving: Duration,
+        k: usize,
+        sent_first: bool,
+    }
+
+    impl Capturer for Scripted {
+        fn next_frame(
+            &mut self,
+            _: Duration,
+        ) -> Result<Option<rconn_media::video::Frame>, rconn_media::capture::CaptureError> {
+            unreachable!("next_into")
+        }
+
+        fn next_into(
+            &mut self,
+            timeout: Duration,
+            picture: &mut Option<I420>,
+            _max: (usize, usize),
+        ) -> Result<Option<Captured>, rconn_media::capture::CaptureError> {
+            use crate::encode_bench::Scenario;
+            let (w, h) = self.desk.size();
+            let t0 = *self.started.get_or_insert_with(Instant::now);
+            if !self.sent_first {
+                self.sent_first = true;
+                let pic = picture.insert(I420::new(w, h));
+                pic.fill_from_bgra(self.desk.screen(), w);
+                return Ok(Some(Captured {
+                    rows: (0, h),
+                    changed: 1.0,
+                    captured_at: Instant::now(),
+                }));
+            }
+            // After a still start (the first keyframe drains), the screen's next change is
+            // due at 30 fps while it moves.
+            let t0 = t0 + SETTLE;
+            let due = t0 + Duration::from_secs(1) / 30 * (self.k as u32 + 1);
+            if t0.elapsed() >= self.moving || Instant::now() + timeout < due {
+                std::thread::sleep(timeout);
+                return Ok(None);
+            }
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            self.k += 1;
+            if matches!(self.scenario, Scenario::Typing | Scenario::Scrolling) {
+                note_input(); // keys, the wheel
+            }
+            let rects = self.desk.step(self.k);
+            let pic = picture.as_mut().expect("allocated above");
+            pic.fill_rects_from_bgra(self.desk.screen(), w * 4, &rects);
+            let (top, bottom) = rects
+                .iter()
+                .fold((h, 0), |(a, b), r| (a.min(r.y), b.max(r.y + r.h)));
+            Ok(Some(Captured {
+                rows: (top & !1, bottom.next_multiple_of(2).min(h)),
+                changed: rects.iter().map(|r| r.w * r.h).sum::<usize>() as f32 / (w * h) as f32,
+                captured_at: Instant::now(),
+            }))
+        }
+    }
+
+    /// The whole host loop on each benchmark scenario (`RCONN_BENCH_SIZE`, viewer
+    /// `RCONN_BENCH_VIEW`): still for 2.5 s, 3 s of changes at 30 fps
+    /// (`RCONN_BENCH_SECS`), then 4 s still, frames acknowledged as received, with the encoder
+    /// the host picks. Frames per second and the longest gap while it moves, bytes,
+    /// keyframes, encoded size, and what the still screen got afterwards.
+    /// `cargo test --release -p rconn-host-agent host_loop -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn host_loop() {
+        use crate::encode_bench::Scenario;
+        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let knob = |name: &str, default: (usize, usize)| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| {
+                    let (w, h) = v.split_once('x')?;
+                    Some((w.parse().ok()?, h.parse().ok()?))
+                })
+                .unwrap_or(default)
+        };
+        // The host's own stats lines too (`RUST_LOG=info`).
+        if std::env::var("RUST_LOG").is_ok() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .try_init();
+        }
+        let size: (usize, usize) = knob("RCONN_BENCH_SIZE", (1920, 1080));
+        let view: (usize, usize) = knob("RCONN_BENCH_VIEW", (1280, 720));
+        let moving = Duration::from_secs(
+            std::env::var("RCONN_BENCH_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+        );
+        println!(
+            "screen {}x{}, viewer {}x{}: {} s of changes at 30 fps, then 4 s still; 8000 kbps",
+            size.0,
+            size.1,
+            view.0,
+            view.1,
+            moving.as_secs()
+        );
+        println!(
+            "{:<10} {:>9} {:>5} {:>6} {:>7} {:>4} {:>9} {:>8} {:>8}",
+            "scenario",
+            "encoded",
+            "fps",
+            "gap ms",
+            "KB/pic",
+            "keys",
+            "still pics",
+            "still KB",
+            "last ms"
+        );
+        for scenario in Scenario::ALL {
+            let keyframes = KeyframeRequests::default();
+            keyframes.set_view_size(view.0 as u32, view.1 as u32);
+            let mut ctx = software_ctx(&lib, &keyframes);
+            ctx.cfg.max_fps = 30;
+            ctx.cfg.software = false;
+            let (tx, mut rx) = mpsc::channel(2);
+            let make = || -> Result<Box<dyn Capturer>> {
+                Ok(Box::new(Scripted {
+                    desk: crate::encode_bench::Desktop::new(
+                        scenario,
+                        size,
+                        40 * moving.as_secs() as usize,
+                    ),
+                    scenario,
+                    started: None,
+                    moving,
+                    k: 0,
+                    sent_first: false,
+                }))
+            };
+            let mut out: Vec<(Instant, usize, bool)> = Vec::new();
+            let mut encoded = None;
+            std::thread::scope(|s| {
+                let worker = s.spawn(|| {
+                    let tx = tx;
+                    run_generation(&make, &ctx, &tx)
+                });
+                s.spawn(|| {
+                    std::thread::sleep(SETTLE + moving + Duration::from_secs(4));
+                    ctx.stop.store(true, Ordering::Relaxed);
+                });
+                while let Some((au, at)) = rx.blocking_recv() {
+                    let (au, tag) = frames::take(rconn_media::caps::VideoCodec::H264, &au);
+                    let key = tag.is_some_and(|t| t.key);
+                    if let Some(t) = tag {
+                        // The viewer decoded it.
+                        keyframes.frame_feedback(Feedback {
+                            decoded: t.id,
+                            lost: false,
+                        });
+                    }
+                    if let Some(sps) = rconn_media::video::sequence_header_of(
+                        rconn_media::caps::VideoCodec::H264,
+                        &au,
+                    )
+                    .and_then(|h| {
+                        rconn_media::video::sequence_info(rconn_media::caps::VideoCodec::H264, h)
+                    }) {
+                        encoded = Some((sps.width, sps.height));
+                    }
+                    out.push((at, au.len(), key));
+                }
+                worker.join().unwrap().unwrap();
+            });
+            let t0 = out[0].0 + SETTLE;
+            let split = t0 + moving;
+            let (moving_frames, still): (Vec<&(Instant, usize, bool)>, Vec<_>) =
+                out.iter().filter(|f| f.0 >= t0).partition(|f| f.0 < split);
+            let gap = moving_frames
+                .windows(2)
+                .map(|w| w[1].0 - w[0].0)
+                .max()
+                .unwrap_or_default();
+            let span = moving_frames
+                .last()
+                .zip(moving_frames.first())
+                .map_or(Duration::ZERO, |(l, f)| l.0 - f.0);
+            let kb = moving_frames.iter().map(|f| f.1).sum::<usize>() as f64
+                / 1024.0
+                / moving_frames.len().max(1) as f64;
+            let (ew, eh) = encoded.unwrap_or_default();
+            println!(
+                "{:<10} {:>9} {:>5.1} {:>6.0} {:>7.1} {:>4} {:>9} {:>8.0} {:>8.0}",
+                format!("{scenario:?}"),
+                format!("{ew}x{eh}"),
+                (moving_frames.len().max(1) - 1) as f64 / span.as_secs_f64().max(1e-9),
+                gap.as_secs_f64() * 1e3,
+                kb,
+                out.iter().filter(|f| f.2).count(),
+                still.len(),
+                still.iter().map(|f| f.1).sum::<usize>() as f64 / 1024.0,
+                still
+                    .last()
+                    .map_or(0.0, |f| (f.0 - split).as_secs_f64() * 1e3)
+            );
+        }
+    }
+
+    /// How long `std::thread::sleep` really takes here (the frame clock sleeps to its next
+    /// slot): `cargo test -p rconn-host-agent sleep_granularity -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn sleep_granularity() {
+        for ms in [1u64, 5, 10, 20] {
+            let t0 = Instant::now();
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            println!(
+                "sleep({ms} ms): {:.2} ms",
+                t0.elapsed().as_secs_f64() * 1e3 / 20.0
+            );
+        }
     }
 }

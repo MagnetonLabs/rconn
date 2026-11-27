@@ -156,14 +156,12 @@ impl Host {
             bitrate_bps: bps,
             ..EncoderSettings::default()
         };
+        // Otherwise openh264 (Windows without a GPU would pick Microsoft's software
+        // encoder, which makes no refinement passes).
         let enc = if hardware {
             VideoEncoder::new(lib, settings).unwrap()
         } else {
-            #[cfg(target_os = "macos")]
-            let e = VideoEncoder::software(lib, settings).unwrap();
-            #[cfg(not(target_os = "macos"))]
-            let e = VideoEncoder::new(lib, settings).unwrap();
-            e
+            VideoEncoder::software(lib, settings).unwrap()
         };
         Self {
             enc,

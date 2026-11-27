@@ -13,7 +13,9 @@
 //! interacts. Per engine and scenario it prints the time per stage, the pictures per
 //! second put out (and the most it could if it did nothing else), the CPU used
 //! (100 % = one core), bytes per picture and frames the rate controller skipped.
-//! Run it on the machine in question: `rconn-host-agent --selftest-encode 120`.
+//! Run it on the machine in question: `rconn-host-agent --selftest-encode 120`
+//! (`RCONN_BENCH_QUALITY=1`: also how sharp each size policy leaves the picture,
+//! [`quality_report`]).
 
 use anyhow::{Context, Result};
 use rconn_media::video::{EncoderSettings, VideoEncoder};
@@ -70,7 +72,7 @@ fn page_pixel(x: usize, y: usize) -> [u8; 4] {
 }
 
 /// Produces the scenario's frames: the current BGRA desktop and what changed.
-struct Desktop {
+pub(crate) struct Desktop {
     scenario: Scenario,
     w: usize,
     h: usize,
@@ -81,7 +83,7 @@ struct Desktop {
 }
 
 impl Desktop {
-    fn new(scenario: Scenario, (w, h): (usize, usize), frames: usize) -> Self {
+    pub(crate) fn new(scenario: Scenario, (w, h): (usize, usize), frames: usize) -> Self {
         let rows = h + if scenario == Scenario::Scrolling {
             frames * SCROLL_STEP
         } else {
@@ -102,6 +104,17 @@ impl Desktop {
             screen,
             seed: 0x1234_5678,
         }
+    }
+
+    /// The desktop now (BGRA), and its size.
+    #[cfg(test)]
+    pub(crate) fn screen(&self) -> &[u8] {
+        &self.screen
+    }
+
+    #[cfg(test)]
+    pub(crate) fn size(&self) -> (usize, usize) {
+        (self.w, self.h)
     }
 
     fn video_area(&self) -> Rect {
@@ -125,7 +138,7 @@ impl Desktop {
     }
 
     /// Advance to frame `k` (from 1); the areas that changed since frame `k - 1`.
-    fn step(&mut self, k: usize) -> Vec<Rect> {
+    pub(crate) fn step(&mut self, k: usize) -> Vec<Rect> {
         let caret_at = |k: usize| Rect {
             x: 240 + 9 * (10 + k % 150),
             y: 18 * 20,
@@ -430,7 +443,12 @@ pub fn run(frames: usize, openh264: &Path) -> Result<String> {
         "skip",
         "keys"
     )?;
-    for engine in engines(openh264) {
+    // `RCONN_BENCH_ENGINES`: engines whose name has one of these `+`-separated words.
+    let only = std::env::var("RCONN_BENCH_ENGINES").ok();
+    for engine in engines(openh264).into_iter().filter(|e| {
+        only.as_ref()
+            .is_none_or(|o| o.split('+').any(|o| e.name.contains(o)))
+    }) {
         // The full screen, then (if the viewer is smaller) at the viewer's size.
         for scaled in std::iter::once(None).chain(to.map(Some)) {
             let mut name = engine.name.clone();
@@ -465,6 +483,454 @@ pub fn run(frames: usize, openh264: &Path) -> Result<String> {
                     m.keys
                 )?;
             }
+        }
+    }
+    // `RCONN_BENCH_QUALITY=1`: the size policies compared too (`quality_report`).
+    if std::env::var("RCONN_BENCH_QUALITY").is_ok_and(|v| v == "1") {
+        out += &quality_report(frames, openh264)?;
+    }
+    Ok(out)
+}
+
+/// Luma PSNR (dB) of `got` against `want` (same size).
+fn luma_psnr(want: &[u8], got: &[u8]) -> f64 {
+    let mse = want
+        .iter()
+        .zip(got)
+        .map(|(&a, &b)| f64::from(a.abs_diff(b)).powi(2))
+        .sum::<f64>()
+        / want.len().max(1) as f64;
+    10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+}
+
+/// How the host sizes the picture and sharpens a still screen (for [`quality`]).
+#[derive(Clone, Copy, Debug)]
+pub enum Policy {
+    /// Always at this size (`None`: the screen's). Once still: refinement passes where
+    /// the host makes them, else its top-off re-encodes.
+    Fixed { size: Option<(usize, usize)> },
+    /// Half size while a large area keeps changing, the full screen once it has been
+    /// still for a second (a keyframe), then refinement passes.
+    HalfInMotion,
+}
+
+/// One policy's numbers for one scenario: motion, then the screen still.
+#[derive(Debug, Default, Clone)]
+pub struct Quality {
+    /// Encoded sizes while it moved, and at the end.
+    pub motion_size: (usize, usize),
+    pub still_size: (usize, usize),
+    pub fps: f64,
+    pub encode_ms: f64,
+    /// Longest time between two pictures out while it moved.
+    pub max_gap_ms: f64,
+    pub kb_per_picture: f64,
+    pub keys: usize,
+    /// How far behind the link (at the target bitrate) was when the motion ended.
+    pub lag_ms: f64,
+    /// Luma PSNR at the viewer's size: mean over the moving pictures, and at the end.
+    pub psnr_motion: f64,
+    pub psnr_final: f64,
+    /// From the last change until the viewer has a picture within 0.5 dB of the final
+    /// one, the link's backlog included.
+    pub sharp_ms: f64,
+    /// Bytes sent after the screen went still.
+    pub still_kb: f64,
+}
+
+/// A unit out (or a skip), the time taken, and the size the picture was encoded at.
+type Sized = (Option<Vec<u8>>, Duration, (usize, usize));
+
+/// Pictures handed to the encoder at the size a policy picks.
+struct Sizer {
+    screen: (usize, usize),
+    scaler: Option<Scaler>,
+    small: Option<I420>,
+    half: Option<I420>,
+}
+
+impl Sizer {
+    /// Encode `pic` at `size` (`None`: as it is), or halved.
+    fn encode(
+        &mut self,
+        enc: &mut VideoEncoder,
+        pic: &I420,
+        size: Option<(usize, usize)>,
+        halve: bool,
+        rows: Option<(usize, usize)>,
+    ) -> Result<Sized> {
+        let t0 = Instant::now();
+        let input = if halve {
+            pic.half_into(&mut self.half);
+            enc.set_scaled_input(true);
+            self.half.as_ref().expect("allocated")
+        } else if let Some(to) = size {
+            if self
+                .scaler
+                .as_ref()
+                .is_none_or(|s| s.sizes() != (self.screen, to))
+            {
+                self.scaler = Some(Scaler::new(self.screen, to));
+                self.small = None;
+            }
+            let fresh = self.small.is_none();
+            self.scaler.as_ref().expect("built").scale(
+                pic,
+                &mut self.small,
+                rows.filter(|_| !fresh),
+            );
+            enc.set_scaled_input(true);
+            self.small.as_ref().expect("allocated")
+        } else {
+            enc.set_scaled_input(false);
+            pic
+        };
+        let dims = input.dimensions();
+        let au = enc.encode_yuv(input, None)?;
+        Ok((au, t0.elapsed(), dims))
+    }
+}
+
+/// Run `scenario` for `frames` frames at 30 fps through `enc` as `policy` sizes it, then
+/// keep the screen still (up to `CONVERGE_MAX`) as the host would (refinement passes paced by
+/// [`rconn_media::refine::Refiner`] on a simulated clock, or top-offs; encodes are real),
+/// and score what the viewer decodes (with openh264 from `lib`).
+#[allow(clippy::too_many_lines)]
+pub fn quality(
+    enc: &mut VideoEncoder,
+    policy: Policy,
+    scenario: Scenario,
+    screen: (usize, usize),
+    frames: usize,
+    lib: &Path,
+) -> Result<Quality> {
+    use rconn_media::refine::Refiner;
+    const WARMUP: usize = 15;
+    const MOTION_SETTLE: Duration = Duration::from_secs(1);
+    let (w, h) = screen;
+    let target = settings().bitrate_bps;
+    let send_time = |bytes: usize| Duration::from_secs_f64(bytes as f64 * 8.0 / f64::from(target));
+    let mut desk = Desktop::new(scenario, screen, frames + WARMUP + 1);
+    let mut pic = I420::new(w, h);
+    pic.fill_from_bgra(&desk.screen, w);
+    let mut sizer = Sizer {
+        screen,
+        scaler: None,
+        small: None,
+        half: None,
+    };
+    // (frame k, encoded at, unit) of every picture out, for the replay.
+    let mut out: Vec<(usize, Instant, Vec<u8>)> = Vec::new();
+    let mut refiner = Refiner::new(Instant::now());
+    let size = match policy {
+        Policy::Fixed { size } => size,
+        Policy::HalfInMotion => None,
+    };
+    let interval = Duration::from_secs(1) / 30;
+    let mut next = Instant::now();
+    let mut started = None;
+    let mut last_out: Option<Instant> = None;
+    let mut q = Quality::default();
+    let (mut encode_time, mut coded, mut bytes) = (Duration::ZERO, 0usize, 0usize);
+    let mut link_free = Instant::now();
+    let (mut streak, mut halving) = (0, false);
+    for k in 0..=frames + WARMUP {
+        let rects = if k == 0 { Vec::new() } else { desk.step(k) };
+        let now = Instant::now();
+        if now < next {
+            std::thread::sleep(next - now);
+        }
+        next = next.max(now) + interval;
+        if k == WARMUP + 1 {
+            started = Some(Instant::now());
+        }
+        pic.fill_rects_from_bgra(&desk.screen, w * 4, &rects);
+        let changed = rects.iter().map(|r| r.w * r.h).sum::<usize>() as f32 / (w * h) as f32;
+        let big = changed >= 0.25;
+        streak = if big { streak + 1 } else { 0 };
+        if matches!(policy, Policy::HalfInMotion) && streak >= 6 {
+            halving = true;
+        }
+        let (top, bottom) = rects
+            .iter()
+            .fold((h, 0), |(a, b), r| (a.min(r.y), b.max(r.y + r.h)));
+        let rows = (top < bottom).then(|| (top & !1, bottom.next_multiple_of(2).min(h)));
+        let (au, took, dims) = sizer.encode(enc, &pic, size, halving, rows)?;
+        let t = Instant::now();
+        if !rects.is_empty() {
+            refiner.changed(t - took);
+        }
+        q.motion_size = dims;
+        if let Some(au) = au {
+            let info = enc.last_frame();
+            refiner.sent(t, au.len(), info.qp, info.refine, info.key, target);
+            if started.is_some() {
+                encode_time += took;
+                coded += 1;
+                bytes += au.len();
+                q.keys += usize::from(info.key);
+                if let Some(l) = last_out {
+                    q.max_gap_ms = q.max_gap_ms.max((t - l).as_secs_f64() * 1e3);
+                }
+                last_out = Some(t);
+            }
+            link_free = link_free.max(t) + send_time(au.len());
+            out.push((k, t, au));
+        }
+    }
+    let end = Instant::now();
+    let wall = started.map_or(Duration::ZERO, |s| end - s);
+    q.fps = coded as f64 / wall.as_secs_f64().max(1e-9);
+    q.encode_ms = encode_time.as_secs_f64() * 1e3 / coded.max(1) as f64;
+    q.kb_per_picture = bytes as f64 / 1024.0 / coded.max(1) as f64;
+    q.lag_ms = link_free.saturating_duration_since(end).as_secs_f64() * 1e3;
+    let motion_units = out.len();
+    // The screen stays still: simulated time from here.
+    let mut clock = end;
+    let mut still_bytes = 0usize;
+    let k_last = frames + WARMUP;
+    q.still_size = q.motion_size;
+    if halving {
+        clock += MOTION_SETTLE;
+        halving = false;
+        let (au, took, dims) = sizer.encode(enc, &pic, None, false, None)?;
+        clock += took;
+        q.still_size = dims;
+        if let Some(au) = au {
+            let info = enc.last_frame();
+            refiner.sent(clock, au.len(), info.qp, info.refine, info.key, target);
+            still_bytes += au.len();
+            out.push((k_last, clock, au));
+        }
+    }
+    // As the host decides (`stream.rs`).
+    let passes =
+        enc.can_refine() && (q.still_size == screen || !enc.engine_name().starts_with("openh264"));
+    // openh264 (camera mode): a few, 100 ms apart; others until no large picture comes.
+    let counted = enc.engine_name().starts_with("openh264");
+    let large = target as usize / 8 / 30 / 2;
+    let mut topoffs = 0;
+    let mut last_large = clock;
+    while clock < end + crate::stream::CONVERGE_MAX {
+        if !passes {
+            if counted && topoffs == crate::stream::TOPOFF_FRAMES
+                || !counted && clock - last_large >= crate::stream::CONVERGE_QUIET
+            {
+                break;
+            }
+            topoffs += 1;
+            clock += if counted {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(1) / 30
+            };
+        } else {
+            let Some(due) = refiner.due() else { break };
+            clock = clock.max(due);
+            let Some(qp) = refiner.next(clock) else { break };
+            enc.refine_next(qp);
+        }
+        let (au, took, _) = sizer.encode(enc, &pic, size, halving, Some((0, 0)))?;
+        clock += took;
+        match au {
+            Some(au) => {
+                let info = enc.last_frame();
+                refiner.sent(clock, au.len(), info.qp, info.refine, info.key, target);
+                if au.len() >= large {
+                    last_large = clock;
+                }
+                still_bytes += au.len();
+                out.push((k_last, clock, au));
+            }
+            None => refiner.dropped(clock),
+        }
+    }
+    q.still_kb = still_bytes as f64 / 1024.0;
+    // Replay: decode everything, compare with the same desktop, both at the viewer's size.
+    let mut dec = rconn_media::video::VideoDecoder::software(lib)?;
+    let mut desk = Desktop::new(scenario, screen, frames + WARMUP + 1);
+    let mut want = I420::new(w, h);
+    want.fill_from_bgra(&desk.screen, w);
+    let mut at = 0;
+    let mut motion_psnr = Vec::new();
+    let mut link_free = out.first().map_or(end, |u| u.1);
+    let mut still: Vec<(Instant, f64)> = Vec::new();
+    for (i, (k, t, au)) in out.iter().enumerate() {
+        while at < *k {
+            at += 1;
+            let rects = desk.step(at);
+            want.fill_rects_from_bgra(&desk.screen, w * 4, &rects);
+        }
+        link_free = link_free.max(*t) + send_time(au.len());
+        let Some(f) = dec.decode(au)? else { continue };
+        let counted = *k > WARMUP;
+        let last_moving = i + 1 == motion_units;
+        if !(i >= motion_units || last_moving || (counted && i % 3 == 0)) {
+            continue;
+        }
+        // Against the screen as the encoder got it (scaled the same way): what the codec
+        // lost. (Text compared across resampling grids measures the grid.)
+        let dims = (f.width, f.height);
+        let p = if dims == (w, h) {
+            luma_psnr(want.luma(), f.y())
+        } else {
+            let mut at_size = None;
+            if dims == ((w / 2) & !1, (h / 2) & !1) {
+                want.half_into(&mut at_size);
+            } else {
+                Scaler::new((w, h), dims).scale(&want, &mut at_size, None);
+            }
+            luma_psnr(at_size.expect("allocated").luma(), f.y())
+        };
+        if std::env::var("RCONN_BENCH_CURVE").is_ok() && i + 1 >= motion_units {
+            eprintln!(
+                "  {:?} {}x{} {} B: {p:.1} dB at +{:.0} ms",
+                scenario,
+                dims.0,
+                dims.1,
+                au.len(),
+                link_free.saturating_duration_since(end).as_secs_f64() * 1e3
+            );
+        }
+        if i < motion_units && counted {
+            motion_psnr.push(p);
+        }
+        if i >= motion_units || last_moving {
+            still.push((link_free, p));
+        }
+    }
+    q.psnr_motion = motion_psnr.iter().sum::<f64>() / motion_psnr.len().max(1) as f64;
+    q.psnr_final = still.iter().map(|s| s.1).fold(0.0, f64::max);
+    q.sharp_ms = still
+        .iter()
+        .find(|s| s.1 >= q.psnr_final - 0.5)
+        .map_or(0.0, |s| {
+            s.0.saturating_duration_since(end).as_secs_f64() * 1e3
+        });
+    Ok(q)
+}
+
+/// An encoder maker for [`quality_report`].
+type Make = Box<dyn Fn() -> Result<VideoEncoder>>;
+
+/// The quality report: each policy through each scenario, at `RCONN_BENCH_SIZE` for a
+/// viewer showing it `RCONN_BENCH_VIEW` wide (`RCONN_BENCH_ENGINES`: policies whose name
+/// has one of these `+`-separated words).
+pub fn quality_report(frames: usize, openh264: &Path) -> Result<String> {
+    let size = size_knob("RCONN_BENCH_SIZE", (1920, 1080))?;
+    let view = size_knob("RCONN_BENCH_VIEW", (1280, 720))?;
+    let at_view = crate::stream::view_target(size, Some(view));
+    let soft = |lib: std::path::PathBuf| -> Make {
+        Box::new(move || Ok(VideoEncoder::software(&lib, settings())?))
+    };
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut runs: Vec<(String, Make, Policy)> = vec![
+        (
+            "openh264 @1216x763 (0.1.9 cap floor)".into(),
+            soft(openh264.to_owned()),
+            Policy::Fixed {
+                size: crate::stream::view_target(size, Some((1216, 763))),
+            },
+        ),
+        (
+            "openh264 half moving, full still (B)".into(),
+            soft(openh264.to_owned()),
+            Policy::HalfInMotion,
+        ),
+        (
+            "openh264 at the viewer's size".into(),
+            soft(openh264.to_owned()),
+            Policy::Fixed { size: at_view },
+        ),
+    ];
+    #[cfg(windows)]
+    {
+        let mf = |lib: std::path::PathBuf| -> Make {
+            Box::new(move || {
+                let mut e = VideoEncoder::new(&lib, settings())?;
+                e.set_microsoft_software(true);
+                Ok(e)
+            })
+        };
+        runs.push((
+            "MF at the viewer's size".into(),
+            mf(openh264.to_owned()),
+            Policy::Fixed { size: at_view },
+        ));
+        runs.push((
+            "MF width-capped".into(),
+            mf(openh264.to_owned()),
+            Policy::Fixed {
+                size: crate::stream::fit_width(
+                    size,
+                    at_view,
+                    Some(rconn_media::mf::SOFTWARE_MAX_WIDTH),
+                ),
+            },
+        ));
+        runs.push((
+            "MF half moving, full still".into(),
+            mf(openh264.to_owned()),
+            Policy::HalfInMotion,
+        ));
+    }
+    let only = std::env::var("RCONN_BENCH_ENGINES").ok();
+    let mut out = String::new();
+    writeln!(
+        out,
+        "screen {}x{}, viewer {}x{}, {frames} frames at 30 fps then still, {} kbps; PSNR against the screen at the encoded size",
+        size.0,
+        size.1,
+        view.0,
+        view.1,
+        settings().bitrate_bps / 1000
+    )?;
+    writeln!(
+        out,
+        "{:<38} {:<9} {:>9} {:>9} {:>5} {:>6} {:>6} {:>7} {:>4} {:>6} {:>6} {:>6} {:>6} {:>7}",
+        "policy",
+        "scenario",
+        "moving",
+        "still",
+        "fps",
+        "enc ms",
+        "gap ms",
+        "KB/pic",
+        "keys",
+        "lag ms",
+        "dB mov",
+        "dB end",
+        "sharp",
+        "still KB"
+    )?;
+    for (name, make, policy) in &runs {
+        if only
+            .as_ref()
+            .is_some_and(|o| !o.split('+').any(|o| name.contains(o)))
+        {
+            continue;
+        }
+        for scenario in Scenario::ALL {
+            let mut enc = make()?;
+            let q = quality(&mut enc, *policy, scenario, size, frames, openh264)?;
+            let dims = |(w, h): (usize, usize)| format!("{w}x{h}");
+            writeln!(
+                out,
+                "{name:<38} {:<9} {:>9} {:>9} {:>5.1} {:>6.1} {:>6.0} {:>7.1} {:>4} {:>6.0} {:>6.1} {:>6.1} {:>6.0} {:>7.0}",
+                scenario.name(),
+                dims(q.motion_size),
+                dims(q.still_size),
+                q.fps,
+                q.encode_ms,
+                q.max_gap_ms,
+                q.kb_per_picture,
+                q.keys,
+                q.lag_ms,
+                q.psnr_motion,
+                q.psnr_final,
+                q.sharp_ms,
+                q.still_kb
+            )?;
         }
     }
     Ok(out)
@@ -561,6 +1027,22 @@ mod tests {
             line += &format!(", top-off {k}: {p:.1}");
         }
         println!("{line}");
+    }
+
+    /// Size policies compared: speed, bytes, and how sharp the viewer's picture is while
+    /// it moves and after (`quality_report`).
+    /// `cargo test --release -p rconn-host-agent quality -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn quality() {
+        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let frames = std::env::var("FRAMES")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(60);
+        println!("{}", quality_report(frames, &lib).unwrap());
     }
 
     /// `cargo test --release -p rconn-host-agent encode_bench -- --ignored --nocapture`

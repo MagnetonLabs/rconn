@@ -207,9 +207,12 @@ pub struct VideoEncoder {
     /// openh264 engines built from now on get scaled screens ([`Self::set_scaled_input`]).
     scaled_input: bool,
     /// Windows: Microsoft's software encoder rather than openh264 when there is no GPU
-    /// encoder (`RCONN_ENCODER=software`, [`Self::set_microsoft_software`]).
+    /// encoder (the default; [`Self::set_microsoft_software`]).
     #[cfg(windows)]
     mf_software: bool,
+    /// Engines built from now on get halved pictures of a moving screen
+    /// ([`Self::set_motion_input`]).
+    motion_input: bool,
     /// Reads our own output: frame numbers and reference marks for loss repair.
     syntax: SyntaxTracker,
     ledger: Ledger,
@@ -273,7 +276,8 @@ impl VideoEncoder {
             openh264_ltr: std::env::var("RCONN_OPENH264_LTR").is_ok_and(|v| v == "1"),
             scaled_input: false,
             #[cfg(windows)]
-            mf_software: std::env::var("RCONN_ENCODER").is_ok_and(|v| v == "software"),
+            mf_software: true,
+            motion_input: false,
             syntax: SyntaxTracker::default(),
             ledger: Ledger::default(),
             next_id: 0,
@@ -357,16 +361,18 @@ impl VideoEncoder {
                 Err(e) => crate::vaapi::encoder_failed(&e.to_string()),
             }
         }
-        // Windows: Media Foundation for the GPU's encoder. Without one, openh264 rather
-        // than Microsoft's software encoder (`RCONN_ENCODER=software` still picks it):
-        // on a Windows 11 ARM VM (8 vCPUs, `--selftest-encode`) that encoder was 3-7x
-        // faster per full-size picture, but ignored the bitrate (8 Mbps asked: 43 KB a
-        // picture for a blinking caret, 2.5 MB for a scrolling 2992x1878 screen) and
-        // added keyframes of its own; at the viewer's size openh264 keeps 23-30 fps on
-        // under half the CPU, within the bitrate, with live rate changes and no keyframes.
+        // Windows: Media Foundation for the GPU's encoder; without one, Microsoft's
+        // software encoder (`RCONN_ENCODER=openh264` picks openh264). On a Windows 11 ARM
+        // VM (8 vCPUs, `encode_bench`) it took 13-15 ms a 2992x1878 picture where openh264
+        // took 70-110 ms (7 fps): the screen at the viewer's size, at 30 fps. What made it
+        // unusable before is handled: a keyframe every 30 frames (its GOP default), the
+        // bitrate blown on keyframes (quantizer ceiling 32; see
+        // `crate::mf::SOFTWARE_MAX_QP`). Its motion search fails on wide pictures and on
+        // scrolled text (see [`Self::width_limit`]): large moving areas go to openh264.
         #[cfg(windows)]
         if !self.software_only
-            && (self.mf_software || crate::mf::MfH264Encoder::hardware_available())
+            && ((self.mf_software && !self.motion_input)
+                || crate::mf::MfH264Encoder::hardware_available())
         {
             match crate::mf::MfH264Encoder::new(
                 width as u32,
@@ -374,7 +380,7 @@ impl VideoEncoder {
                 self.settings.max_fps.round().max(1.0) as u32,
                 self.settings.bitrate_bps,
             ) {
-                Ok(mf) if mf.is_hardware() || self.mf_software => {
+                Ok(mf) if mf.is_hardware() || (self.mf_software && !self.motion_input) => {
                     self.engine_name = format!("Media Foundation ({})", mf.name());
                     return Ok(Engine::MediaFoundation(mf));
                 }
@@ -468,9 +474,18 @@ impl VideoEncoder {
             // instead of 13 (the rate controller skipped the rest), and the host re-sends a
             // still picture a few times to sharpen it again (`stream.rs`, top-off: 25.5 dB
             // after the scroll, 31 dB after 6, better than 30.4 with the cap at 32).
+            // Moving pictures for Microsoft's software encoder (`set_motion_input`) coarser
+            // still: they only stand in until the screen is still, and the rate
+            // controller skipped most of them at 38.
             .qp(openh264::encoder::QpRange::new(
                 10,
-                if self.scaled_input && !ltr { 38 } else { 32 },
+                if self.motion_input {
+                    48
+                } else if self.scaled_input && !ltr {
+                    38
+                } else {
+                    32
+                },
             ))
             // Not supported for screen content; openh264 warns and disables them anyway.
             .adaptive_quantization(false)
@@ -545,12 +560,13 @@ impl VideoEncoder {
         }
     }
 
-    /// Does a bitrate change cost a keyframe on this engine? Microsoft's software Media
-    /// Foundation encoder puts out an IDR after about every other change (measured: 10
-    /// keyframes for 19 changes); other engines are watched and join it if they do the
-    /// same. Callers change such an engine's bitrate only on large, lasting moves.
+    /// Does a bitrate change cost a keyframe on this engine? Engines are watched, and one
+    /// seen to answer a change with a keyframe counts as costly from then on. Callers
+    /// change such an engine's bitrate only on large, lasting moves. (Microsoft's software
+    /// encoder was taken for one by name: its "10 keyframes for 19 changes" were its
+    /// keyframe every 30 frames; with that gone, 19 changes made none.)
     pub fn bitrate_change_costs_keyframe(&self) -> bool {
-        self.retarget_costs_key || self.engine_name.contains("H264 Encoder MFT")
+        self.retarget_costs_key
     }
 
     /// Which encoder is in use ("Media Foundation (...)" or "openh264").
@@ -583,8 +599,44 @@ impl VideoEncoder {
         self.scaled_input = on;
     }
 
+    /// Engines built from now on get halved pictures of a large area moving (scrolling, a
+    /// window dragged), or not. On Windows without a GPU encoder those go to openh264
+    /// (camera mode) rather than Microsoft's software encoder (see [`Self::width_limit`];
+    /// openh264 at 1496x939: 32 KB, 12.7 ms a scrolled picture). Each switch is a keyframe,
+    /// so callers switch rarely.
+    pub fn set_motion_input(&mut self, on: bool) {
+        self.motion_input = on;
+    }
+
+    /// The widest picture this engine (or the one the next frame builds) encodes well
+    /// (`None`: no limit): Microsoft's software encoder [`crate::mf::SOFTWARE_MAX_WIDTH`].
+    /// It also codes large moving areas as new pictures at any width once they move more
+    /// than a few pixels a frame (575-886 KB a scrolled 2688x1686 picture at 8 Mbps):
+    /// see [`Self::set_motion_input`].
+    pub fn width_limit(&self) -> Option<usize> {
+        #[cfg(windows)]
+        {
+            let software_mf = match &self.encoder {
+                Some(Engine::MediaFoundation(mf)) => !mf.is_hardware(),
+                Some(_) => false,
+                None => {
+                    !self.software_only
+                        && self.gpu.is_none()
+                        && self.codec == VideoCodec::H264
+                        && self.mf_software
+                        && !self.motion_input
+                        && !crate::mf::MfH264Encoder::hardware_available()
+                }
+            };
+            if software_mf {
+                return Some(crate::mf::SOFTWARE_MAX_WIDTH);
+            }
+        }
+        None
+    }
+
     /// Windows without a GPU encoder: Microsoft's software encoder for engines built from
-    /// now on, rather than openh264 (comparisons; `RCONN_ENCODER=software`).
+    /// now on (the default), or openh264 (comparisons).
     #[cfg(windows)]
     pub fn set_microsoft_software(&mut self, on: bool) {
         self.mf_software = on;
@@ -1444,10 +1496,11 @@ fn with_headers_of(codec: VideoCodec, out: Vec<u8>, headers: &mut Vec<u8>) -> Ve
 }
 
 /// Should a bandwidth estimate move the encoder? Where a change is free (no keyframe),
-/// anything beyond estimator jitter (5 %) is followed.
+/// a move of more than 15 %: smaller ones are the estimator's jitter (a 5 % rule made 99
+/// changes in 115 s of a live session, each a rate-control upset).
 pub fn should_retarget(current_bps: u32, estimate_bps: u32) -> bool {
     let (c, e) = (f64::from(current_bps), f64::from(estimate_bps));
-    c > 0.0 && ((e - c).abs() / c) > 0.05
+    c > 0.0 && ((e - c).abs() / c) > 0.15
 }
 
 /// As [`should_retarget`], for an engine where a change costs a keyframe
@@ -1504,7 +1557,9 @@ mod tests {
     #[test]
     fn retarget_threshold() {
         assert!(!should_retarget(4_000_000, 4_150_000));
-        assert!(should_retarget(4_000_000, 4_500_000));
+        assert!(!should_retarget(4_000_000, 4_500_000));
+        assert!(should_retarget(4_000_000, 4_700_000));
+        assert!(should_retarget(4_000_000, 3_300_000));
         assert!(should_retarget(4_000_000, 2_000_000));
         assert!(should_retarget(4_000_000, 6_000_000));
         assert!(!should_retarget(0, 1));
@@ -1644,11 +1699,8 @@ mod ltr_tests {
             bitrate_bps: bps,
             ..EncoderSettings::default()
         };
-        // openh264 everywhere (macOS would pick VideoToolbox).
-        #[cfg(target_os = "macos")]
+        // openh264 everywhere (macOS would pick VideoToolbox, Windows Media Foundation).
         let mut e = VideoEncoder::software(&lib, settings).ok()?;
-        #[cfg(not(target_os = "macos"))]
-        let mut e = VideoEncoder::new(&lib, settings).ok()?;
         e.set_long_term_refs(ltr);
         Some(e)
     }
@@ -1667,8 +1719,23 @@ mod ltr_tests {
     /// full-size IDR per change.
     #[test]
     fn live_retarget_makes_no_keyframes() {
-        for ltr in [false, true] {
-            let Some(mut e) = encoder(ltr, 4_000_000) else {
+        // openh264 both ways; on Windows also what the host picks (Media Foundation: the
+        // GPU's encoder, else Microsoft's software one).
+        let engines = [Some(false), Some(true)]
+            .into_iter()
+            .chain(cfg!(windows).then_some(None));
+        for ltr in engines {
+            let made = match ltr {
+                Some(ltr) => encoder(ltr, 4_000_000),
+                None => crate::cisco::local_binary_path().and_then(|lib| {
+                    let settings = EncoderSettings {
+                        bitrate_bps: 4_000_000,
+                        ..EncoderSettings::default()
+                    };
+                    VideoEncoder::new(&lib, settings).ok()
+                }),
+            };
+            let Some(mut e) = made else {
                 return;
             };
             let rates = [8_000_000, 1_000_000, 6_000_000, 500_000, 4_000_000];
@@ -1693,16 +1760,13 @@ mod ltr_tests {
                 rates.iter().zip(bytes).collect::<Vec<_>>(),
                 e.bitrate_change_costs_keyframe()
             );
-            // Microsoft's software Media Foundation encoder puts out keyframes on changes
-            // (known by name, so the host changes its bitrate rarely). Every other engine:
-            // one keyframe, and not taken for one that pays for changes.
-            if !e.engine_name().contains("H264 Encoder MFT") {
-                assert_eq!(keys, 1, "only the first frame");
-                assert!(
-                    !e.bitrate_change_costs_keyframe(),
-                    "free changes taken for costly"
-                );
-            }
+            // Every engine (Microsoft's software encoder too, measured on a Windows 11
+            // ARM VM): one keyframe, and not taken for one that pays for changes.
+            assert_eq!(keys, 1, "only the first frame");
+            assert!(
+                !e.bitrate_change_costs_keyframe(),
+                "free changes taken for costly"
+            );
         }
     }
 
@@ -1946,10 +2010,7 @@ mod refine_tests {
         if hardware {
             return VideoEncoder::new(lib, settings).unwrap();
         }
-        #[cfg(target_os = "macos")]
-        return VideoEncoder::software(lib, settings).unwrap();
-        #[cfg(not(target_os = "macos"))]
-        return VideoEncoder::new(lib, settings).unwrap();
+        VideoEncoder::software(lib, settings).unwrap()
     }
 
     /// Typing at 250 kbit/s leaves the text coarse (openh264 at its QP cap); one pass at

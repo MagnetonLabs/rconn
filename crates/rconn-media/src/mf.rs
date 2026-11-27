@@ -78,6 +78,23 @@ pub struct MfH264Encoder {
 
 /// Quantizer ceiling of ordinary frames (as on the openh264 path): never blocky text.
 pub const MAX_QP: u8 = 32;
+/// Quantizer ceiling of Microsoft's software encoder. With [`MAX_QP`] its rate controller
+/// could not hold the bitrate: a 2.28 MB keyframe of a 2992x1878 desktop (2.3 s at
+/// 8 Mbps), 1.7 MB pictures of it scrolling at 2688x1686 (16 KB with this ceiling). It
+/// takes the ceiling only when it starts (changes while encoding are ignored: no
+/// refinement passes), so a still screen is sharpened by re-encoding it (the host's
+/// top-off), each picture finer within the bitrate.
+pub const SOFTWARE_MAX_QP: u8 = 44;
+/// The widest picture given to Microsoft's software encoder: its motion search gives up
+/// on wider ones (a desktop scrolling 7 px a frame: 16 KB a picture at 2688x1686, QP <= 44
+/// and 8 Mbps; 553 KB at 2704x1696, 1.2 MB at 2992x1878, every picture coded as new;
+/// quality settings, worker threads, slices and levels made no difference). Fewer
+/// pixels also make its keyframes smaller: the host loop on a 2992x1878 screen kept a
+/// video at 18.6 fps capped, 10.3 uncapped (Windows 11 ARM VM, `stream::host_loop`).
+pub const SOFTWARE_MAX_WIDTH: usize = 2688;
+/// Frames between keyframes asked of Microsoft's software encoder: "0" (its default) put
+/// one in every 30 frames (2.28 MB each at 2992x1878); keyframes come on request.
+const SOFTWARE_GOP: u32 = 100_000;
 
 /// Long-term reference slots asked for: one confirmed by the viewer, one being marked.
 const LTR_SLOTS: u8 = 2;
@@ -260,8 +277,11 @@ impl MfH264Encoder {
         let max_qp = kind != VideoCodec::Av1
             && codec.as_ref().is_some_and(|c| unsafe {
                 c.IsSupported(&CODECAPI_AVEncVideoMaxQP).is_ok()
-                    && c.SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(u32::from(MAX_QP)))
-                        .is_ok()
+                    && c.SetValue(
+                        &CODECAPI_AVEncVideoMaxQP,
+                        &VARIANT::from(u32::from(max_qp_for(hardware))),
+                    )
+                    .is_ok()
             });
         Ok(Self {
             activate,
@@ -340,22 +360,32 @@ impl MfH264Encoder {
                     &VARIANT::from(eAVEncCommonRateControlMode_LowDelayVBR.0 as u32),
                 );
                 let _ = codec.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &VARIANT::from(0u32)); // fastest
-                let _ = codec.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(0u32)); // keyframes on request
+                // Keyframes on request (hardware encoders take 0 for "never"; Microsoft's
+                // software encoder takes it for 30 frames).
+                let gop = if hardware { 0 } else { SOFTWARE_GOP };
+                let _ = codec.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(gop));
                 // No B-frames: every frame comes out as soon as it is encoded.
                 let _ =
                     codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32));
-                // Same quality floor as the openh264 path: never blocky text.
+                // Same quality floor as the openh264 path: never blocky text (looser on
+                // the software encoder, see `SOFTWARE_MAX_QP`).
                 // (H.264 and HEVC share the 0-51 scale; AV1's is 0-255: left alone.)
                 if kind != VideoCodec::Av1 {
-                    let _ = codec
-                        .SetValue(&CODECAPI_AVEncVideoMaxQP, &VARIANT::from(u32::from(MAX_QP)));
+                    let _ = codec.SetValue(
+                        &CODECAPI_AVEncVideoMaxQP,
+                        &VARIANT::from(u32::from(max_qp_for(hardware))),
+                    );
                 }
             }
             // Long-term references for repairing losses without a keyframe (Windows 8.1+;
             // optional for vendors' encoders, so asked for and checked, never assumed).
             // `RCONN_ENCODER_LTR=0` turns it off for an encoder that misbehaves with it.
+            // Not on Microsoft's software encoder: its repairs broke the decoder
+            // (openh264's, on a Windows 11 ARM VM, `ltr_tests`), so its losses get a
+            // keyframe.
             let ltr_slots = match &codec {
                 Some(_) if std::env::var("RCONN_ENCODER_LTR").is_ok_and(|v| v == "0") => 0,
+                Some(_) if !hardware => 0,
                 Some(codec) => {
                     let ok = codec
                         .IsSupported(&CODECAPI_AVEncVideoLTRBufferControl)
@@ -461,8 +491,9 @@ impl MfH264Encoder {
     }
 
     /// Can a frame be coded under a lower quantizer ceiling ([`Self::set_max_qp`])?
+    /// Not on Microsoft's software encoder: it accepts the change and ignores it.
     pub fn can_refine(&self) -> bool {
-        self.max_qp
+        self.max_qp && self.is_hardware()
     }
 
     /// Code the next frames no coarser than quantizer `qp` (a refinement pass), or back to
@@ -652,6 +683,11 @@ impl MfH264Encoder {
             }
         }
     }
+}
+
+/// The quantizer ceiling an encoder starts with.
+fn max_qp_for(hardware: bool) -> u8 {
+    if hardware { MAX_QP } else { SOFTWARE_MAX_QP }
 }
 
 /// The Media Foundation subtype of `codec`.
