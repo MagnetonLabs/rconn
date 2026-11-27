@@ -486,7 +486,12 @@ export function createMockServer(db: Db = seed()): MockServer {
   on('GET', `${ORG}/invites`, (c) => {
     const { orgId, m } = member(c);
     need(m, 'admin');
-    return ok(db.invites.filter((i) => i.org_id === orgId).map(({ org_id: _o, token: _t, ...i }) => (void _o, void _t, i)));
+    // Like the server: only pending invites (expired ones drop out).
+    return ok(
+      db.invites
+        .filter((i) => i.org_id === orgId && i.expires_at > iso())
+        .map(({ org_id: _o, token: _t, ...i }) => (void _o, void _t, i)),
+    );
   });
   on('POST', `${ORG}/invites`, (c) => {
     const { orgId, m, user } = member(c);
@@ -498,22 +503,26 @@ export function createMockServer(db: Db = seed()): MockServer {
     if (role === 'owner' && m.role !== 'owner') throw forbidden('Only an owner can invite an owner.');
     const existing = db.users.find((u) => u.email === email);
     if (existing && db.memberships.some((x) => x.org_id === orgId && x.user_id === existing.id)) throw conflict(`${email} is already in this company.`);
-    if (db.invites.some((i) => i.org_id === orgId && i.email === email)) throw conflict(`${email} already has an invite.`);
+    if (db.invites.some((i) => i.org_id === orgId && i.email === email && i.expires_at > iso()))
+      throw conflict(`${email} already has an invite. Cancel it to send a new one.`);
     const inv = { id: ids.uuid(), org_id: orgId, email, role, invited_by: user.email, expires_at: iso(now() + 7 * 86_400_000), token: ids.secret(32) };
     db.invites.push(inv);
     db.outbox.push({ to: email, subject: `Join ${db.orgs.find((o) => o.id === orgId)!.name} on Rconn`, link: `/admin/invite?token=${inv.token}` });
-    audit(orgId, 'person.invited', user, { type: 'person', id: inv.id, label: email }, { role });
+    audit(orgId, 'person.invited', user, { type: 'invite', id: inv.id, label: email }, { role });
     const { org_id: _o, token: _t, ...out } = inv;
     void _o;
     void _t;
     return ok(out, 201);
   });
   on('DELETE', `${ORG}/invites/([^/]+)`, (c) => {
-    const { orgId, m } = member(c);
-    const inv = db.invites.find((i) => i.org_id === orgId && i.id === c.params[1]);
-    if (!inv) throw notFound();
+    // Like the server: the role is checked first, and admins can't cancel an owner's invite.
+    const { orgId, m, user } = member(c);
     need(m, 'admin');
+    const inv = db.invites.find((i) => i.org_id === orgId && i.id === c.params[1] && i.expires_at > iso());
+    if (!inv) throw notFound();
+    if (inv.role === 'owner' && m.role !== 'owner') throw forbidden('Only an owner can change owners.');
     db.invites = db.invites.filter((i) => i !== inv);
+    audit(orgId, 'invite.cancelled', user, { type: 'invite', id: inv.id, label: inv.email }, { role: inv.role });
     return empty();
   });
 
