@@ -17,6 +17,9 @@ pub enum Content {
     Busy,
     /// A caret blinks: a small frame 5 times a second.
     Idle,
+    /// Typing, a terminal: a frame of this many bytes 30 times a second, whatever the
+    /// estimate (application-limited).
+    Trickle(usize),
 }
 
 pub struct Scenario {
@@ -26,6 +29,13 @@ pub struct Scenario {
     pub one_way: Duration,
     /// Random loss probability per packet.
     pub loss: f64,
+    /// Extra one-way delay per packet, uniform in 0..this, packets kept in order (Wi-Fi,
+    /// a busy VM): what a delay detector can mistake for queueing.
+    pub jitter: Duration,
+    /// The receiver stops reading for a while (start, length; seconds): what arrives
+    /// meanwhile is stamped when it resumes. A busy viewer or VM does this; to the
+    /// estimator it looks like a queue that built and drained.
+    pub stalls: Vec<(f64, f64)>,
     pub content: Box<dyn Fn(f64) -> Content>,
     /// Keyframes (time in seconds, bytes), on top of the content.
     pub keyframes: Vec<(f64, usize)>,
@@ -138,6 +148,8 @@ pub fn run<E: BandwidthEstimator>(mut est: E, s: &Scenario, sender: Sender) -> T
     let mut next_frame = t0;
     let mut keyframes = s.keyframes.clone();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut jitter_rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut last_arrival = t0;
     let mut trace = Trace {
         points: Vec::new(),
         lost: 0,
@@ -153,6 +165,7 @@ pub fn run<E: BandwidthEstimator>(mut est: E, s: &Scenario, sender: Sender) -> T
             let (bytes, gap) = match (s.content)(secs) {
                 Content::Busy => ((target / 30.0 / 8.0) as usize, Duration::from_millis(33)),
                 Content::Idle => (1500, Duration::from_millis(200)),
+                Content::Trickle(b) => (b, Duration::from_millis(33)),
             };
             let mut bytes = bytes;
             if keyframes.first().is_some_and(|&(t, _)| secs >= t) {
@@ -185,11 +198,24 @@ pub fn run<E: BandwidthEstimator>(mut est: E, s: &Scenario, sender: Sender) -> T
             }
             trace.sent += 1;
             trace.lost += dropped as usize;
+            let arrival = (!dropped).then(|| {
+                let mut a = exit + s.one_way;
+                if !s.jitter.is_zero() {
+                    a = (a + s.jitter.mul_f64(jitter_rng.next())).max(last_arrival);
+                    last_arrival = a;
+                }
+                let at = a.duration_since(t0).as_secs_f64();
+                if let Some(&(start, len)) = s.stalls.iter().find(|&&(b, l)| at >= b && at < b + l)
+                {
+                    a = t0 + Duration::from_secs_f64(start + len);
+                }
+                a
+            });
             sent.push(Sent {
                 id: sent.len() as u64,
                 size,
                 departure: now,
-                arrival: (!dropped).then_some(exit + s.one_way),
+                arrival,
             });
         }
         // The receiver's feedback: everything up to the newest arrival.
