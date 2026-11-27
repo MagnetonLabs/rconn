@@ -613,22 +613,17 @@ impl Bwe {
                     let delivered = self.delivered(now, DECREASE_WINDOW);
                     // What measured the link, if anything did.
                     let queue_grew = self.link_limited(DECREASE_WINDOW);
-                    let measured = if queue_grew {
-                        // Less arrived than was sent: the link's rate.
+                    let measured = if queue_grew || !self.alr.active {
+                        // Less arrived than was sent: the link's rate. Or sending about
+                        // what the estimate allows, and it all arrived: the link is
+                        // about full.
                         delivered
-                    } else if !self.alr.active {
-                        // Sending about what the estimate allows, and it all arrived:
-                        // the link is about full.
-                        delivered
-                    } else if let Some(t) = train.filter(|&t| t < self.estimate) {
-                        // Application-limited, but a burst arrived slower than the
-                        // estimate allows.
-                        Some(t)
                     } else {
-                        // Application-limited, nothing measured the link: what arrived
-                        // is what was sent. Hold; a link that really shrank shows at the
+                        // Application-limited: only a burst that arrived slower than the
+                        // estimate allows measured the link. Otherwise what arrived is
+                        // what was sent: hold; a link that really shrank shows at the
                         // next burst.
-                        None
+                        train.filter(|&t| t < self.estimate)
                     };
                     if let Some(d) = measured {
                         // Only a queue that grew may cut deeper than half at once (the
@@ -995,7 +990,7 @@ mod tests {
         let stalls: Vec<(f64, f64)> = (0..8)
             .map(|k| (1.0 + 2.5 * k as f64 + 0.017, 0.12))
             .collect();
-        let cases: [(&str, Duration, Vec<(f64, f64)>, Content, Vec<(f64, usize)>); 3] = [
+        let cases = [
             ("busy", Duration::ZERO, vec![], Content::Busy, vec![]),
             (
                 "busy, 20 ms jitter",
