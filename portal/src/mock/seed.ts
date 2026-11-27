@@ -231,6 +231,23 @@ export function seed(now = Date.now()): Db {
   };
   addAll(ORG_A, specA, sam);
   addAll(ORG_B, specB, grace);
+  // A host from 0.1.x: connected, but never reported its OS or version.
+  computers.push({
+    id: 'b0d1e5c0-0000-4000-8000-000000000001',
+    org_id: ORG_A,
+    short_code: '104 220 381',
+    name: 'WAITING-ROOM',
+    hostname: 'WAITING-ROOM',
+    os: null,
+    version: null,
+    group_id: null,
+    online: false,
+    last_seen: iso(now - 3 * DAY),
+    enrolled_at: null,
+    enrolled_by: null,
+    revoked_at: null,
+    needs_update: true,
+  });
 
   const tokens: DbToken[] = [
     {
@@ -309,7 +326,7 @@ export function seed(now = Date.now()): Db {
       else if (r < 0.85) ev = { kind: 'sign_in.failed', actor: { type: 'system', id: 'auth', label: u.email }, target: null, ip: pick(ips), detail: { reason: 'bad_password' } };
       else if (r < 0.88) ev = { kind: 'computer.renamed', actor, target: host, ip: pick(ips), detail: { from: pc.hostname, to: pc.name } };
       else if (r < 0.91) ev = { kind: 'policy.changed', actor, target: { type: 'group', id: 'g', label: pick(['Front desk', 'Operatories', 'Company default']) }, ip: pick(ips), detail: { field: pick(['clipboard', 'allowed_hours', 'require_approval']) } };
-      else if (r < 0.94) ev = { kind: 'computer.enrolled', actor: { type: 'host', id: pc.id, label: pc.hostname }, target: host, ip: pick(ips), detail: { token: 'Operatory rollout' } };
+      else if (r < 0.94) ev = { kind: 'computer.enrolled', actor: { type: 'host', id: pc.id, label: pc.hostname ?? pc.name }, target: host, ip: pick(ips), detail: { token: 'Operatory rollout' } };
       else if (r < 0.96) ev = { kind: 'token.created', actor, target: { type: 'token', id: 't', label: 'Operatory rollout' }, ip: pick(ips), detail: {} };
       else if (r < 0.98) ev = { kind: 'person.invited', actor, target: { type: 'person', id: 'p', label: 'maria@northwind.test' }, ip: pick(ips), detail: { role: 'technician' } };
       else ev = { kind: 'person.role_changed', actor, target: { type: 'person', id: 'p', label: pick(people).email }, ip: pick(ips), detail: { from: 'viewer', to: 'technician' } };

@@ -117,7 +117,9 @@ describe('roles', () => {
   it('lets a viewer read computers but not change them or see audit', async () => {
     await signIn('leo@northwind.test');
     const list = await computers.listComputers(ORG_A);
-    expect(list.length).toBe(17);
+    expect(list.length).toBe(18);
+    const old = list.find((c) => c.hostname === 'WAITING-ROOM')!;
+    expect([old.os, old.version, old.enrolled_at, old.needs_update]).toEqual([null, null, null, true]);
     await expectError(computers.updateComputer(ORG_A, list[0].id, { name: 'x' }), 403, 'forbidden');
     await expectError(computers.listTokens(ORG_A), 403);
     await expectError(audit.listAudit(ORG_A, {}), 403);

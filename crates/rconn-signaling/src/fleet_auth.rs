@@ -279,4 +279,8 @@ impl Authenticator for FleetAuthenticator {
     async fn session_policy(&self, _host: HostIdentity) -> SessionPolicy {
         self.policy
     }
+
+    fn revoke_host(&self, host: HostId) {
+        self.revoke(host);
+    }
 }

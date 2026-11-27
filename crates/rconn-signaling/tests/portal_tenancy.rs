@@ -1,6 +1,7 @@
 //! Tenant isolation and the role table: a member of org A gets 404 for every org B route
 //! (like an org that doesn't exist), and each role gets exactly the rights the contract
-//! lists. Routes not built yet answer 501 to members whose role passes.
+//! lists. Routes not built yet answer 501 to members whose role passes; routes naming a
+//! resource answer 404 for an id that doesn't exist.
 
 mod portal_support;
 
@@ -226,8 +227,11 @@ async fn each_role_gets_what_the_table_says() {
             let r = w.p.call(&mut b, method.clone(), &path, body).await;
             let allowed = role.at_least(action.min_role());
             if allowed {
+                // Routes naming a resource answer 404 for the made-up id X.
                 assert!(
-                    r.status == StatusCode::OK || r.status == StatusCode::NOT_IMPLEMENTED,
+                    r.status.is_success()
+                        || r.status == StatusCode::NOT_IMPLEMENTED
+                        || (rest.contains(X) && r.status == StatusCode::NOT_FOUND),
                     "{role:?} {method} {path}: {} {}",
                     r.status,
                     r.text

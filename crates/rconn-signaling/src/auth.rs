@@ -74,4 +74,7 @@ pub trait Authenticator: Send + Sync + 'static {
 
     /// Effective policy for a new session to `host`.
     async fn session_policy(&self, host: HostIdentity) -> SessionPolicy;
+
+    /// Refuse this host from now on (until the revocation set is next replaced).
+    fn revoke_host(&self, _host: HostId) {}
 }

@@ -192,6 +192,32 @@ impl SignalingClient {
         }
     }
 
+    /// Join a company with an enrollment token from its admin portal: returns this
+    /// computer's new id and certificate for `key`. An older server that doesn't know
+    /// tokens answers with an error.
+    pub async fn enroll_with_token(
+        url: &str,
+        trust: &ServerTrust,
+        key: &rconn_core::fleet::HostKey,
+        token: &str,
+    ) -> Result<(HostId, String)> {
+        let mut ws = open(url, trust).await?;
+        send_on(
+            &mut ws,
+            &ClientMessage::EnrollWithToken {
+                protocol_version: PROTOCOL_VERSION,
+                token: token.trim().to_owned(),
+                public_key_der: key.public_der(),
+            },
+        )
+        .await?;
+        match recv_on(&mut ws).await? {
+            ServerMessage::HostEnrolled { host_id, cert_pem } => Ok((host_id, cert_pem)),
+            ServerMessage::Error { message, .. } => bail!("{message}"),
+            other => bail!("unexpected answer to enrollment: {other:?}"),
+        }
+    }
+
     /// Which of these 9-digit IDs are online (no account needed). An older server that
     /// doesn't know the question answers with an error.
     pub async fn presence(url: &str, trust: &ServerTrust, ids: Vec<String>) -> Result<Vec<String>> {

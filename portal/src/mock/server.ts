@@ -361,7 +361,7 @@ export function createMockServer(db: Db = seed()): MockServer {
       if (q) {
         const hit =
           x.name.toLowerCase().includes(q) ||
-          x.hostname.toLowerCase().includes(q) ||
+          (x.hostname ?? '').toLowerCase().includes(q) ||
           (qDigits.length > 0 && /^\d+$/.test(qDigits) && x.short_code.replace(/\s/g, '').includes(qDigits));
         if (!hit) return false;
       }
@@ -379,7 +379,10 @@ export function createMockServer(db: Db = seed()): MockServer {
     const x = findComputer(orgId, c.params[1]);
     need(m, 'admin');
     if (x.revoked_at) throw conflict('This computer was revoked.');
-    if ('name' in c.body) {
+    if ('name' in c.body && c.body.name === null) {
+      // Like the server: null clears the admin's name.
+      x.name = x.hostname ?? `Computer ${x.short_code}`;
+    } else if ('name' in c.body) {
       const name = str(c.body.name);
       if (!name) throw invalid('Enter a name.');
       if (name.length > 64) throw invalid('Names are at most 64 characters.');
@@ -415,7 +418,7 @@ export function createMockServer(db: Db = seed()): MockServer {
     const label = str(c.body.label);
     if (!label) throw invalid('Enter a label.');
     const hours = Number(c.body.expires_in_hours);
-    if (!Number.isInteger(hours) || hours < 1 || hours > 720) throw invalid('Expiry must be 1 to 720 hours.');
+    if (![1, 24, 168, 720].includes(hours)) throw invalid('expires_in_hours must be 1, 24, 168 or 720');
     const max = c.body.max_uses;
     if (max !== undefined && max !== null && (!Number.isInteger(max) || (max as number) < 1)) throw invalid('Max uses must be a whole number.');
     const g = groupOf(orgId, c.body.group_id);

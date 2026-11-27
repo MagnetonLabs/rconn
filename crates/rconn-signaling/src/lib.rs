@@ -28,7 +28,7 @@ use axum::http::{Extensions, HeaderMap, HeaderName};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
-use hosts::{HostFacts, HostInventory, InventoryEvent};
+use hosts::{HostFacts, HostInventory, InventoryEvent, TokenEnroller};
 use rconn_core::PROTOCOL_VERSION;
 use rconn_core::ids::{HostId, SessionId};
 use rconn_core::owner::{HostOwner, owner_admits};
@@ -68,6 +68,8 @@ struct Inner {
     client_ip_header: std::sync::OnceLock<HeaderName>,
     /// Where org hosts' online/offline/enrollment are recorded, when configured.
     inventory: std::sync::OnceLock<Arc<dyn HostInventory>>,
+    /// Enrollment tokens from the admin portal, when configured.
+    token_enroller: std::sync::OnceLock<Arc<dyn TokenEnroller>>,
 }
 
 struct OnlineHost {
@@ -117,6 +119,7 @@ impl AppState {
                 public: std::sync::OnceLock::new(),
                 client_ip_header: std::sync::OnceLock::new(),
                 inventory: std::sync::OnceLock::new(),
+                token_enroller: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -145,6 +148,33 @@ impl AppState {
     /// account are never recorded.
     pub fn record_hosts_in(&self, inventory: Arc<dyn HostInventory>) {
         let _ = self.inner.inventory.set(inventory);
+    }
+
+    /// Let computers join a company with an enrollment token (`EnrollWithToken`).
+    pub fn allow_token_enrollment(&self, enroller: Arc<dyn TokenEnroller>) {
+        let _ = self.inner.token_enroller.set(enroller);
+    }
+
+    /// Refuse this host at its next connect (the authenticator's revocation set), e.g.
+    /// right after the portal revoked it. Pair with [`Self::evict_host`].
+    pub fn refuse_host(&self, host_id: HostId) {
+        self.inner.auth.revoke_host(host_id);
+    }
+
+    /// The hosts of `org` online right now.
+    pub async fn online_in(
+        &self,
+        org: rconn_core::ids::OrgId,
+    ) -> std::collections::HashSet<HostId> {
+        self.inner
+            .registry
+            .lock()
+            .await
+            .hosts
+            .values()
+            .filter(|h| h.identity.org_id == org)
+            .map(|h| h.identity.host_id)
+            .collect()
     }
 
     /// Report to the inventory, unless the host is one without an account. Never blocks.
@@ -653,6 +683,19 @@ async fn step(
         }
         (
             Phase::New,
+            ClientMessage::EnrollWithToken {
+                protocol_version,
+                token,
+                public_key_der,
+            },
+        ) => {
+            if check_version(tx, protocol_version) {
+                enroll_with_token(state, tx, source, &token, &public_key_der).await;
+            }
+            Next::Close(Phase::New)
+        }
+        (
+            Phase::New,
             ClientMessage::GuestHello {
                 protocol_version,
                 host,
@@ -870,6 +913,45 @@ async fn enroll_anonymous(
                 public::Refusal::BadKey => ErrorCode::BadRequest,
                 public::Refusal::Internal => ErrorCode::Internal,
                 _ => ErrorCode::Forbidden,
+            };
+            send_err(tx, code, why.message().into());
+        }
+    }
+}
+
+/// A computer joins a company with an enrollment token.
+async fn enroll_with_token(
+    state: &AppState,
+    tx: &Outbox,
+    source: Option<IpAddr>,
+    token: &str,
+    public_key_der: &[u8],
+) {
+    let Some(enroller) = state.inner.token_enroller.get() else {
+        return send_err(
+            tx,
+            ErrorCode::Forbidden,
+            "this server doesn't take enrollment tokens".into(),
+        );
+    };
+    let host_id = state.fresh_host_id().await;
+    match enroller
+        .enroll(token, host_id, public_key_der, source)
+        .await
+    {
+        Ok((org, cert_pem)) => {
+            tracing::info!(%host_id, %org, ?source, "computer enrolled with a token");
+            let _ = tx.send(ServerMessage::HostEnrolled { host_id, cert_pem });
+        }
+        Err(why) => {
+            state.audit(AuditEvent::AuthFailed {
+                role: AuthRole::Host,
+                reason: format!("enrollment token from {source:?}: {why:?}"),
+            });
+            let code = match why {
+                hosts::TokenRefusal::Invalid => ErrorCode::Unauthenticated,
+                hosts::TokenRefusal::BadKey => ErrorCode::BadRequest,
+                hosts::TokenRefusal::Internal => ErrorCode::Internal,
             };
             send_err(tx, code, why.message().into());
         }

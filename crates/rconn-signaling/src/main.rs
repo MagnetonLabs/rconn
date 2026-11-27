@@ -170,6 +170,10 @@ struct ServeArgs {
     /// Resend when RESEND_API_KEY is set; otherwise it is written to the log.
     #[arg(long, env = "RCONN_MAIL_FROM")]
     mail_from: Option<String>,
+    /// The current host release (e.g. 0.1.14): the portal marks computers running an
+    /// older version "needs update". Default: this server's version.
+    #[arg(long, env = "RCONN_HOST_RELEASE")]
+    host_release: Option<String>,
 }
 
 #[tokio::main]
@@ -308,6 +312,7 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
         portal_url,
         allow_signup,
         mail_from,
+        host_release,
     } = args;
     if let Some(u) = &portal_url {
         anyhow::ensure!(
@@ -464,6 +469,14 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
     rconn_signaling::reload::reload_once(&db, &auth, &state, &mut seen).await?;
     let revoked = db.revoked_hosts().await?.len();
     let master = Arc::new(master);
+    // Computers join a company with an enrollment token made in the portal.
+    state.allow_token_enrollment(Arc::new(
+        rconn_signaling::portal::computers::DbTokenEnroller::new(
+            db.clone(),
+            master.clone(),
+            audit.clone(),
+        ),
+    ));
     let portal = rconn_signaling::portal::PortalState::new(
         db.clone(),
         state.clone(),
@@ -473,6 +486,7 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
         rconn_signaling::portal::PortalConfig {
             portal_url: portal_url.map(|u| u.trim_end_matches('/').to_owned()),
             allow_signup,
+            host_release: host_release.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
             ..Default::default()
         },
     );

@@ -43,7 +43,7 @@ test('sign in with password', async ({ page }) => {
   await page.getByLabel('Password').fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(page.getByRole('heading', { name: /^Computers/ })).toBeVisible();
-  await expect(page.locator('tbody tr')).toHaveCount(17);
+  await expect(page.locator('tbody tr')).toHaveCount(18);
   await expect(page.getByRole('combobox', { name: 'Company' })).toHaveValue(/.+/);
   await shot(page, '03-computers');
 });
@@ -235,7 +235,7 @@ test('settings, SSO and passkeys', async ({ page }) => {
 
 test('viewer sees no admin controls', async ({ page }) => {
   await signIn(page, 'leo@northwind.test');
-  await expect(page.locator('tbody tr')).toHaveCount(17);
+  await expect(page.locator('tbody tr')).toHaveCount(18);
   await expect(page.getByRole('button', { name: /^Revoke/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: /^Rename/ })).toHaveCount(0);
   await expect(page.getByRole('link', { name: 'Enrollment tokens' })).toHaveCount(0);

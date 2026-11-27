@@ -143,6 +143,17 @@ pub enum ClientMessage {
         protocol_version: u16,
         ids: Vec<String>,
     },
+    /// First message from a computer joining a company with an enrollment token (made in
+    /// the admin portal, read by the host agent from a file): the server issues an id and
+    /// a certificate for this public key in the token's company and group. Answered with
+    /// [`ServerMessage::HostEnrolled`] (or an error), then the socket closes. Servers that
+    /// predate it answer "unparseable message".
+    EnrollWithToken {
+        protocol_version: u16,
+        token: String,
+        /// Ed25519 SubjectPublicKeyInfo, DER.
+        public_key_der: Vec<u8>,
+    },
 }
 
 /// IDs per [`ClientMessage::Presence`] question.
@@ -626,6 +637,11 @@ mod tests {
             },
             ClientMessage::EndSession {
                 session_id: SessionId::new(),
+            },
+            ClientMessage::EnrollWithToken {
+                protocol_version: crate::PROTOCOL_VERSION,
+                token: "rcet_x".into(),
+                public_key_der: vec![4, 5],
             },
         ];
         for m in msgs {

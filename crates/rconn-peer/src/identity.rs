@@ -102,6 +102,20 @@ pub async fn enroll_anonymous_into(
     Ok(host_id)
 }
 
+/// Join the company of an enrollment token (from `server`'s admin portal) and save the
+/// identity in `dir`. The company decides who may connect, so no owner file is written.
+pub async fn enroll_with_token_into(
+    dir: &Path,
+    server: &str,
+    trust: &ServerTrust,
+    token: &str,
+) -> Result<HostId> {
+    let key = HostKey::generate()?;
+    let (host_id, cert) = SignalingClient::enroll_with_token(server, trust, &key, token).await?;
+    save_identity(dir, host_id, &cert, &key, None)?;
+    Ok(host_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
