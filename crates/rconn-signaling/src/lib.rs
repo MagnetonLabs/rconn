@@ -90,6 +90,8 @@ struct OnlineHost {
     owner: Option<HostOwner>,
     /// What it said it supports in `HostHello` (policies it can enforce).
     capabilities: Vec<String>,
+    /// Ends the socket's read loop (revoked).
+    kick: Arc<Notify>,
 }
 
 /// A signed-in operator's socket, so removing the person can drop it.
@@ -285,6 +287,8 @@ impl AppState {
                 code: ErrorCode::Forbidden,
                 message: "host revoked".into(),
             });
+            // Close the socket (after the error goes out), so the host knows it is offline.
+            h.kick.notify_one();
         }
         let gone: Vec<SessionId> = reg
             .sessions
@@ -430,7 +434,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, source: Option<IpAddr
         let next = if matches!(phase, Phase::Ready(_)) {
             tokio::select! {
                 n = stream.next() => n,
-                // Evicted (the person was removed): stop reading; cleanup runs below.
+                // Evicted (person removed, host revoked): stop reading; cleanup runs below.
                 () = kick.notified() => break,
             }
         } else {
@@ -578,6 +582,7 @@ async fn step(
                                 tx: tx.clone(),
                                 owner,
                                 capabilities: facts.capabilities.clone(),
+                                kick: kick.clone(),
                             },
                         );
                         match &facts.label {

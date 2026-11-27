@@ -525,6 +525,10 @@ async fn revoking_evicts_a_live_host_ends_its_sessions_and_blocks_reconnect() {
         }
     }
     assert!(saw_error, "the host is told it was revoked");
+    // ...and its socket closes, so the host sees it is offline and stops looking online.
+    while let Some(m) = recv(&mut host_ws).await {
+        assert!(!matches!(m, ServerMessage::IncomingSession { .. }), "{m:?}");
+    }
     let (_ws, verdict) = connect_host(&w.b.url, id, &key, &cert, Some("0.1.14")).await;
     assert!(
         matches!(
