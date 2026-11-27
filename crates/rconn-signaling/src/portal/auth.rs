@@ -65,6 +65,19 @@ async fn user_by_email(db: &Db, email: &str) -> anyhow::Result<Option<OperatorId
         .transpose()
 }
 
+/// Someone has a pending invite to this email: they may get a sign-in link (and become a
+/// person by using it) even where sign-up is off, so they can accept it.
+async fn invited(db: &Db, email: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM invites WHERE email = ? AND accepted_at IS NULL
+           AND revoked_at IS NULL AND expires_at > ?)",
+    )
+    .bind(email)
+    .bind(crate::db::now())
+    .fetch_one(db.pool())
+    .await?)
+}
+
 /// Finish a successful sign-in: new session (old one revoked), audit, `Me` + cookie.
 async fn signed_in(
     st: &PortalState,
@@ -225,7 +238,8 @@ pub struct MagicLinkBody {
 }
 
 /// `POST /auth/magic-link` `{email}` → 202, always (unless the request itself is bad or
-/// rate-limited). Sets the nonce cookie that binds the link to this browser.
+/// rate-limited). Sets the nonce cookie that binds the link to this browser. Mail goes to
+/// people, to anyone with a pending invite, and with sign-up on to any address.
 pub async fn magic_link(
     State(st): State<PortalState>,
     client: ClientInfo,
@@ -257,7 +271,7 @@ pub async fn magic_link(
         ),
         Some(origin) => {
             let user = user_by_email(&st.db, &email).await?;
-            if user.is_some() || st.config.allow_signup {
+            if user.is_some() || st.config.allow_signup || invited(&st.db, &email).await? {
                 let token = random_token();
                 let code = format!("{:06}", rand::random_range(0..1_000_000u32));
                 let now = crate::db::now();
@@ -389,7 +403,9 @@ pub async fn magic(
     };
     let user = match user {
         Some(u) => u,
-        None if st.config.allow_signup => create_user(&st.db, &email).await?,
+        None if st.config.allow_signup || invited(&st.db, &email).await? => {
+            create_user(&st.db, &email).await?
+        }
         None => return Err(dead()),
     };
     let enabled: Option<i64> =

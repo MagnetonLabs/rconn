@@ -724,6 +724,66 @@ async fn an_invite_is_emailed_hashed_and_accepted_once() {
 }
 
 #[tokio::test]
+async fn someone_new_signs_in_by_link_to_accept_an_invite_without_signup() {
+    // A self-hosted server (no sign-up): the invited email has no account yet.
+    let p = Portal::new().await;
+    let org = p.org("Acme").await;
+    p.user("owner@a.test", true, &[(org, Role::Owner)]).await;
+    let mut owner = p.signed_in("owner@a.test").await;
+    let (_, invite_token) = invite(&p, &mut owner, org, "Fresh@X.test", "viewer").await;
+
+    let mut b = Browser::new();
+    let n = p.mail.sent().len();
+    let r = p
+        .call(
+            &mut b,
+            Method::POST,
+            "/api/v1/auth/magic-link",
+            Some(json!({ "email": "fresh@x.test" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+    let mail = p.mail.wait_for(n + 1).await.pop().unwrap();
+    assert_eq!(mail.to, "fresh@x.test");
+    let (token, _) = portal_support::token_and_code(&mail.text);
+    let me = p
+        .call(
+            &mut b,
+            Method::POST,
+            "/api/v1/auth/magic",
+            Some(json!({ "token": token })),
+        )
+        .await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.text);
+    assert_eq!(me.json["memberships"], json!([]));
+    let r = accept(&p, &mut b, &invite_token).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_eq!(r.json["memberships"][0]["role"], "viewer");
+
+    // Without an invite (or once it is cancelled or used), a new email still gets nothing.
+    let n = p.mail.sent().len();
+    for email in ["fresh@x.test", "stranger@x.test"] {
+        let mut b = Browser::new();
+        let r = p
+            .call(
+                &mut b,
+                Method::POST,
+                "/api/v1/auth/magic-link",
+                Some(json!({ "email": email })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::ACCEPTED);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let sent: Vec<_> = p.mail.sent().into_iter().skip(n).map(|m| m.to).collect();
+    assert_eq!(
+        sent,
+        vec!["fresh@x.test".to_owned()],
+        "only the person who now exists"
+    );
+}
+
+#[tokio::test]
 async fn an_invite_for_another_email_is_refused() {
     let p = Portal::new().await;
     let org = p.org("Acme").await;
