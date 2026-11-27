@@ -3,12 +3,15 @@
 
 pub mod accounts;
 pub mod audit;
+pub mod audit_db;
 pub mod auth;
 pub mod db;
 pub mod fleet_auth;
 pub mod hosts;
 pub mod import;
+pub mod mail;
 pub mod oidc;
+pub mod portal;
 pub mod public;
 pub mod reload;
 pub mod secrets;
@@ -230,7 +233,11 @@ async fn ws_upgrade(
 
 /// The client's address: from the trusted proxy header if configured, else the socket's
 /// peer (needs `into_make_service_with_connect_info::<SocketAddr>`).
-fn client_ip(state: &AppState, headers: &HeaderMap, extensions: &Extensions) -> Option<IpAddr> {
+pub(crate) fn client_ip(
+    state: &AppState,
+    headers: &HeaderMap,
+    extensions: &Extensions,
+) -> Option<IpAddr> {
     if let Some(name) = state.inner.client_ip_header.get() {
         // Several headers or a comma list: the proxy appends, so the last entry is its own.
         let last = headers

@@ -1,8 +1,9 @@
 //! Audit log: who connected to what, when, and what was refused.
 //!
-//! Self-hosted servers append JSON lines to `<data-dir>/audit.jsonl`; the hosted service
-//! will implement [`AuditSink`] on Postgres. Records are written before the action they
-//! describe is acknowledged to the client, so a session never exists without its record.
+//! Servers append JSON lines to `<data-dir>/audit.jsonl` and, through
+//! [`crate::audit_db::DbAudit`], to the database's `audit` table that the portal shows.
+//! The file record is written before the action it describes is acknowledged to the
+//! client, so a session never exists without its record.
 
 use rconn_core::ids::{HostId, OperatorId, OrgId, SessionId};
 use rconn_core::protocol::EndReason;
@@ -79,6 +80,44 @@ pub enum AuditEvent {
         operator_id: OperatorId,
         reason: String,
     },
+    /// Someone signed in to the admin portal. `orgs`: the orgs they are a member of (the
+    /// event shows in each one's log).
+    PortalSignIn {
+        user_id: OperatorId,
+        /// `password`, `magic_link`, `sso`, `passkey`.
+        method: String,
+        ip: Option<IpAddr>,
+        orgs: Vec<OrgId>,
+    },
+    /// A portal sign-in refused. `orgs` is empty when nobody has this email.
+    PortalSignInFailed {
+        email: String,
+        method: String,
+        reason: String,
+        ip: Option<IpAddr>,
+        orgs: Vec<OrgId>,
+    },
+    /// An admin action in the portal. `kind` is the portal's audit kind
+    /// (`computer.renamed`, `person.invited`, `policy.changed`, ...).
+    PortalAction {
+        org_id: OrgId,
+        actor_id: OperatorId,
+        kind: String,
+        target: Option<AuditTarget>,
+        ip: Option<IpAddr>,
+        /// A JSON object with the action's fields (old and new values, ...).
+        detail: serde_json::Value,
+    },
+}
+
+/// What a portal action was done to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditTarget {
+    /// `computer`, `person`, `invite`, `group`, `policy`, `token`, `org`, `sso`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -132,6 +171,20 @@ impl AuditSink for FileAudit {
         if let Err(e) = f.write_all(json.as_bytes()).and_then(|_| f.flush()) {
             // Losing audit records silently would be worse than noisy logs.
             tracing::error!(error = %e, ?event, "AUDIT WRITE FAILED");
+        }
+    }
+}
+
+/// Sends every event to several sinks (the JSONL file and the database).
+pub struct TeeAudit(pub Vec<std::sync::Arc<dyn AuditSink>>);
+
+impl AuditSink for TeeAudit {
+    fn record(&self, event: AuditEvent) {
+        if let Some((last, rest)) = self.0.split_last() {
+            for sink in rest {
+                sink.record(event.clone());
+            }
+            last.record(event);
         }
     }
 }
