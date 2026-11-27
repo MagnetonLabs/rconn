@@ -94,8 +94,9 @@ pub struct Feedback {
 const ACK_EVERY: Duration = Duration::from_millis(100);
 /// A loss report is repeated after this, doubling up to 8 s, while the picture stays
 /// broken and frames that build on the loss keep coming. Longer than a full-size keyframe
-/// takes (0.5 s just to encode on a slow host): hosts before 0.1.11 answer every report
-/// with a keyframe, and a repeat at 300 ms made two or three of them per loss.
+/// takes (0.5 s just to encode on a slow host): a host sending copy instructions answers
+/// every report with a keyframe (0.1.6 to 0.1.10 do not dedupe them), and a repeat at
+/// 300 ms made two or three of them per loss.
 const REPORT_AGAIN: Duration = Duration::from_secs(1);
 
 /// Whether a frame should go to the decoder.
@@ -462,8 +463,8 @@ mod tests {
     }
 
     /// A report is not repeated while nothing new arrives: the host is encoding the
-    /// repair (or the screen is still), and with hosts before 0.1.11 every report is a
-    /// keyframe. Once frames that build on the loss come again, it is.
+    /// repair (or the screen is still), and to some hosts every report is a keyframe.
+    /// Once frames that build on the loss come again, it is.
     #[test]
     fn a_loss_report_waits_for_new_frames_before_it_is_repeated() {
         let now = Instant::now();
