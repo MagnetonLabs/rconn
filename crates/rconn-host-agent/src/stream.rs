@@ -245,8 +245,12 @@ const CPU_BOUND: f64 = 0.7;
 const CPU_AIM: f64 = 0.5;
 /// ...and raises it again when encoding takes less than this share for a while.
 const CPU_IDLE: f64 = 0.25;
-/// [`CpuCap`] never goes below this many pixels (640x360).
-const MIN_CAP_PIXELS: usize = 640 * 360;
+/// [`CpuCap`] never goes below this many pixels (1280x720): below that, text can't be read
+/// on a large window, whatever the frame rate.
+const MIN_CAP_PIXELS: usize = 1280 * 720;
+/// A screen still for this long goes out at the viewer's size, not the CPU cap's: sharp
+/// once it stops moving (the cap is for motion).
+const SHARP_AFTER: Duration = Duration::from_millis(1500);
 
 /// Keeps an encoder that can't keep up within the frame interval by capping the pixels
 /// it gets, whatever size the viewer shows the picture at: openh264 on a 4-vCPU VM took
@@ -262,13 +266,26 @@ struct CpuCap {
 
 impl CpuCap {
     /// A picture of `size` took `ms` to encode; frames are due every `budget_ms`.
-    fn note(&mut self, size: (usize, usize), ms: f64, budget_ms: f64, screen_pixels: usize) {
+    /// Keyframes aren't counted: every size switch starts with one (much slower than the
+    /// pictures that follow), and counting it made each cut look too slow and led to the
+    /// next, down to the floor.
+    fn note(
+        &mut self,
+        size: (usize, usize),
+        ms: f64,
+        key: bool,
+        budget_ms: f64,
+        screen_pixels: usize,
+    ) {
         if size != self.size {
             *self = Self {
                 max_pixels: self.max_pixels,
                 size,
                 ..Self::default()
             };
+        }
+        if key {
+            return;
         }
         self.avg_ms = if self.samples == 0 {
             ms
@@ -292,7 +309,7 @@ impl CpuCap {
             }
             self.max_pixels = Some(max);
             self.samples = 0; // measure the new size
-        } else if self.samples >= 60
+        } else if self.samples >= 15
             && self.avg_ms < budget_ms * CPU_IDLE
             && let Some(max) = self.max_pixels
         {
@@ -641,9 +658,19 @@ fn run_generation(
         // A CPU encoder (or one that can't keep up) gets the picture at the size the
         // viewer shows it, and no more pixels than it can encode in time; GPU surfaces go
         // to a hardware encoder as they are.
+        // Still for a while: the viewer's size, uncapped (and full size if that is what
+        // the viewer shows, where refinement passes then sharpen it further).
+        let calm = pending.is_none() && last_change.elapsed() >= SHARP_AFTER;
         let mut target =
             (!surfaces && view_scale != ViewScale::Off && (enc.is_software() || cpu_cap.capped()))
-                .then(|| cpu_cap.apply((w, h), view_target((w, h), ctx.view_size())))
+                .then(|| {
+                    let view = view_target((w, h), ctx.view_size());
+                    if calm {
+                        view
+                    } else {
+                        cpu_cap.apply((w, h), view)
+                    }
+                })
                 .flatten();
         // `Refine`: a still screen gets one sharp full-size picture, then stays so
         // until it changes.
@@ -838,7 +865,9 @@ fn run_generation(
         };
         let took = t0.elapsed();
         stats.encode += took;
-        if !surfaces && view_scale != ViewScale::Off {
+        // Calm pictures are sharpening, not keeping up: not the cap's business.
+        if !surfaces && view_scale != ViewScale::Off && !calm {
+            let key = encoded.is_some() && enc.last_frame().key;
             let size = target
                 .or(motion
                     .then(|| small.as_ref().map(|s| s.dimensions()))
@@ -847,6 +876,7 @@ fn run_generation(
             cpu_cap.note(
                 size,
                 took.as_secs_f64() * 1e3,
+                key,
                 budget.as_secs_f64() * 1e3,
                 w * h,
             );
@@ -1208,7 +1238,7 @@ mod tests {
         let px = screen.0 * screen.1;
         let mut cap = CpuCap::default();
         for _ in 0..10 {
-            cap.note(screen, 90.0, 33.3, px);
+            cap.note(screen, 90.0, false, 33.3, px);
         }
         let to = cap.apply(screen, None).expect("capped");
         assert!(to.0 * to.1 <= px * 20 / 100, "{to:?}");
@@ -1219,10 +1249,31 @@ mod tests {
         for _ in 0..20 {
             for _ in 0..60 {
                 let size = cap.apply(screen, None).unwrap_or(screen);
-                cap.note(size, 5.0, 33.3, px);
+                cap.note(size, 5.0, false, 33.3, px);
             }
         }
         assert!(!cap.capped());
+    }
+
+    /// Keyframes (every size switch starts with one) never lower the cap, and a slow
+    /// encoder is never cut below the floor.
+    #[test]
+    fn keyframes_dont_count_and_the_cap_has_a_floor() {
+        let screen = (2992, 1878);
+        let px = screen.0 * screen.1;
+        let mut cap = CpuCap::default();
+        for _ in 0..30 {
+            cap.note(screen, 400.0, true, 33.3, px);
+        }
+        assert!(!cap.capped());
+        for _ in 0..10 {
+            for _ in 0..10 {
+                let size = cap.apply(screen, None).unwrap_or(screen);
+                cap.note(size, 500.0, false, 33.3, px);
+            }
+        }
+        let to = cap.apply(screen, None).expect("capped");
+        assert!(to.0 * to.1 >= MIN_CAP_PIXELS * 9 / 10, "{to:?}");
     }
 
     #[test]
