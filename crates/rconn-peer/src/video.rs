@@ -818,7 +818,8 @@ impl VideoReceiver {
 /// How long the viewer waits for a missing packet before giving up on its frame.
 pub const LOSS_GIVE_UP: Duration = Duration::from_millis(250);
 
-/// Video arriving without a picture for this long: ask for a keyframe.
+/// Complete frames without a picture for this long, or video data that stopped this long
+/// without a picture: ask for a keyframe.
 pub const STALL: Duration = Duration::from_secs(1);
 /// Requests after a picture came: at most this often (each costs a full-size encode).
 const RETRY_AFTER_PICTURE: Duration = Duration::from_millis(300);
@@ -827,16 +828,23 @@ const RETRY_AFTER_PICTURE: Duration = Duration::from_millis(300);
 const RETRY_MAX: Duration = Duration::from_secs(4);
 
 /// When the viewer asks the host for a keyframe: after lost packets or a decode error,
-/// and whenever video keeps arriving with no picture coming out of it. Some decoders say
-/// nothing when a picture can't be made (VideoToolbox, given frames that build on a
-/// keyframe it never saw, returns no error and no picture), so a lost keyframe after the
-/// host changed screen size froze the picture for good: nothing ever asked for another.
+/// and whenever video keeps coming with no picture out of it. Some decoders say nothing
+/// when a picture can't be made (VideoToolbox, given frames that build on a keyframe it
+/// never saw, returns no error and no picture), so a lost keyframe after the host changed
+/// screen size froze the picture for good: nothing ever asked for another.
+///
+/// "No picture" is timed from the first *complete* frame that gave none, or from the
+/// last packet when packets stop without one (a keyframe that lost a packet on a still
+/// screen): not from the first packet. A full-size keyframe can take more than a second
+/// to arrive, and asking for another while it does only queued more of them.
 #[derive(Debug, Default)]
 pub struct KeyframeNeed {
     /// Packets were lost or a frame failed to decode, not yet asked about.
     owed: bool,
-    /// Video has arrived since the last picture, since then.
-    waiting_since: Option<Instant>,
+    /// The first complete frame since the last picture.
+    frame_since: Option<Instant>,
+    /// The newest video data since the last picture.
+    last_data: Option<Instant>,
     last_request: Option<Instant>,
     /// Requests since the last picture.
     unanswered: u32,
@@ -850,21 +858,27 @@ impl KeyframeNeed {
 
     /// Video data (an RTP packet with payload) arrived.
     pub fn data(&mut self, now: Instant) {
-        self.waiting_since.get_or_insert(now);
+        self.last_data = Some(now);
+    }
+
+    /// A complete frame came out of the reassembly (before decoding it).
+    pub fn frame(&mut self, now: Instant) {
+        self.frame_since.get_or_insert(now);
     }
 
     /// A picture came out of the decoder.
     pub fn picture(&mut self) {
-        self.waiting_since = None;
+        self.frame_since = None;
+        self.last_data = None;
         self.unanswered = 0;
     }
 
     /// Should the viewer ask for a keyframe now? Call after every packet and on a timer
     /// (a lost keyframe on a still screen is followed by no packets at all).
     pub fn poll(&mut self, now: Instant) -> bool {
-        let stalled = self
-            .waiting_since
-            .is_some_and(|t| now.saturating_duration_since(t) >= STALL);
+        let over =
+            |t: Option<Instant>| t.is_some_and(|t| now.saturating_duration_since(t) >= STALL);
+        let stalled = over(self.frame_since) || over(self.last_data);
         if !self.owed && !stalled {
             return false;
         }
@@ -898,10 +912,11 @@ mod keyframe_need_tests {
         let t0 = Instant::now();
         let mut k = KeyframeNeed::default();
         k.picture();
-        // P-frames of a stream whose keyframe was lost: data, no picture, no error.
+        // P-frames of a stream whose keyframe was lost: frames, no picture, no error.
         let mut asked = Vec::new();
         for t in (0..12_000).step_by(50) {
             k.data(ms(t0, t));
+            k.frame(ms(t0, t));
             if k.poll(ms(t0, t)) {
                 asked.push(t);
             }
@@ -934,6 +949,40 @@ mod keyframe_need_tests {
         assert!(k.poll(ms(t0, 1000)), "the timer finds it");
     }
 
+    /// A full-size keyframe on a slow link: packets for 3 s, no complete frame yet. Asking
+    /// for another meanwhile only queues another one behind it.
+    #[test]
+    fn a_keyframe_still_arriving_is_not_asked_for_again() {
+        let t0 = Instant::now();
+        let mut k = KeyframeNeed::default();
+        for t in (0..3_000).step_by(5) {
+            k.data(ms(t0, t));
+            assert!(!k.poll(ms(t0, t)), "asked at {t} ms while it arrived");
+        }
+        k.frame(ms(t0, 3_000));
+        k.picture();
+        assert!(!k.poll(ms(t0, 10_000)));
+    }
+
+    /// The clock starts at the first complete frame that gave no picture.
+    #[test]
+    fn the_stall_counts_from_a_complete_frame_without_a_picture() {
+        let t0 = Instant::now();
+        let mut k = KeyframeNeed::default();
+        for t in (0..2_000).step_by(5) {
+            k.data(ms(t0, t)); // a big frame arriving
+        }
+        let mut asked = Vec::new();
+        for t in (2_000..4_000).step_by(33) {
+            k.data(ms(t0, t));
+            k.frame(ms(t0, t)); // complete, but the decoder makes nothing of them
+            if k.poll(ms(t0, t)) {
+                asked.push(t);
+            }
+        }
+        assert_eq!(asked, [3_023], "1 s after the first complete frame");
+    }
+
     #[test]
     fn a_loss_inside_the_throttle_is_remembered_not_dropped() {
         let t0 = Instant::now();
@@ -958,6 +1007,7 @@ mod keyframe_need_tests {
         // An error on every frame at 30 fps, no picture for 10 s (a slow link).
         for t in (0..10_000).step_by(33) {
             k.data(ms(t0, t));
+            k.frame(ms(t0, t));
             k.lost();
             if k.poll(ms(t0, t)) {
                 asked.push(t);
