@@ -355,7 +355,8 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
     let org_id = db.require_legacy_org().await?.id;
     let ca = db.org_ca(org_id, &master).await?;
     // Org CAs, operator tokens, accounts and revocations come from the database (below).
-    let mut auth = FleetAuthenticator::new(server_id.clone());
+    // Roles decide who lists and connects to org computers (checked on every request).
+    let mut auth = FleetAuthenticator::new(server_id.clone()).with_db(db.clone());
     // Computers without an account: a separate CA (its own org, which no operator is in).
     // Its hosts keep connecting even after enrollment is turned off.
     let anonymous_enroll = anonymous_enroll.unwrap_or(public);

@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use rconn_core::fleet::FleetCa;
 use rconn_core::ids::{OperatorId, OrgId};
 use rconn_signaling::AppState;
+use rconn_signaling::accounts::SessionTokens;
 use rconn_signaling::audit_db::DbAudit;
 use rconn_signaling::db::{Db, Role};
 use rconn_signaling::fleet_auth::FleetAuthenticator;
@@ -22,10 +23,17 @@ use tower::ServiceExt;
 
 pub const ORIGIN: &str = "https://portal.test";
 pub const PASSWORD: &str = "correct horse battery staple";
+/// The server identity hosts sign for (`Portal::serve_ws`).
+pub const SERVER_ID: &str = "wss://portal.test";
+/// Key of the desktop app's v1 session tokens.
+pub const TOKEN_KEY: [u8; 32] = [7; 32];
 
 pub struct Portal {
     pub app: Router,
     pub db: Db,
+    /// The broker the portal drives (evictions), sharing the database's roles.
+    pub broker: AppState,
+    pub auth: Arc<FleetAuthenticator>,
     pub mail: Arc<CaptureMailer>,
     pub audit: Arc<DbAudit>,
     _dir: tempfile::TempDir,
@@ -98,7 +106,16 @@ impl Portal {
         let db = Db::open(&dir.path().join("rconn.db")).await.unwrap();
         let mail = Arc::new(CaptureMailer::default());
         let audit = Arc::new(DbAudit::spawn(db.clone()));
-        let app = AppState::new(Arc::new(FleetAuthenticator::new("wss://portal.test")));
+        let auth = Arc::new(
+            FleetAuthenticator::new(SERVER_ID)
+                .with_db(db.clone())
+                .with_accounts(
+                    OrgId::new(),
+                    Default::default(),
+                    SessionTokens::new(TOKEN_KEY),
+                ),
+        );
+        let app = AppState::new(auth.clone());
         let mut config = PortalConfig {
             portal_url: Some(ORIGIN.into()),
             ..Default::default()
@@ -106,7 +123,7 @@ impl Portal {
         f(&mut config);
         let state = PortalState::new(
             db.clone(),
-            app,
+            app.clone(),
             Arc::new(MasterKey::generate()),
             mail.clone(),
             audit.clone(),
@@ -115,6 +132,8 @@ impl Portal {
         Self {
             app: portal::router(state),
             db,
+            broker: app,
+            auth,
             mail,
             audit,
             _dir: dir,
@@ -240,6 +259,24 @@ impl Portal {
             text,
             json,
         }
+    }
+
+    /// Load the database into the broker's authenticator (CAs, tokens, accounts), as the
+    /// server's reload loop does.
+    pub async fn reload(&self) {
+        let mut seen = rconn_signaling::reload::Seen::default();
+        rconn_signaling::reload::reload_once(&self.db, &self.auth, &self.broker, &mut seen)
+            .await
+            .unwrap();
+    }
+
+    /// Serve the broker's `/v1/ws` on localhost; returns its URL.
+    pub async fn serve_ws(&self) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/ws", listener.local_addr().unwrap());
+        let app = rconn_signaling::router(self.broker.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
     }
 
     /// Audit rows `(org_id, actor_id, event)` after the writer caught up.

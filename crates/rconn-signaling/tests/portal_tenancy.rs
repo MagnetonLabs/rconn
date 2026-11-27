@@ -226,8 +226,18 @@ async fn each_role_gets_what_the_table_says() {
             let r = w.p.call(&mut b, method.clone(), &path, body).await;
             let allowed = role.at_least(action.min_role());
             if allowed {
+                // Built routes answer for real: the placeholder id X exists nowhere (404),
+                // and each role repeats the same invite (409 after the first).
                 assert!(
-                    r.status == StatusCode::OK || r.status == StatusCode::NOT_IMPLEMENTED,
+                    [
+                        StatusCode::OK,
+                        StatusCode::CREATED,
+                        StatusCode::NO_CONTENT,
+                        StatusCode::CONFLICT,
+                        StatusCode::NOT_IMPLEMENTED,
+                    ]
+                    .contains(&r.status)
+                        || (r.status == StatusCode::NOT_FOUND && rest.contains(X)),
                     "{role:?} {method} {path}: {} {}",
                     r.status,
                     r.text

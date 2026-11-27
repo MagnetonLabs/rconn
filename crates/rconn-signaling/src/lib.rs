@@ -19,7 +19,7 @@ pub mod store;
 pub mod turn_relay;
 
 use audit::{AuditEvent, AuditSink, AuthRole, NoAudit};
-use auth::{Authenticator, HostIdentity, HostProofInput, OperatorIdentity};
+use auth::{Authenticator, HostIdentity, HostProofInput, OperatorIdentity, OrgAccess};
 use axum::Router;
 use axum::extract::State;
 use axum::extract::connect_info::ConnectInfo;
@@ -30,7 +30,7 @@ use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use hosts::{HostFacts, HostInventory, InventoryEvent};
 use rconn_core::PROTOCOL_VERSION;
-use rconn_core::ids::{HostId, SessionId};
+use rconn_core::ids::{HostId, OperatorId, OrgId, SessionId};
 use rconn_core::owner::{HostOwner, owner_admits};
 use rconn_core::protocol::{
     CHALLENGE_LEN, ClientMessage, EndReason, ErrorCode, SERVER_CAPABILITIES, ServerMessage,
@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 
 type Outbox = mpsc::UnboundedSender<ServerMessage>;
 
@@ -77,9 +77,18 @@ struct OnlineHost {
     owner: Option<HostOwner>,
 }
 
+/// A signed-in operator's socket, so removing the person can drop it.
+struct OperatorConn {
+    identity: OperatorIdentity,
+    tx: Outbox,
+    /// Ends the socket's read loop.
+    kick: Arc<Notify>,
+}
+
 #[derive(Default)]
 struct Registry {
     hosts: HashMap<HostId, OnlineHost>,
+    operators: Vec<OperatorConn>,
     labels: HashMap<HostId, String>,
     sessions: HashMap<SessionId, SessionEntry>,
     /// Recent access-password requests per computer (rate limit).
@@ -206,6 +215,33 @@ impl AppState {
         }
     }
 
+    /// A person was removed from `org`: drop their signed-in sockets for it (each gets a
+    /// `Forbidden` error first) and end their sessions with `Revoked`. Returns the number
+    /// of sockets dropped.
+    pub async fn evict_operator(&self, org: OrgId, operator: OperatorId) -> usize {
+        let mut reg = self.inner.registry.lock().await;
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut reg.operators)
+            .into_iter()
+            .partition(|c| c.identity.org_id == org && c.identity.operator_id == operator);
+        reg.operators = kept;
+        for c in &gone {
+            let _ = c.tx.send(ServerMessage::Error {
+                code: ErrorCode::Forbidden,
+                message: "you were removed from this company".into(),
+            });
+            c.kick.notify_one();
+        }
+        end_sessions_of(self, &mut reg, org, operator);
+        gone.len()
+    }
+
+    /// A person's role in `org` no longer allows connecting: end their open sessions there
+    /// with `Revoked` (their sockets stay, so they can still list). Returns how many ended.
+    pub async fn end_operator_sessions(&self, org: OrgId, operator: OperatorId) -> usize {
+        let mut reg = self.inner.registry.lock().await;
+        end_sessions_of(self, &mut reg, org, operator)
+    }
+
     /// Number of hosts currently online. For health checks and tests.
     pub async fn online_hosts(&self) -> usize {
         self.inner.registry.lock().await.hosts.len()
@@ -305,9 +341,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, source: Option<IpAddr
 
     let mut phase = Phase::New;
     let auth_deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
+    let kick = Arc::new(Notify::new());
     loop {
         let next = if matches!(phase, Phase::Ready(_)) {
-            stream.next().await
+            tokio::select! {
+                n = stream.next() => n,
+                // Evicted (the person was removed): stop reading; cleanup runs below.
+                () = kick.notified() => break,
+            }
         } else {
             match tokio::time::timeout_at(auth_deadline, stream.next()).await {
                 Ok(n) => n,
@@ -347,7 +388,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, source: Option<IpAddr
                 continue;
             }
         };
-        match step(&state, &tx, phase, msg, source).await {
+        match step(&state, &tx, &kick, phase, msg, source).await {
             Next::Continue(next) => phase = next,
             // Fatal (auth failure, protocol violation): keep the phase so cleanup still runs.
             Next::Close(last) => {
@@ -373,6 +414,7 @@ enum Next {
 async fn step(
     state: &AppState,
     tx: &Outbox,
+    kick: &Arc<Notify>,
     phase: Phase,
     msg: ClientMessage,
     source: Option<IpAddr>,
@@ -493,12 +535,36 @@ async fn step(
                 return Next::Close(Phase::New);
             }
             match auth.verify_operator(&token).await {
+                // A valid token of someone no longer in the company (removed, disabled).
+                Ok(identity) if auth.org_access(identity).await == OrgAccess::None => {
+                    state.audit(AuditEvent::AuthFailed {
+                        role: AuthRole::Operator,
+                        reason: format!("{} is not a member of the org", identity.operator_id),
+                    });
+                    send_err(
+                        tx,
+                        ErrorCode::Unauthenticated,
+                        "you are not a member of this company".into(),
+                    );
+                    Next::Close(Phase::New)
+                }
                 Ok(identity) => {
                     let ice_servers = auth.ice_servers(identity.org_id).await;
                     state.audit(AuditEvent::OperatorLogin {
                         org_id: identity.org_id,
                         operator_id: identity.operator_id,
                     });
+                    state
+                        .inner
+                        .registry
+                        .lock()
+                        .await
+                        .operators
+                        .push(OperatorConn {
+                            identity,
+                            tx: tx.clone(),
+                            kick: kick.clone(),
+                        });
                     let _ = tx.send(welcome(identity.org_id, ice_servers));
                     Next::Continue(Phase::Ready(Peer::Operator(identity)))
                 }
@@ -620,12 +686,13 @@ async fn step(
             Next::Continue(Phase::Ready(Peer::Operator(op)))
         }
         (Phase::Ready(Peer::Operator(op)), ClientMessage::ListHosts) => {
+            let access = auth.org_access(op).await;
             let reg = state.inner.registry.lock().await;
             // Only hosts this operator owns: never anyone's account-less computer.
             let mut hosts: Vec<_> = reg
                 .hosts
                 .values()
-                .filter(|h| owner_admits(h.owner, op.org_id, op.operator_id))
+                .filter(|h| reaches(h.owner, op, access) != Reach::No)
                 .map(|h| rconn_core::protocol::HostInfo {
                     host_id: h.identity.host_id,
                     label: reg.labels.get(&h.identity.host_id).cloned(),
@@ -895,6 +962,30 @@ impl AppState {
     }
 }
 
+/// How far an operator gets with a host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Not in their list; requests answer "not found".
+    No,
+    /// In their list, but their role doesn't allow connecting.
+    See,
+    /// In their list and they may connect without the access password.
+    Connect,
+}
+
+/// Org computers follow the operator's role in the org (asked on every request); a
+/// computer one account claimed is that account's, whatever its org role.
+fn reaches(owner: Option<HostOwner>, op: OperatorIdentity, access: OrgAccess) -> Reach {
+    if !owner_admits(owner, op.org_id, op.operator_id) {
+        return Reach::No;
+    }
+    match (owner, access) {
+        (Some(HostOwner::Operator { .. }), _) | (_, OrgAccess::Connect) => Reach::Connect,
+        (_, OrgAccess::List) => Reach::See,
+        (_, OrgAccess::None) => Reach::No,
+    }
+}
+
 async fn request_session(
     state: &AppState,
     tx: &Outbox,
@@ -902,20 +993,44 @@ async fn request_session(
     host_id: HostId,
     guest: bool,
 ) {
+    let access = if guest {
+        OrgAccess::None
+    } else {
+        state.inner.auth.org_access(op).await
+    };
     let mut reg = state.inner.registry.lock().await;
     // A session without the access password only for the host's owner; guests (who must
     // know the password) only for the one computer they typed. Same answer for "offline",
     // "other org" and "not yours", so nobody can probe for computers.
+    let reach = |h: &OnlineHost| {
+        if guest {
+            if h.identity.org_id == op.org_id {
+                Reach::Connect
+            } else {
+                Reach::No
+            }
+        } else {
+            reaches(h.owner, op, access)
+        }
+    };
+    if reg.hosts.get(&host_id).map(reach) == Some(Reach::See) {
+        drop(reg);
+        state.audit(AuditEvent::SessionRefused {
+            host_id,
+            operator_id: op.operator_id,
+            reason: "the operator's role doesn't allow connecting".into(),
+        });
+        send_err(
+            tx,
+            ErrorCode::Forbidden,
+            "your role in this company doesn't allow connecting to computers".into(),
+        );
+        return;
+    }
     let Some((host, host_tx)) = reg
         .hosts
         .get(&host_id)
-        .filter(|h| {
-            if guest {
-                h.identity.org_id == op.org_id
-            } else {
-                owner_admits(h.owner, op.org_id, op.operator_id)
-            }
-        })
+        .filter(|h| reach(h) == Reach::Connect)
         .map(|h| (h.identity, h.tx.clone()))
     else {
         if !guest {
@@ -1008,6 +1123,27 @@ async fn end_session(state: &AppState, tx: &Outbox, peer: Peer, session_id: Sess
     }
 }
 
+/// End every session `operator` (signed in to `org`) has open, with `Revoked`.
+fn end_sessions_of(
+    state: &AppState,
+    reg: &mut Registry,
+    org: OrgId,
+    operator: OperatorId,
+) -> usize {
+    let gone: Vec<SessionId> = reg
+        .sessions
+        .iter()
+        .filter(|(_, e)| e.operator.org_id == org && e.operator.operator_id == operator)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in &gone {
+        if let Some(e) = reg.sessions.remove(id) {
+            notify_ended(state, &e, *id, EndReason::Revoked);
+        }
+    }
+    gone.len()
+}
+
 fn notify_ended(state: &AppState, e: &SessionEntry, session_id: SessionId, reason: EndReason) {
     state.audit(AuditEvent::SessionEnded { session_id, reason });
     let _ = e
@@ -1039,6 +1175,9 @@ async fn disconnect(state: &AppState, peer: Peer, tx: &Outbox) {
             });
             tracing::info!(host_id = %h.host_id, "host offline");
         }
+    }
+    if let Peer::Operator(_) = peer {
+        reg.operators.retain(|c| !c.tx.same_channel(tx));
     }
     let gone: Vec<SessionId> = reg
         .sessions
