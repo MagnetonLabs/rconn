@@ -55,6 +55,6 @@ ENV RCONN_DATA_DIR=/data RCONN_MASTER_KEY_FILE=/keys/master.key RCONN_BIND=0.0.0
 VOLUME /data /keys
 # 8080/tcp signaling (put TLS in front), 3478/udp TURN, relay range udp
 EXPOSE 8080/tcp 3478/udp 49160-49260/udp
-HEALTHCHECK --interval=30s --timeout=3s CMD ["/bin/sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+HEALTHCHECK --interval=30s --timeout=3s CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
 ENTRYPOINT ["rconn-signaling"]
 CMD ["serve"]
