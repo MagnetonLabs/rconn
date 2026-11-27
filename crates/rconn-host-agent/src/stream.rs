@@ -331,14 +331,32 @@ impl FrameClock {
         self.next
     }
 
-    /// A frame started (its picture taken, its encode about to begin) at `now`.
-    fn started(&mut self, now: Instant) {
+    /// A frame started (its picture taken, its encode about to begin) at `now`: the slot
+    /// it fills (`now`, or earlier on the grid). Intervals count from slots, not from
+    /// starts: a start a few ms late (the picture took longer to take, a coarse sleep)
+    /// must not push the next frame's due time back, or each frame waits for the
+    /// screen's next present after it (a 60 Hz screen: 24 fps of 30).
+    fn started(&mut self, now: Instant) -> Instant {
         let slot = if now < self.next + self.budget {
             self.next
         } else {
             now
         };
         self.next = slot + self.budget;
+        slot
+    }
+}
+
+/// How long after the last frame's slot a change is due: at once (the frame budget)
+/// while someone interacts, a big area moves or something plays; background animation
+/// gets fewer frames (each full-screen encode costs the same, however small the change).
+fn change_interval(urgent: bool, changed: f32, budget: Duration) -> Duration {
+    if urgent {
+        budget
+    } else if changed >= BIG_CHANGE {
+        MEDIUM_INTERVAL.max(budget)
+    } else {
+        BACKGROUND_INTERVAL.max(budget)
     }
 }
 
@@ -633,8 +651,8 @@ fn run_generation(
     let mut produced = false;
     let started = Instant::now();
     let mut clock = FrameClock::new(budget, Instant::now());
-    // Start of the last frame encoded (background batching counts from it).
-    let mut last_start = Instant::now() - Duration::from_secs(1);
+    // Slot of the last frame encoded (intervals count from it, see `FrameClock::started`).
+    let mut last_slot = Instant::now() - Duration::from_secs(1);
     let mut last_sent: Option<Instant> = None;
     let mut retarget_at = Instant::now() + RETARGET_EVERY;
     let mut last_change = Instant::now();
@@ -673,21 +691,14 @@ fn run_generation(
         let due = pending
             .as_ref()
             .map(|p| {
-                (last_start
-                    + if p.changed >= BIG_CHANGE {
-                        MEDIUM_INTERVAL
-                    } else {
-                        BACKGROUND_INTERVAL
-                    })
-                .max(link_due)
+                let urgent = interactive() || p.changed >= MOTION_CHANGE || animation.playing(now);
+                (last_slot + change_interval(urgent, p.changed, budget)).max(link_due)
             })
             .into_iter()
             .chain(resends.first().copied())
             // (Top-offs wait for the link too: a due time before it would poll.)
-            .chain((topoff_left > 0).then(|| (last_start + BACKGROUND_INTERVAL).max(link_due)))
-            .chain(
-                converging(converge, Instant::now()).then(|| (last_start + budget).max(link_due)),
-            )
+            .chain((topoff_left > 0).then(|| (last_slot + BACKGROUND_INTERVAL).max(link_due)))
+            .chain(converging(converge, Instant::now()).then(|| (last_slot + budget).max(link_due)))
             .chain(
                 refiner
                     .as_ref()
@@ -866,18 +877,10 @@ fn run_generation(
             motion = false;
             big_streak = 0;
         }
-        // Full rate while someone interacts, a big area moves or something plays;
-        // background animation gets fewer frames (each full-screen encode costs the
-        // same, however small the change).
+        // Full rate while someone interacts, a big area moves or something plays.
         let changed = pending.as_ref().map_or(0.0, |p| p.changed);
         let urgent = interactive() || changed >= MOTION_CHANGE || animation.playing(now);
-        let interval = if urgent {
-            budget
-        } else if changed >= BIG_CHANGE {
-            MEDIUM_INTERVAL.max(budget)
-        } else {
-            BACKGROUND_INTERVAL.max(budget)
-        };
+        let interval = change_interval(urgent, changed, budget);
         // A still picture is sharpened by refinement passes where the engine codes a
         // frame at a chosen quantizer (openh264 at full size only: its camera mode, at
         // the viewer's size, gets top-offs), else by top-offs where a software encoder's
@@ -892,7 +895,7 @@ fn run_generation(
         let topoff = pending.is_none()
             && topoffs
             && if counted {
-                topoff_left > 0 && now >= last_start + BACKGROUND_INTERVAL
+                topoff_left > 0 && now >= last_slot + BACKGROUND_INTERVAL
             } else {
                 converging(converge, now)
             };
@@ -919,7 +922,7 @@ fn run_generation(
         // Changes and top-offs wait for the link (keyframes, repairs and refinement
         // passes don't: the refiner paces itself).
         let link_busy = link_free > now + LINK_AHEAD;
-        let change_due = pending.is_some() && now >= last_start + interval;
+        let change_due = pending.is_some() && now >= last_slot + interval;
         if link_busy && change_due {
             held_since.get_or_insert(now);
         }
@@ -936,8 +939,12 @@ fn run_generation(
         if let Some(t) = held_since.take() {
             stats.link_held += now - t;
         }
-        clock.started(now);
-        last_start = now;
+        if now < clock.next() + budget {
+            // A frame of a steady stream: how long after its slot it started.
+            stats.late += now.saturating_duration_since(clock.next());
+            stats.late_frames += 1;
+        }
+        last_slot = clock.started(now);
         if let Some(qp) = refine_qp {
             enc.refine_next(qp);
             if let Some(c) = composer.as_mut() {
@@ -1298,6 +1305,10 @@ struct Stats {
     max_gap: Duration,
     /// Time changes waited for the link to drain (an encoder above its bitrate).
     link_held: Duration,
+    /// How long after their slot frames of a steady stream started (sleep overshoot,
+    /// waiting for the capturer), and how many such frames.
+    late: Duration,
+    late_frames: u32,
     /// The size of the last picture encoded, and how often it changed.
     size: Option<(usize, usize)>,
     size_switches: u32,
@@ -1353,6 +1364,7 @@ impl Stats {
             max_latency_ms = ms(self.max_latency),
             max_gap_ms = ms(self.max_gap),
             link_held_ms = ms(self.link_held),
+            late_ms = per(self.late, f64::from(self.late_frames.max(1))),
             // Stages after the encoder: waiting for the session task, then packetizing
             // into RTP and queueing at the pacer.
             queue_ms = format!("{queue_ms:.1}"),
@@ -1376,6 +1388,10 @@ impl Stats {
         *self = Self::default();
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "stream_live.rs"]
+mod live;
 
 #[cfg(test)]
 mod tests {
@@ -1585,6 +1601,41 @@ mod tests {
         assert_eq!(clock.next(), idle + budget);
     }
 
+    /// A 60 Hz screen, pictures taking 2-8 ms to take, 11 ms encodes, someone typing:
+    /// counting the next frame's due time from the last frame's slot keeps 30 fps. From
+    /// its start (a few ms late), a frame taken at its slot was "not due yet" and waited
+    /// for the screen's next present: 24 fps (a Windows VM: 24-26, never above 25.8).
+    #[test]
+    fn intervals_count_from_slots_not_starts() {
+        let budget = Duration::from_secs(1) / 30;
+        let present = Duration::from_secs(1) / 60;
+        let fps = |from_slot: bool| {
+            let t0 = Instant::now();
+            let mut clock = FrameClock::new(budget, t0);
+            let mut last = t0 - Duration::from_secs(1);
+            let (mut now, mut seed, mut frames) = (t0, 7u32, 0u32);
+            while now < t0 + Duration::from_secs(3) {
+                now = now.max(clock.next()); // the frame clock's sleep
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                now += Duration::from_millis(2 + u64::from(seed >> 29)); // take the picture
+                if now < last + change_interval(true, 0.01, budget) {
+                    // Not due: the capturer waits for the screen's next present.
+                    let n = (now - t0).as_nanos() / present.as_nanos() + 1;
+                    now = t0 + present * n as u32;
+                    continue;
+                }
+                let slot = clock.started(now);
+                last = if from_slot { slot } else { now };
+                frames += 1;
+                now += Duration::from_millis(11); // encode
+            }
+            f64::from(frames) / 3.0
+        };
+        let (slots, starts) = (fps(true), fps(false));
+        assert!(slots >= 29.5, "{slots:.1} fps");
+        assert!(starts < 27.0, "the old way: {starts:.1} fps");
+    }
+
     /// Something playing (a video in a window) is noticed after a few changes in a row;
     /// a blinking caret (twice a second) and a tiny spinner are not.
     #[test]
@@ -1697,6 +1748,8 @@ mod tests {
         scenario: crate::encode_bench::Scenario,
         started: Option<Instant>,
         moving: Duration,
+        /// Changes per second while it moves.
+        hz: u32,
         k: usize,
         sent_first: bool,
     }
@@ -1729,9 +1782,9 @@ mod tests {
                 }));
             }
             // After a still start (the first keyframe drains), the screen's next change is
-            // due at 30 fps while it moves.
+            // due at `hz` while it moves.
             let t0 = t0 + SETTLE;
-            let due = t0 + Duration::from_secs(1) / 30 * (self.k as u32 + 1);
+            let due = t0 + Duration::from_secs(1) / self.hz * (self.k as u32 + 1);
             if t0.elapsed() >= self.moving || Instant::now() + timeout < due {
                 std::thread::sleep(timeout);
                 return Ok(None);
@@ -1791,8 +1844,13 @@ mod tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3),
         );
+        // The screen's own rate (a 60 Hz display scrolling: `RCONN_BENCH_HZ=60`).
+        let hz: u32 = std::env::var("RCONN_BENCH_HZ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
         println!(
-            "screen {}x{}, viewer {}x{}: {} s of changes at 30 fps, then 4 s still; 8000 kbps",
+            "screen {}x{}, viewer {}x{}: {} s of changes at {hz} Hz, then 4 s still; 8000 kbps",
             size.0,
             size.1,
             view.0,
@@ -1823,11 +1881,12 @@ mod tests {
                     desk: crate::encode_bench::Desktop::new(
                         scenario,
                         size,
-                        40 * moving.as_secs() as usize,
+                        (hz as usize + 10) * moving.as_secs() as usize,
                     ),
                     scenario,
                     started: None,
                     moving,
+                    hz,
                     k: 0,
                     sent_first: false,
                 }))
