@@ -31,6 +31,15 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# Debug builds and tests: line numbers in backtraces, no full debug info (measured on
+# `cargo test -p rconn-peer --no-run`: 3.4 GB -> 2.0-2.6 GB, 26 s -> 21 s). For a debugger
+# session, build with CARGO_PROFILE_DEV_DEBUG=2.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
