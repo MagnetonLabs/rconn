@@ -150,7 +150,7 @@ export default function People() {
                             You
                           </span>
                         )}
-                        <span className="sub">{p.email}</span>
+                        {p.name && p.name !== p.email && <span className="sub">{p.email}</span>}
                       </td>
                       <td>
                         {manageable ? (
