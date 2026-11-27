@@ -85,7 +85,7 @@ if [ "$MODE" = rollback ]; then
   [ -f "$BACKUP" ] || die "no backup $BACKUP"
   OLD_COMPOSE="${BACKUP%.tgz}.compose.yaml"
   [ -f "$OLD_COMPOSE" ] || die "no compose backup $OLD_COMPOSE"
-  tar -tzf "$BACKUP" | grep -qx './ca.pem' || die "$BACKUP holds no ca.pem; is it a data-volume backup?"
+  tar -tzf "$BACKUP" | grep -x './ca.pem' >/dev/null || die "$BACKUP holds no ca.pem; is it a data-volume backup?"
   step "rollback to $(basename "$BACKUP")"
   note "the database and everything written since the migration are discarded"
   x dc "${PROFILE[@]}" stop
@@ -149,11 +149,11 @@ x sh -c 'umask 077; docker compose -f "$1" run --rm --no-deps -T --entrypoint ta
 x cp "$COMPOSE" "${BACKUP%.tgz}.compose.yaml"
 if [ -n "$APPLY" ]; then
   [ -s "$BACKUP" ] || die "backup is empty"
-  if tar -tzf "$BACKUP" | grep -qx './rconn.db'; then
+  if tar -tzf "$BACKUP" | grep -x './rconn.db' >/dev/null; then
     x dc start "$SERVICE"
     die "the data volume already has rconn.db: this server was migrated before (restarted it unchanged)"
   fi
-  tar -tzf "$BACKUP" | grep -qx './ca.pem' || { dc start "$SERVICE"; die "no ca.pem in the data volume (restarted it unchanged)"; }
+  tar -tzf "$BACKUP" | grep -x './ca.pem' >/dev/null || { dc start "$SERVICE"; die "no ca.pem in the data volume (restarted it unchanged)"; }
   note "backup: $(wc -c < "$BACKUP" | tr -d ' ') bytes, $(tar -tzf "$BACKUP" | grep -vc '/$') files"
 fi
 
@@ -163,8 +163,8 @@ x python3 -I -c 'import sys; p,old,new=sys.argv[1:]; s=open(p).read(); s=s.repla
 x dc up -d "$SERVICE"
 if [ -n "$APPLY" ]; then
   for _ in $(seq 60); do
-    dc logs --no-color "$SERVICE" 2>&1 | grep -q 'imported data-dir files' && break
-    dc ps --status running -q "$SERVICE" | grep -q . || { dc logs --tail 30 "$SERVICE"; die "the server stopped; roll back: $0 rollback --backup $BACKUP --apply"; }
+    dc logs --no-color "$SERVICE" 2>&1 | grep -c 'imported data-dir files' >/dev/null && break
+    dc ps --status running -q "$SERVICE" | grep -c . >/dev/null || { dc logs --tail 30 "$SERVICE"; die "the server stopped; roll back: $0 rollback --backup $BACKUP --apply"; }
     sleep 1
   done
   dc logs --no-color "$SERVICE" 2>&1 | grep 'imported data-dir files' | tail -1 | sed 's/^/   /'
@@ -241,10 +241,10 @@ if [ -n "$WITH_BACKUP" ]; then
   x dc --profile backup up -d litestream
   if [ -n "$APPLY" ]; then
     for _ in $(seq 60); do
-      dc --profile backup logs --no-color litestream 2>&1 | grep -q 'snapshot complete' && break
+      dc --profile backup logs --no-color litestream 2>&1 | grep -c 'snapshot complete' >/dev/null && break
       sleep 1
     done
-    if dc --profile backup logs --no-color litestream 2>&1 | grep -q 'snapshot complete'; then
+    if dc --profile backup logs --no-color litestream 2>&1 | grep -c 'snapshot complete' >/dev/null; then
       note "first snapshot uploaded"
     else
       dc --profile backup logs --tail 20 litestream; die "Litestream has not uploaded a snapshot after 60 s (the server keeps running)"
