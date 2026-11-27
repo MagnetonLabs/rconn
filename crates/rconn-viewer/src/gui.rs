@@ -1199,15 +1199,23 @@ pub fn fit(area: Rect, size: Vec2) -> Rect {
 const DANGER: Color32 = Color32::from_rgb(210, 70, 60);
 
 /// Key combinations offered in the toolbar's Keys menu (pressed in order, released in reverse).
-const COMBOS: [(&str, &[u16]); 3] = {
+const COMBOS: [(&str, &[u16]); 10] = {
     use rconn_core::hid::usage as u;
     [
-        ("Windows key", &[u::META_LEFT]),
-        ("Alt+Tab", &[u::ALT_LEFT, u::TAB]),
+        // (Windows hosts from 0.1.12 turn this into a real Ctrl+Alt+Delete.)
+        ("Ctrl+Alt+Del", &[u::CONTROL_LEFT, u::ALT_LEFT, u::DELETE]),
         (
             "Task Manager (Ctrl+Shift+Esc)",
             &[u::CONTROL_LEFT, u::SHIFT_LEFT, u::ESCAPE],
         ),
+        ("Windows key", &[u::META_LEFT]),
+        ("Alt+Tab", &[u::ALT_LEFT, u::TAB]),
+        ("Close window (Alt+F4)", &[u::ALT_LEFT, u::F1 + 3]),
+        ("Show desktop (Win+D)", &[u::META_LEFT, u::A + 3]),
+        ("Run (Win+R)", &[u::META_LEFT, u::A + 17]),
+        ("File Explorer (Win+E)", &[u::META_LEFT, u::A + 4]),
+        ("Print Screen", &[u::PRINT_SCREEN]),
+        ("Insert", &[u::INSERT]),
     ]
 };
 

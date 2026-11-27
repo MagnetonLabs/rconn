@@ -185,6 +185,37 @@ fn platform_injector() -> Option<Box<dyn Injector>> {
     }
 }
 
+/// Spots Ctrl+Alt+Delete in the key stream. Windows never acts on that chord from
+/// `SendInput`; the host asks Windows for it instead (see `windows::send_sas`).
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub struct SasChord {
+    ctrl: HashSet<u16>,
+    alt: HashSet<u16>,
+}
+
+#[cfg(any(windows, test))]
+impl SasChord {
+    /// Note a key event; true when it is the Delete press of Ctrl+Alt+Delete.
+    pub fn key(&mut self, hid: u16, pressed: bool) -> bool {
+        use rconn_core::hid::usage as u;
+        let set = match hid {
+            u::CONTROL_LEFT | u::CONTROL_RIGHT => Some(&mut self.ctrl),
+            u::ALT_LEFT | u::ALT_RIGHT => Some(&mut self.alt),
+            _ => None,
+        };
+        if let Some(set) = set {
+            if pressed {
+                set.insert(hid);
+            } else {
+                set.remove(&hid);
+            }
+            return false;
+        }
+        pressed && hid == u::DELETE && !self.ctrl.is_empty() && !self.alt.is_empty()
+    }
+}
+
 /// Tracks what the viewer is holding down, to release it when the session ends.
 #[derive(Default)]
 struct Held {
@@ -283,6 +314,22 @@ mod tests {
             plain.0,
             ["key 0x2a true", "key 0x2a true", "key 0x2a false"]
         );
+    }
+
+    #[test]
+    fn ctrl_alt_delete_is_spotted() {
+        use rconn_core::hid::usage as u;
+        let mut c = SasChord::default();
+        assert!(!c.key(u::DELETE, true), "Delete alone");
+        c.key(u::DELETE, false);
+        c.key(u::CONTROL_LEFT, true);
+        assert!(!c.key(u::DELETE, true), "Ctrl+Delete");
+        c.key(u::DELETE, false);
+        c.key(u::ALT_RIGHT, true);
+        assert!(c.key(u::DELETE, true), "Ctrl+Alt+Delete");
+        assert!(!c.key(u::DELETE, false), "the release");
+        c.key(u::ALT_RIGHT, false);
+        assert!(!c.key(u::DELETE, true), "Alt released");
     }
 
     #[test]

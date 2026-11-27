@@ -26,6 +26,80 @@ const XBUTTON2: u32 = 2;
 #[derive(Default)]
 pub struct SendInputInjector {
     attached: bool,
+    sas: super::SasChord,
+    /// A Delete press went to Windows as the secure attention sequence; its release is
+    /// swallowed too.
+    sas_sent: bool,
+}
+
+/// Ctrl+Alt+Delete: Windows ignores it from `SendInput`, so ask Winlogon for it with
+/// `SendSAS` (sas.dll), which works from this SYSTEM process when the
+/// SoftwareSASGeneration policy allows services. Returns whether it was sent.
+fn send_sas() -> bool {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::{s, w};
+    if let Err(e) = allow_software_sas() {
+        tracing::warn!(error = %e, "can't allow Ctrl+Alt+Delete from software");
+    }
+    unsafe {
+        let Ok(lib) = LoadLibraryW(w!("sas.dll")) else {
+            tracing::warn!("sas.dll not found; Ctrl+Alt+Delete not sent");
+            return false;
+        };
+        let Some(f) = GetProcAddress(lib, s!("SendSAS")) else {
+            tracing::warn!("SendSAS missing from sas.dll");
+            return false;
+        };
+        // SendSAS(BOOL AsUser): FALSE, sent as a service rather than an Ease of Access app.
+        let send: unsafe extern "system" fn(i32) = std::mem::transmute(f);
+        send(0);
+    }
+    tracing::info!("Ctrl+Alt+Delete sent to Windows");
+    true
+}
+
+/// SendSAS needs HKLM\...\Policies\System\SoftwareSASGeneration to include services
+/// (1 = services, 3 = services and Ease of Access apps). Add services if it doesn't.
+fn allow_software_sas() -> windows::core::Result<()> {
+    use windows::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, REG_DWORD, RRF_RT_REG_DWORD, RegGetValueW, RegSetKeyValueW,
+    };
+    use windows::core::w;
+    let key = w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System");
+    let name = w!("SoftwareSASGeneration");
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key,
+            name,
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut value).cast()),
+            Some(&mut size),
+        )
+    };
+    if read.is_ok() && value & 1 == 1 {
+        return Ok(());
+    }
+    let wanted: u32 = if read.is_ok() { value | 1 } else { 1 };
+    unsafe {
+        RegSetKeyValueW(
+            HKEY_LOCAL_MACHINE,
+            key,
+            name,
+            REG_DWORD.0,
+            Some((&raw const wanted).cast()),
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
+    .ok()?;
+    tracing::info!(
+        wanted,
+        "allowed services to send Ctrl+Alt+Delete (SoftwareSASGeneration)"
+    );
+    Ok(())
 }
 
 impl SendInputInjector {
@@ -166,6 +240,14 @@ impl Injector for SendInputInjector {
     }
 
     fn key(&mut self, hid_usage: u16, pressed: bool) {
+        if self.sas.key(hid_usage, pressed) && send_sas() {
+            self.sas_sent = true;
+            return;
+        }
+        if self.sas_sent && !pressed && hid_usage == rconn_core::hid::usage::DELETE {
+            self.sas_sent = false;
+            return;
+        }
         let Some(code) = to_windows_scancode(hid_usage) else {
             tracing::debug!(hid_usage, "unmapped key");
             return;
