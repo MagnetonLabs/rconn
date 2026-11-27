@@ -88,15 +88,39 @@ impl MasterKey {
 
     /// Seal `plaintext` for `org`.
     pub fn seal(&self, org: OrgId, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.seal_aad(&aad(org), plaintext)
+    }
+
+    /// Seal another kind of org secret (`purpose` names it, e.g. `sso-client-secret`), so
+    /// it can't be swapped with the org's CA key or a secret of another purpose.
+    pub fn seal_for(&self, org: OrgId, purpose: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.seal_aad(&purpose_aad(org, purpose), plaintext)
+    }
+
+    /// Open what [`seal_for`](Self::seal_for) sealed with the same org and purpose.
+    pub fn open_for(&self, org: OrgId, purpose: &str, sealed: &[u8]) -> Result<Vec<u8>> {
+        self.open_aad(org, &purpose_aad(org, purpose), sealed)
+    }
+
+    /// A 32-byte key for `label`, derived from the master key (HMAC-SHA256), for server
+    /// secrets that must stay the same across restarts.
+    pub fn derive(&self, label: &str) -> [u8; 32] {
+        use hmac::{KeyInit as _, Mac};
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&self.0).expect("any key size");
+        mac.update(b"rconn/derive/v1\0");
+        mac.update(label.as_bytes());
+        mac.finalize().into_bytes().into()
+    }
+
+    fn seal_aad(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce: [u8; NONCE_LEN] = rand::random();
-        let aad = aad(org);
         let ct = self
             .cipher()
             .encrypt(
                 &XNonce::from(nonce),
                 Payload {
                     msg: plaintext,
-                    aad: &aad,
+                    aad,
                 },
             )
             .map_err(|_| anyhow::anyhow!("sealing failed"))?;
@@ -110,6 +134,10 @@ impl MasterKey {
     /// Open an envelope sealed for `org`. Fails for another org, another key, or any
     /// change to the bytes.
     pub fn open(&self, org: OrgId, sealed: &[u8]) -> Result<Vec<u8>> {
+        self.open_aad(org, &aad(org), sealed)
+    }
+
+    fn open_aad(&self, org: OrgId, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
         let Some((&ENVELOPE_V1, rest)) = sealed.split_first() else {
             bail!("unknown secret envelope version");
         };
@@ -118,9 +146,8 @@ impl MasterKey {
         }
         let (nonce, ct) = rest.split_at(NONCE_LEN);
         let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("split at NONCE_LEN");
-        let aad = aad(org);
         self.cipher()
-            .decrypt(&XNonce::from(nonce), Payload { msg: ct, aad: &aad })
+            .decrypt(&XNonce::from(nonce), Payload { msg: ct, aad })
             .map_err(|_| anyhow::anyhow!("secret for org {org} does not open with this master key"))
     }
 
@@ -132,6 +159,14 @@ impl MasterKey {
 fn aad(org: OrgId) -> Vec<u8> {
     let mut aad = AAD_LABEL.to_vec();
     aad.extend_from_slice(org.0.as_bytes());
+    aad
+}
+
+/// The CA key's associated data plus `\0purpose`, so it never equals the CA key's.
+fn purpose_aad(org: OrgId, purpose: &str) -> Vec<u8> {
+    let mut aad = aad(org);
+    aad.push(0);
+    aad.extend_from_slice(purpose.as_bytes());
     aad
 }
 
@@ -147,4 +182,30 @@ fn warn_if_shared(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purpose_sealed_secrets_open_only_for_their_org_and_purpose() {
+        let k = MasterKey::generate();
+        let (a, b) = (OrgId::new(), OrgId::new());
+        let sealed = k.seal_for(a, "sso-client-secret", b"s3cret").unwrap();
+        assert_eq!(
+            k.open_for(a, "sso-client-secret", &sealed).unwrap(),
+            b"s3cret"
+        );
+        assert!(k.open_for(b, "sso-client-secret", &sealed).is_err());
+        assert!(k.open_for(a, "other", &sealed).is_err());
+        assert!(
+            k.open(a, &sealed).is_err(),
+            "not interchangeable with the CA key"
+        );
+        let ca = k.seal(a, b"ca key").unwrap();
+        assert!(k.open_for(a, "", &ca).is_err());
+        assert_eq!(k.derive("x"), k.derive("x"));
+        assert_ne!(k.derive("x"), k.derive("y"));
+    }
 }

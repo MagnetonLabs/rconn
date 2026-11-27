@@ -12,7 +12,8 @@
 //! | [`people`] | `/orgs/{org_id}/people…`, `/orgs/{org_id}/invites…`, `/invites/accept` |
 //! | [`policies`] | `/orgs/{org_id}/groups…`, `/orgs/{org_id}/policy/default` |
 //! | [`audit`] | `/orgs/{org_id}/audit`, `/orgs/{org_id}/audit.csv` |
-//! | [`sso`] | `/orgs/{org_id}/sso…`, `/auth/sso/…`, `/auth/passkey/…`, `/me/passkeys…` |
+//! | [`sso`] | `/orgs/{org_id}/sso…`, `/auth/sso/…` |
+//! | [`passkeys`] | `/auth/passkey/…`, `/me/passkeys…` |
 //!
 //! Every request passes [`security::guard`] (Origin check and JSON-only bodies on
 //! non-GET requests). Org data is only reached through an [`OrgCtx`], which answers 404
@@ -24,6 +25,7 @@ pub mod computers;
 pub mod error;
 pub mod me;
 pub mod org;
+pub mod passkeys;
 pub mod people;
 pub mod policies;
 pub mod ratelimit;
@@ -94,6 +96,11 @@ pub struct PortalConfig {
     pub limits: Limits,
     /// The current host release: computers reporting an older version show "needs update".
     pub host_release: String,
+    /// DNS TXT lookups for company domain verification.
+    pub dns: sso::Dns,
+    /// Company SSO may use identity providers at private addresses and over plain http
+    /// (tests; servers whose IdP is on a closed network). Off: https and public only.
+    pub sso_private_issuers: bool,
 }
 
 impl Default for PortalConfig {
@@ -106,6 +113,8 @@ impl Default for PortalConfig {
             magic_link_ttl: Duration::from_secs(15 * 60),
             limits: Limits::default(),
             host_release: env!("CARGO_PKG_VERSION").to_owned(),
+            dns: sso::Dns::default(),
+            sso_private_issuers: false,
         }
     }
 }
@@ -129,6 +138,10 @@ pub struct PortalInner {
     pub audit: Arc<dyn AuditSink>,
     pub config: PortalConfig,
     pub limiter: RateLimiter,
+    /// Company SSO: the IdP HTTP client and discovered IdPs.
+    pub sso: sso::SsoRuntime,
+    /// The WebAuthn relying party; `None` (passkeys off) without an https portal URL.
+    pub passkeys: Option<webauthn_rs::Webauthn>,
 }
 
 #[derive(Clone)]
@@ -156,6 +169,8 @@ impl PortalState {
             master,
             mailer,
             audit,
+            sso: sso::SsoRuntime::new(&config),
+            passkeys: passkeys::relying_party(&config),
             config,
             limiter: RateLimiter::default(),
         }))
@@ -192,6 +207,7 @@ pub fn router(state: PortalState) -> Router {
         .route("/orgs/{org_id}", get(org::get_org).patch(org::patch_org))
         .merge(people::public_routes())
         .merge(sso::public_routes())
+        .merge(passkeys::routes())
         .nest("/orgs/{org_id}", org_areas)
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(

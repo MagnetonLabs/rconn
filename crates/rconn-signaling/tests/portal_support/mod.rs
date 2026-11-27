@@ -120,6 +120,8 @@ impl Portal {
         let app = AppState::new(auth.clone());
         let mut config = PortalConfig {
             portal_url: Some(ORIGIN.into()),
+            // Tests never ask real DNS.
+            dns: rconn_signaling::portal::sso::Dns::none(),
             ..Default::default()
         };
         f(&mut config);

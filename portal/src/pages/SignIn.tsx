@@ -47,6 +47,25 @@ export function safeNext(v: string | null): string {
   return v && v.startsWith('/') && !v.startsWith('//') ? v : '/';
 }
 
+/** What a failed single sign-on round trip (`/admin/signin?sso_error=…`) means. */
+export function ssoErrorMessage(code: string | null): string | null {
+  switch (code) {
+    case null:
+    case '':
+      return null;
+    case 'unavailable':
+      return 'Single sign-on isn’t available for this company right now. Try another way to sign in.';
+    case 'expired':
+      return 'That single sign-on attempt expired or was already used. Try again.';
+    case 'domain':
+      return 'Your identity provider account isn’t at a domain this company has verified. Ask an owner to verify it, or sign in another way.';
+    case 'rate_limited':
+      return 'Too many attempts. Wait a few minutes and try again.';
+    default:
+      return 'Single sign-on didn’t complete. Try again, or sign in another way.';
+  }
+}
+
 export default function SignIn() {
   const [params] = useSearchParams();
   const next = safeNext(params.get('next'));
@@ -56,7 +75,7 @@ export default function SignIn() {
   const [options, setOptions] = useState<AuthOptions | null>(null);
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(() => ssoErrorMessage(params.get('sso_error')));
   const [sent, setSent] = useState(false);
 
   const done = (me: auth.Me) => {

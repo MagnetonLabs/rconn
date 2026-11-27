@@ -33,6 +33,28 @@ allow = ["OFL-1.1", "Ubuntu-font-1.0"]
 crate = "option-ext"
 allow = ["MPL-2.0"]
 
+# webauthn-rs (passkeys in the signaling server's admin portal), MPL-2.0 like option-ext
+# above: used unmodified.
+[[licenses.exceptions]]
+crate = "webauthn-rs"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "webauthn-rs-core"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "webauthn-rs-proto"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "webauthn-attestation-ca"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "crypto-glue"
+allow = ["MPL-2.0"]
+
 # uniffi (rconn-mobile's Swift bindings), MPL-2.0 like option-ext above: used unmodified.
 [[licenses.exceptions]]
 crate = "uniffi"
@@ -75,6 +97,9 @@ ignore = [
   # so it isn't reachable. Pulled in by openidconnect 4.1 (pins rsa ^0.9; fix is rsa 0.10).
   # Revisit when openidconnect moves to rsa 0.10.
   { id = "RUSTSEC-2023-0071", reason = "RSA public-key verification only; no private-key operations" },
+  # chrono unmaintained (no vulnerability): openidconnect/oauth2 use it for token times and
+  # have no alternative yet. Revisit when they move to jiff or time.
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained only; required by openidconnect 4.1" },
 ]
 
 [sources]

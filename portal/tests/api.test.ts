@@ -200,3 +200,22 @@ describe('computers, tokens, policies, audit', () => {
     expect(csv.trim().split('\n')).toHaveLength(sessions.items.length + 1);
   });
 });
+
+describe('sso domains', () => {
+  it('lets a company claim a domain but only one verify it', async () => {
+    await signIn('dana@northwind.test');
+    await expectError(sso.addDomain(ORG_A, 'harbor.test'), 409, 'conflict');
+    const d = await sso.addDomain(ORG_A, 'northwind-new.test');
+    expect(d).toMatchObject({ domain: 'northwind-new.test', verified: false });
+    expect(d.txt_record).toMatch(/^rconn-verify=/);
+    await expectError(sso.addDomain(ORG_A, 'northwind-new.test'), 409, 'conflict');
+    expect((await sso.verifyDomain(ORG_A, 'northwind-new.test')).verified).toBe(true);
+  });
+
+  it('explains a failed SSO round trip', async () => {
+    const { ssoErrorMessage } = await import('../src/pages/SignIn');
+    expect(ssoErrorMessage(null)).toBeNull();
+    expect(ssoErrorMessage('domain')).toMatch(/verified/);
+    expect(ssoErrorMessage('something-new')).toMatch(/didn’t complete/);
+  });
+});

@@ -592,7 +592,7 @@ async fn options_are_the_same_for_every_email() {
         .await;
     assert_eq!(
         none.json,
-        json!({ "password": false, "magic_link": true, "sso": null, "passkey": false })
+        json!({ "password": false, "magic_link": true, "sso": null, "passkey": true })
     );
     let org = p.org("Acme").await;
     p.user("alice@acme.test", true, &[(org, Role::Admin)]).await;
@@ -727,6 +727,5 @@ async fn admin_ui_and_unknown_api_paths() {
             None,
         )
         .await;
-    assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(r.code(), "not_implemented");
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "no email: {}", r.text);
 }

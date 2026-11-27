@@ -664,24 +664,32 @@ export function createMockServer(db: Db = seed()): MockServer {
     return ok(ssoOut(orgId));
   });
   on('POST', `${ORG}/sso/domains`, (c) => {
-    const { orgId, m } = member(c);
+    const { orgId, m, user } = member(c);
     need(m, 'owner');
     const domain = str(c.body.domain).toLowerCase();
     if (!/^([a-z0-9-]+\.)+[a-z]{2,}$/.test(domain)) throw invalid('Enter a domain like example.com.');
+    // Several companies may claim a domain; only one can verify it.
     for (const [o, s] of Object.entries(db.sso)) {
-      if (s.domains.some((d) => d.domain === domain)) throw conflict(o === orgId ? 'That domain is already added.' : 'Another company has claimed that domain.');
+      if (o === orgId && s.domains.some((d) => d.domain === domain)) throw conflict('That domain is already added.');
+      if (o !== orgId && s.domains.some((d) => d.domain === domain && d.verified)) throw conflict('Another company has verified that domain.');
     }
     const d = { domain, verified: false, txt_record: `rconn-verify=${ids.secret(16)}` };
     db.sso[orgId].domains.push(d);
+    audit(orgId, 'sso.changed', user, null, { domain, action: 'domain_added' });
     return ok(d, 201);
   });
   on('POST', `${ORG}/sso/domains/([^/]+)/verify`, (c) => {
-    const { orgId, m } = member(c);
+    const { orgId, m, user } = member(c);
     need(m, 'owner');
     const d = db.sso[orgId].domains.find((x) => x.domain === decodeURIComponent(c.params[1]));
     if (!d) throw notFound();
     // The mock "finds" the TXT record for *.test domains only.
-    if (d.domain.endsWith('.test')) d.verified = true;
+    if (d.domain.endsWith('.test') && !d.verified) {
+      const taken = Object.entries(db.sso).some(([o, s]) => o !== orgId && s.domains.some((x) => x.domain === d.domain && x.verified));
+      if (taken) throw conflict('Another company has verified that domain.');
+      d.verified = true;
+      audit(orgId, 'sso.changed', user, null, { domain: d.domain, action: 'domain_verified' });
+    }
     return ok(d);
   });
 

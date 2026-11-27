@@ -44,7 +44,7 @@ fn email_key(email: &str) -> String {
 }
 
 /// The orgs a person is a member of (for audit fan-out).
-async fn orgs_of(db: &Db, user: OperatorId) -> anyhow::Result<Vec<OrgId>> {
+pub(super) async fn orgs_of(db: &Db, user: OperatorId) -> anyhow::Result<Vec<OrgId>> {
     let ids: Vec<String> = sqlx::query_scalar("SELECT org_id FROM memberships WHERE user_id = ?")
         .bind(user.to_string())
         .fetch_all(db.pool())
@@ -75,12 +75,7 @@ async fn signed_in(
     clear_nonce: bool,
 ) -> ApiResult<Response> {
     let cookie = start_session(st, user, client, headers).await?;
-    st.audit.record(AuditEvent::PortalSignIn {
-        user_id: user,
-        method: method.to_owned(),
-        ip: client.ip,
-        orgs: orgs_of(&st.db, user).await?,
-    });
+    record_sign_in(st, user, method, client).await?;
     let me: Me = me::load(&st.db, user).await?;
     let mut resp = Json(me).into_response();
     resp.headers_mut().append(header::SET_COOKIE, cookie);
@@ -89,6 +84,40 @@ async fn signed_in(
             .append(header::SET_COOKIE, clear_cookie(NONCE_COOKIE));
     }
     Ok(resp)
+}
+
+/// Audit a successful sign-in (`sign_in`, in each of the person's orgs).
+pub(super) async fn record_sign_in(
+    st: &PortalState,
+    user: OperatorId,
+    method: &str,
+    client: &ClientInfo,
+) -> anyhow::Result<()> {
+    st.audit.record(AuditEvent::PortalSignIn {
+        user_id: user,
+        method: method.to_owned(),
+        ip: client.ip,
+        orgs: orgs_of(&st.db, user).await?,
+    });
+    Ok(())
+}
+
+/// Audit a refused sign-in (`sign_in.failed`, in `orgs`).
+pub(super) fn sign_in_failed(
+    st: &PortalState,
+    email: &str,
+    method: &str,
+    reason: &str,
+    orgs: Vec<OrgId>,
+    client: &ClientInfo,
+) {
+    st.audit.record(AuditEvent::PortalSignInFailed {
+        email: email.chars().take(MAX_EMAIL_CHARS).collect(),
+        method: method.to_owned(),
+        reason: reason.to_owned(),
+        ip: client.ip,
+        orgs,
+    });
 }
 
 async fn failed(
@@ -103,13 +132,7 @@ async fn failed(
         Some(u) => orgs_of(&st.db, u).await?,
         None => vec![],
     };
-    st.audit.record(AuditEvent::PortalSignInFailed {
-        email: email.chars().take(MAX_EMAIL_CHARS).collect(),
-        method: method.to_owned(),
-        reason: reason.to_owned(),
-        ip: client.ip,
-        orgs,
-    });
+    sign_in_failed(st, email, method, reason, orgs, client);
     Ok(())
 }
 
@@ -414,7 +437,6 @@ pub async fn logout(State(st): State<PortalState>, headers: HeaderMap) -> ApiRes
 
 #[derive(Deserialize)]
 pub struct OptionsQuery {
-    #[allow(dead_code)]
     email: Option<String>,
 }
 
@@ -432,11 +454,11 @@ pub struct LoginOptions {
     pub passkey: bool,
 }
 
-/// `GET /auth/options?email=` → the sign-in methods to show. The same for every email
-/// on this server (company SSO by verified domain comes with SSO support).
+/// `GET /auth/options?email=` → the sign-in methods to show. Only the email's domain
+/// matters (company SSO for a verified domain); known and unknown emails get the same.
 pub async fn options(
     State(st): State<PortalState>,
-    Query(_q): Query<OptionsQuery>,
+    Query(q): Query<OptionsQuery>,
 ) -> ApiResult<Json<LoginOptions>> {
     let accounts: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts)")
         .fetch_one(st.db.pool())
@@ -444,7 +466,10 @@ pub async fn options(
     Ok(Json(LoginOptions {
         password: accounts,
         magic_link: st.config.origin().is_some(),
-        sso: None,
-        passkey: false,
+        sso: match q.email.as_deref() {
+            Some(e) => super::sso::sso_for_email(&st.db, e).await?,
+            None => None,
+        },
+        passkey: st.passkeys.is_some(),
     }))
 }
