@@ -1,6 +1,7 @@
 //! Tenant isolation and the role table: a member of org A gets 404 for every org B route
 //! (like an org that doesn't exist), and each role gets exactly the rights the contract
-//! lists. Routes not built yet answer 501 to members whose role passes.
+//! lists. Routes not built yet answer 501 to members whose role passes; routes naming a
+//! resource answer 404 for an id that doesn't exist.
 
 mod portal_support;
 
@@ -100,14 +101,22 @@ fn org_routes() -> Vec<(Method, String, Action, Option<Value>)> {
             Method::PUT,
             format!("/groups/{X}/policy"),
             Action::ManageFleet,
-            Some(json!({})),
+            Some(json!({
+                "clipboard": true, "file_transfer": true, "audio": true,
+                "require_approval": false, "show_indicator": true,
+                "allow_access_password": true, "allowed_hours": null
+            })),
         ),
         (Method::GET, "/policy/default".into(), Action::View, None),
         (
             Method::PUT,
             "/policy/default".into(),
             Action::ManageFleet,
-            Some(json!({})),
+            Some(json!({
+                "clipboard": true, "file_transfer": true, "audio": true,
+                "require_approval": false, "show_indicator": true,
+                "allow_access_password": true, "allowed_hours": null
+            })),
         ),
         (Method::GET, "/audit".into(), Action::ViewAudit, None),
         (Method::GET, "/audit.csv".into(), Action::ViewAudit, None),
@@ -226,15 +235,13 @@ async fn each_role_gets_what_the_table_says() {
             let r = w.p.call(&mut b, method.clone(), &path, body).await;
             let allowed = role.at_least(action.min_role());
             if allowed {
-                // Past the role check: any answer but 401/403/500 (a route may 404 the
-                // made-up id, 409 a name taken by an earlier role, 400 a stub body).
+                // Built routes answer for real: the placeholder id X exists nowhere (404),
+                // and each role repeats the same invite (409 after the first).
                 assert!(
-                    !matches!(
-                        r.status,
-                        StatusCode::UNAUTHORIZED
-                            | StatusCode::FORBIDDEN
-                            | StatusCode::INTERNAL_SERVER_ERROR
-                    ),
+                    r.status.is_success()
+                        || r.status == StatusCode::CONFLICT
+                        || r.status == StatusCode::NOT_IMPLEMENTED
+                        || (r.status == StatusCode::NOT_FOUND && rest.contains(X)),
                     "{role:?} {method} {path}: {} {}",
                     r.status,
                     r.text

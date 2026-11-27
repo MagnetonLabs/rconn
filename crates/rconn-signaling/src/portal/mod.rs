@@ -92,6 +92,8 @@ pub struct PortalConfig {
     pub session_idle: Duration,
     pub magic_link_ttl: Duration,
     pub limits: Limits,
+    /// The current host release: computers reporting an older version show "needs update".
+    pub host_release: String,
 }
 
 impl Default for PortalConfig {
@@ -103,6 +105,7 @@ impl Default for PortalConfig {
             session_idle: Duration::from_secs(24 * 3600),
             magic_link_ttl: Duration::from_secs(15 * 60),
             limits: Limits::default(),
+            host_release: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }
 }

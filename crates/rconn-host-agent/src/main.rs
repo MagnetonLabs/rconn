@@ -76,6 +76,11 @@ struct Cli {
     /// accepts it) and save it there.
     #[arg(long, env = "RCONN_ENROLL_IF_MISSING")]
     enroll_if_missing: bool,
+    /// No identity in --identity yet: join a company with the enrollment token in this
+    /// file (made in the admin portal; keep the file admin-only) and save the identity
+    /// there. Tried before --enroll-if-missing.
+    #[arg(long, env = "RCONN_ENROLL_TOKEN_FILE", value_name = "PATH")]
+    enroll_token_file: Option<PathBuf>,
     /// Directory with host.id, host.cert.pem and host.key.pem from `enroll-host`.
     #[arg(
         long,
@@ -221,8 +226,20 @@ async fn main() -> Result<()> {
         cli.server_id.clone().context("--server-id is required")?,
         cli.identity.clone().context("--identity is required")?,
     );
-    if cli.enroll_if_missing && !rconn_peer::identity::has_identity(&identity) {
-        enroll_until_done(&identity, &server, cli.fingerprint.as_deref()).await;
+    if !rconn_peer::identity::has_identity(&identity) {
+        if let Some(file) = &cli.enroll_token_file {
+            let token = fs::read_to_string(file)
+                .with_context(|| format!("reading the enrollment token {}", file.display()))?;
+            enroll_until_done(
+                &identity,
+                &server,
+                cli.fingerprint.as_deref(),
+                Some(token.trim()),
+            )
+            .await;
+        } else if cli.enroll_if_missing {
+            enroll_until_done(&identity, &server, cli.fingerprint.as_deref(), None).await;
+        }
     }
     let read =
         |f: &str| fs::read_to_string(identity.join(f)).with_context(|| format!("reading {f}"));
@@ -697,15 +714,30 @@ async fn serve_channel(
     }
 }
 
-/// First start without an identity: ask the server for an ID (no account), retrying until
-/// it answers. Nothing else can work before this does.
-async fn enroll_until_done(dir: &std::path::Path, server: &str, fingerprint: Option<&str>) {
+/// First start without an identity: ask the server for an ID (with the company's
+/// enrollment token, or without an account), retrying until it answers. Nothing else can
+/// work before this does.
+async fn enroll_until_done(
+    dir: &std::path::Path,
+    server: &str,
+    fingerprint: Option<&str>,
+    token: Option<&str>,
+) {
     let trust = ServerTrust::from_fingerprint(fingerprint);
     let mut backoff = Duration::from_secs(2);
     loop {
-        match rconn_peer::identity::enroll_anonymous_into(dir, server, &trust).await {
+        let got = match token {
+            Some(t) => rconn_peer::identity::enroll_with_token_into(dir, server, &trust, t).await,
+            None => rconn_peer::identity::enroll_anonymous_into(dir, server, &trust).await,
+        };
+        match got {
             Ok(id) => {
-                tracing::info!(host_id = %id, code = %id.short_code(), "got an ID from the server (no account)");
+                let how = if token.is_some() {
+                    "joined the company with the enrollment token"
+                } else {
+                    "got an ID from the server (no account)"
+                };
+                tracing::info!(host_id = %id, code = %id.short_code(), "{how}");
                 return;
             }
             Err(e) => {

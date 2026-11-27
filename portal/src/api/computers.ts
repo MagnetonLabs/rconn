@@ -5,14 +5,17 @@ export type ComputerStatus = 'online' | 'offline' | 'revoked';
 export interface Computer {
   id: string;
   short_code: string;
+  /** The admin's name, else the hostname, else "Computer <short code>". */
   name: string;
-  hostname: string;
-  os: string;
-  version: string;
+  /** null: not reported yet (never connected) or by hosts that predate it (0.1.x). */
+  hostname: string | null;
+  os: string | null;
+  version: string | null;
   group_id: string | null;
   online: boolean;
   last_seen: string | null;
-  enrolled_at: string;
+  /** null for computers enrolled before the server had a database. */
+  enrolled_at: string | null;
   enrolled_by: string | null;
   revoked_at: string | null;
   needs_update: boolean;
@@ -51,7 +54,8 @@ export interface CreateTokenInput {
 export const listComputers = (orgId: string, f: ComputerFilter = {}) =>
   api<Computer[]>('GET', orgPath(orgId, '/computers'), undefined, { ...f });
 
-export const updateComputer = (orgId: string, id: string, patch: { name?: string; group_id?: string | null }) =>
+/** `name: null` clears the admin's name (the hostname shows again). */
+export const updateComputer = (orgId: string, id: string, patch: { name?: string | null; group_id?: string | null }) =>
   api<Computer>('PATCH', orgPath(orgId, `/computers/${encodeURIComponent(id)}`), patch);
 
 export const revokeComputer = (orgId: string, id: string) =>

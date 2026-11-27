@@ -311,18 +311,18 @@ function ComputerRow({
               <span className="name">{c.name}</span>
               {revoked && <span className="badge danger" style={{ marginLeft: '0.4rem' }}>Revoked</span>}
               {!revoked && c.needs_update && (
-                <span className="badge warn" style={{ marginLeft: '0.4rem' }} title={`Running ${c.version}`}>
+                <span className="badge warn" style={{ marginLeft: '0.4rem' }} title={`Running ${c.version ?? 'an unknown version'}`}>
                   Needs update
                 </span>
               )}
-              <span className="sub">{c.hostname}</span>
+              {c.hostname && c.hostname !== c.name && <span className="sub">{c.hostname}</span>}
             </span>
           )}
         </div>
       </td>
       <td className="id">{c.short_code}</td>
-      <td className="hide-sm">{c.os}</td>
-      <td className="hide-md mono">{c.version}</td>
+      <td className="hide-sm">{c.os ?? <span className="muted">unknown</span>}</td>
+      <td className="hide-md mono">{c.version ?? <span className="muted">unknown</span>}</td>
       <td>
         {canManage && !revoked ? (
           <>

@@ -170,6 +170,10 @@ struct ServeArgs {
     /// Resend when RESEND_API_KEY is set; otherwise it is written to the log.
     #[arg(long, env = "RCONN_MAIL_FROM")]
     mail_from: Option<String>,
+    /// The current host release (e.g. 0.1.14): the portal marks computers running an
+    /// older version "needs update". Default: this server's version.
+    #[arg(long, env = "RCONN_HOST_RELEASE")]
+    host_release: Option<String>,
 }
 
 #[tokio::main]
@@ -308,6 +312,7 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
         portal_url,
         allow_signup,
         mail_from,
+        host_release,
     } = args;
     if let Some(u) = &portal_url {
         anyhow::ensure!(
@@ -355,7 +360,8 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
     let org_id = db.require_legacy_org().await?.id;
     let ca = db.org_ca(org_id, &master).await?;
     // Org CAs, operator tokens, accounts and revocations come from the database (below).
-    let mut auth = FleetAuthenticator::new(server_id.clone());
+    // Roles decide who lists and connects to org computers (checked on every request).
+    let mut auth = FleetAuthenticator::new(server_id.clone()).with_db(db.clone());
     // Computers without an account: a separate CA (its own org, which no operator is in).
     // Its hosts keep connecting even after enrollment is turned off.
     let anonymous_enroll = anonymous_enroll.unwrap_or(public);
@@ -467,6 +473,14 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
     rconn_signaling::reload::reload_once(&db, &auth, &state, &mut seen).await?;
     let revoked = db.revoked_hosts().await?.len();
     let master = Arc::new(master);
+    // Computers join a company with an enrollment token made in the portal.
+    state.allow_token_enrollment(Arc::new(
+        rconn_signaling::portal::computers::DbTokenEnroller::new(
+            db.clone(),
+            master.clone(),
+            audit.clone(),
+        ),
+    ));
     let portal = rconn_signaling::portal::PortalState::new(
         db.clone(),
         state.clone(),
@@ -476,6 +490,7 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
         rconn_signaling::portal::PortalConfig {
             portal_url: portal_url.map(|u| u.trim_end_matches('/').to_owned()),
             allow_signup,
+            host_release: host_release.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
             ..Default::default()
         },
     );

@@ -6,7 +6,9 @@
 //! whole by [`crate::reload`]; CAs given to the builder (the public CA, tests) stay.
 
 use crate::accounts::{Accounts, SESSION_TOKEN_TTL, SessionTokens};
-use crate::auth::{AuthError, Authenticator, HostIdentity, HostProofInput, OperatorIdentity};
+use crate::auth::{
+    AuthError, Authenticator, HostIdentity, HostProofInput, OperatorIdentity, OrgAccess,
+};
 use crate::oidc::OidcVerifier;
 use crate::turn_relay::TurnMinter;
 use async_trait::async_trait;
@@ -33,6 +35,8 @@ pub struct FleetAuthenticator {
     tokens: Option<SessionTokens>,
     oidc: Option<OidcVerifier>,
     policy: SessionPolicy,
+    /// People and roles: who may list and connect (see [`Authenticator::org_access`]).
+    db: Option<crate::db::Db>,
 }
 
 impl FleetAuthenticator {
@@ -56,7 +60,15 @@ impl FleetAuthenticator {
                 audio: true,
                 require_approval: false,
             },
+            db: None,
         }
+    }
+
+    /// Decide who may list and connect to org computers from the database's memberships,
+    /// on every request (without it, every operator of an org connects).
+    pub fn with_db(mut self, db: crate::db::Db) -> Self {
+        self.db = Some(db);
+        self
     }
 
     pub fn with_org_ca(mut self, org: OrgId, ca_pem: impl Into<String>) -> Self {
@@ -270,6 +282,20 @@ impl Authenticator for FleetAuthenticator {
         Ok((who, token, expires))
     }
 
+    async fn org_access(&self, op: OperatorIdentity) -> OrgAccess {
+        let Some(db) = &self.db else {
+            return OrgAccess::Connect;
+        };
+        match crate::portal::people::desktop_access(db, op).await {
+            Ok(access) => access,
+            Err(e) => {
+                // Fail closed: a database problem never widens access.
+                tracing::error!(error = %format!("{e:#}"), "reading an operator's role failed");
+                OrgAccess::None
+            }
+        }
+    }
+
     async fn ice_servers(&self, _org: OrgId) -> Vec<IceServer> {
         let mut servers = self.ice_servers.clone();
         if let Some(turn) = &self.turn {
@@ -280,5 +306,9 @@ impl Authenticator for FleetAuthenticator {
 
     async fn session_policy(&self, _host: HostIdentity) -> SessionPolicy {
         self.policy
+    }
+
+    fn revoke_host(&self, host: HostId) {
+        self.revoke(host);
     }
 }

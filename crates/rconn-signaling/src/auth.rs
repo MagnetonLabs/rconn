@@ -29,6 +29,17 @@ pub struct OperatorIdentity {
     pub org_id: OrgId,
 }
 
+/// What a signed-in operator may do with their org's computers (from their role).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgAccess {
+    /// Not (or no longer) a member: refused at sign-in, sees nothing.
+    None,
+    /// Sees the org's computers but can't connect (viewer).
+    List,
+    /// Sees and connects (technician and up).
+    Connect,
+}
+
 /// Everything a host sent (plus the server's nonce) for one authentication attempt.
 #[derive(Debug, Clone, Copy)]
 pub struct HostProofInput<'a> {
@@ -69,9 +80,18 @@ pub trait Authenticator: Send + Sync + 'static {
         Err(AuthError::Invalid)
     }
 
+    /// What `op` may do with their org's computers. Asked on every sign-in, computer list
+    /// and session request. Without people and roles (the default), everyone connects.
+    async fn org_access(&self, _op: OperatorIdentity) -> OrgAccess {
+        OrgAccess::Connect
+    }
+
     /// STUN/TURN servers (with short-lived credentials) for a member of `org`.
     async fn ice_servers(&self, org: OrgId) -> Vec<IceServer>;
 
     /// Effective policy for a new session to `host`.
     async fn session_policy(&self, host: HostIdentity) -> SessionPolicy;
+
+    /// Refuse this host from now on (until the revocation set is next replaced).
+    fn revoke_host(&self, _host: HostId) {}
 }

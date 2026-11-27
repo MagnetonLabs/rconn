@@ -35,6 +35,8 @@ const KIND_LABEL: Record<string, string> = {
   'person.invited': 'Person invited',
   'person.role_changed': 'Role changed',
   'person.removed': 'Person removed',
+  'person.joined': 'Person joined',
+  'invite.cancelled': 'Invite cancelled',
   'policy.changed': 'Policy changed',
   sign_in: 'Signed in',
   'sign_in.failed': 'Sign-in failed',

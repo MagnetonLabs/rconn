@@ -31,7 +31,7 @@ fn tidy_email(s: &str) -> String {
     s.trim().to_owned()
 }
 
-fn plausible_email(s: &str) -> bool {
+pub(super) fn plausible_email(s: &str) -> bool {
     let parts = s.split_once('@');
     s.chars().count() <= MAX_EMAIL_CHARS
         && !s.chars().any(|c| c.is_whitespace() || c.is_control())
