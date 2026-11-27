@@ -110,35 +110,47 @@ pub struct Sender {
     pub pacing: f64,
     /// Encoder target / estimate.
     pub encoder: f64,
-    /// Pacer burst in bits; `None`: `rtc`'s default (100 ms of the rate).
-    pub burst_bits: Option<f64>,
+    pub burst: Burst,
+}
+
+/// The pacer's burst.
+#[derive(Clone, Copy)]
+pub enum Burst {
+    /// `rtc`'s default: 100 ms of the rate.
+    Default,
+    /// Following the rate, as [`crate::video`] does ([`crate::video::pacer_burst_bits`]).
+    Adaptive,
 }
 
 /// As 0.1.5 ran `rtc`'s GCC: pacer and encoder at the estimate, default burst.
 pub const OLD: Sender = Sender {
     pacing: 1.0,
     encoder: 1.0,
-    burst_bits: None,
+    burst: Burst::Default,
 };
 
 /// As [`crate::video`] runs [`Bwe`] now.
 pub const NEW: Sender = Sender {
     pacing: PACING_FACTOR,
     encoder: crate::video::ENCODER_SHARE,
-    burst_bits: Some(crate::video::PACER_BURST_BITS),
+    burst: Burst::Adaptive,
 };
 
 pub fn run<E: BandwidthEstimator>(mut est: E, s: &Scenario, sender: Sender) -> Trace {
     let Sender {
         pacing,
         encoder,
-        burst_bits,
+        burst,
     } = sender;
     let t0 = Instant::now();
-    let mut pacer = Pacer::new(est.target_bitrate() * pacing);
-    if let Some(b) = burst_bits {
-        pacer = pacer.with_burst_bits(b);
-    }
+    let with_burst = |pacer: Pacer| match burst {
+        Burst::Default => pacer,
+        Burst::Adaptive => {
+            let b = crate::video::pacer_burst_bits(pacer.target_bitrate());
+            pacer.with_burst_bits(b)
+        }
+    };
+    let mut pacer = with_burst(Pacer::new(est.target_bitrate() * pacing));
     let mut queue: VecDeque<usize> = VecDeque::new();
     let mut sent: Vec<Sent> = Vec::new();
     let mut link_free = t0;
@@ -253,6 +265,7 @@ pub fn run<E: BandwidthEstimator>(mut est: E, s: &Scenario, sender: Sender) -> T
             let (_, reports) = feedback.pop_front().expect("checked");
             est.on_reports(now, &reports);
             pacer.set_target_bitrate(est.target_bitrate() * pacing);
+            pacer = with_burst(pacer);
         }
         if est.poll_timeout().is_some_and(|t| t <= now) {
             est.handle_timeout(now);
