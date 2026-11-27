@@ -14,6 +14,12 @@
 # get IDs by themselves (rate limited; see `rconn-signaling serve --help` for
 # RCONN_ENROLL_PER_IP_PER_HOUR, RCONN_ENROLL_PER_HOUR, RCONN_TURN_SESSION_CAP_MB,
 # RCONN_TURN_MONTHLY_CAP_GB, RCONN_CLIENT_IP_HEADER).
+#
+# Continuous database backup (Litestream to any S3-compatible bucket, e.g. Cloudflare R2):
+#   cp litestream.env.example litestream.env && chmod 600 litestream.env   # fill it in
+#   docker compose --profile backup up -d
+#   (LITESTREAM_ENV_FILE=/path/to/litestream.env to keep it elsewhere)
+# Check a restore regularly: scripts/db-restore-drill.sh --env-file litestream.env
 services:
   signaling:
     image: ghcr.io/rconn/signaling:latest
@@ -31,6 +37,22 @@ services:
       - rconn-data:/data
       # Server master key: back it up separately from rconn-data.
       - rconn-keys:/keys
+
+  # Replicates /data/rconn.db (WAL) about once a second; daily snapshots kept 30 days.
+  # It shares the data volume and runs as the server's user (10001) so files it creates
+  # there stay the server's. It never sees the master key.
+  litestream:
+    image: litestream/litestream:0.5.18
+    profiles: [backup]
+    restart: unless-stopped
+    user: "10001:10001"
+    depends_on: [signaling]
+    command: ["replicate"]
+    env_file:
+      - path: ${LITESTREAM_ENV_FILE:-./litestream.env}
+    volumes:
+      - rconn-data:/data
+      - ./litestream.yml:/etc/litestream.yml:ro
 
 volumes:
   rconn-data:

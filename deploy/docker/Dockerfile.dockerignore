@@ -1,0 +1,10 @@
+# Build context for deploy/docker/Dockerfile (BuildKit uses this instead of the root
+# .dockerignore). Same rules, plus Node outputs: the portal stage runs npm ci itself.
+target
+.git
+.claude
+*.dll
+*.dylib
+dist
+**/node_modules
+**/dist
