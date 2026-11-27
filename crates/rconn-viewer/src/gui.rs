@@ -129,7 +129,7 @@ impl KeyGate {
             self.toolbar = !self.toolbar;
             return KeyAction::Toggled(self.release_all());
         }
-        if self.toolbar || repeat {
+        if self.toolbar {
             return KeyAction::Drop;
         }
         let Some(mut hid_usage) = to_hid(key) else {
@@ -140,6 +140,20 @@ impl KeyGate {
                 u::META_LEFT => u::CONTROL_LEFT,
                 u::META_RIGHT => u::CONTROL_RIGHT,
                 other => other,
+            };
+        }
+        if repeat {
+            // A held key repeating here (at this keyboard's repeat rate) repeats on the
+            // host: Windows and macOS don't repeat keys pressed by software, so the host
+            // gets another press of a key it already holds. Modifiers never repeat.
+            let forward = pressed
+                && self.held.contains(&hid_usage)
+                && modifier_down(hid_usage, mods).is_none()
+                && hid_usage != u::CAPS_LOCK;
+            return if forward {
+                KeyAction::Send(vec![key_event(hid_usage, true)])
+            } else {
+                KeyAction::Drop
             };
         }
         // A modifier whose release we never saw (macOS drops some key-ups) is released now,
@@ -1771,7 +1785,42 @@ mod tests {
         assert!(!g.toolbar);
         assert!(
             matches!(g.key(egui::Key::B, true, true, none), KeyAction::Drop),
-            "repeats are the host's job"
+            "a repeat of a key the host doesn't hold is dropped"
+        );
+    }
+
+    #[test]
+    fn a_held_key_repeats_on_the_host() {
+        use rconn_core::hid::usage as u;
+        let mut g = KeyGate::default();
+        let none = egui::Modifiers::default();
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keys(g.key(egui::Key::Backspace, true, false, none)),
+            [(u::BACKSPACE, true)]
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                keys(g.key(egui::Key::Backspace, true, true, none)),
+                [(u::BACKSPACE, true)],
+                "each repeat is another press of the held key"
+            );
+        }
+        assert_eq!(
+            keys(g.key(egui::Key::Backspace, false, false, none)),
+            [(u::BACKSPACE, false)]
+        );
+        assert!(
+            keys(g.key(egui::Key::Backspace, true, true, none)).is_empty(),
+            "no repeat after the release"
+        );
+        g.key(egui::Key::ControlLeft, true, false, ctrl);
+        assert!(
+            keys(g.key(egui::Key::ControlLeft, true, true, ctrl)).is_empty(),
+            "modifiers never repeat"
         );
     }
 

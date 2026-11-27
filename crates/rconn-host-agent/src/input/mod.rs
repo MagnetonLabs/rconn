@@ -53,6 +53,12 @@ pub trait Injector {
     fn button(&mut self, button: MouseButton, pressed: bool);
     fn wheel(&mut self, dx: f32, dy: f32);
     fn key(&mut self, hid_usage: u16, pressed: bool);
+    /// The viewer's keyboard repeated a key that is held down here. Windows and macOS don't
+    /// repeat keys pressed by software, so by default this presses it again; injectors on
+    /// systems that repeat held keys themselves (X11, Wayland) ignore it.
+    fn repeat(&mut self, hid_usage: u16) {
+        self.key(hid_usage, true);
+    }
     /// Type text as keystrokes (default: unsupported, ignored).
     fn text(&mut self, _text: &str) {
         tracing::info!("typing text isn't supported on this OS yet");
@@ -130,8 +136,7 @@ fn run(rx: mpsc::Receiver<InputEvent>) {
             }
             InputEvent::Wheel { dx, dy } => inj.wheel(dx.clamp(-50.0, 50.0), dy.clamp(-50.0, 50.0)),
             InputEvent::Key { hid_usage, pressed } => {
-                held.key(hid_usage, pressed);
-                inj.key(hid_usage, pressed);
+                key(&mut held, inj.as_mut(), hid_usage, pressed)
             }
             InputEvent::Text(text) => {
                 let text: String = text.chars().take(4096).collect();
@@ -140,6 +145,16 @@ fn run(rx: mpsc::Receiver<InputEvent>) {
         }
     }
     held.release_all(inj.as_mut());
+}
+
+/// A press of a key already held is the viewer's keyboard repeating it.
+fn key(held: &mut Held, inj: &mut dyn Injector, hid_usage: u16, pressed: bool) {
+    if pressed && held.keys.contains(&hid_usage) {
+        inj.repeat(hid_usage);
+    } else {
+        held.key(hid_usage, pressed);
+        inj.key(hid_usage, pressed);
+    }
 }
 
 fn platform_injector() -> Option<Box<dyn Injector>> {
@@ -220,6 +235,54 @@ mod tests {
         fn key(&mut self, k: u16, p: bool) {
             self.0.push(format!("key {k:#x} {p}"));
         }
+    }
+
+    #[test]
+    fn a_second_press_of_a_held_key_is_a_repeat() {
+        struct Repeats(Recorder);
+        impl Injector for Repeats {
+            fn pointer_move(&mut self, x: f32, y: f32) {
+                self.0.pointer_move(x, y)
+            }
+            fn button(&mut self, b: MouseButton, p: bool) {
+                self.0.button(b, p)
+            }
+            fn wheel(&mut self, dx: f32, dy: f32) {
+                self.0.wheel(dx, dy)
+            }
+            fn key(&mut self, k: u16, p: bool) {
+                self.0.key(k, p)
+            }
+            fn repeat(&mut self, k: u16) {
+                self.0.0.push(format!("repeat {k:#x}"));
+            }
+        }
+        let mut held = Held::default();
+        let mut rec = Repeats(Recorder::default());
+        for pressed in [true, true, true, false] {
+            key(&mut held, &mut rec, 0x2A, pressed); // Backspace held, repeated twice
+        }
+        key(&mut held, &mut rec, 0x2A, true);
+        assert_eq!(
+            rec.0.0,
+            [
+                "key 0x2a true",
+                "repeat 0x2a",
+                "repeat 0x2a",
+                "key 0x2a false",
+                "key 0x2a true"
+            ]
+        );
+        // Without its own repeat, an injector presses the key again (Windows).
+        let mut held = Held::default();
+        let mut plain = Recorder::default();
+        for pressed in [true, true, false] {
+            key(&mut held, &mut plain, 0x2A, pressed);
+        }
+        assert_eq!(
+            plain.0,
+            ["key 0x2a true", "key 0x2a true", "key 0x2a false"]
+        );
     }
 
     #[test]

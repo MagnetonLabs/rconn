@@ -142,6 +142,18 @@ impl Injector for CgInjector {
             pressed,
         ));
     }
+
+    fn repeat(&mut self, hid_usage: u16) {
+        let Some(code) = to_mac_keycode(hid_usage) else {
+            return;
+        };
+        let ev = CGEvent::new_keyboard_event(self.source.as_deref(), code, true);
+        if let Some(e) = ev.as_deref() {
+            // Marked as a repeat, as the keyboard's own repeats are.
+            CGEvent::set_integer_value_field(Some(e), CGEventField::KeyboardEventAutorepeat, 1);
+        }
+        self.post(ev);
+    }
 }
 
 /// Normalized (0..1) position on `bounds` -> global point; 1.0 is the last point.

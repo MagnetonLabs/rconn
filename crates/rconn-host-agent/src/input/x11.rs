@@ -98,6 +98,9 @@ impl Injector for XTestInjector {
         }
     }
 
+    /// The X server repeats held keys itself.
+    fn repeat(&mut self, _hid_usage: u16) {}
+
     fn key(&mut self, hid_usage: u16, pressed: bool) {
         let Some(code) = to_linux_evdev(hid_usage) else {
             tracing::debug!(hid_usage, "unmapped key");
