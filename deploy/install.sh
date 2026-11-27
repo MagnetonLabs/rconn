@@ -12,6 +12,10 @@
 #   RCONN_PUBLIC_IP  public IP for TURN (default: auto-detected)
 #   RCONN_IMAGE      server image (default: ghcr.io/rconn/signaling:latest)
 #   RCONN_ADMIN      admin account name (default: admin)
+#
+# Database backup: put Litestream settings in /opt/rconn/litestream.env (mode 600; see
+# deploy/docker/litestream.env.example) before or after installing; when that file exists
+# the Litestream sidecar starts too (`docker compose --profile backup up -d`).
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
@@ -60,8 +64,36 @@ services:
       - rconn-data:/data
       - $DIR/keys:/keys
     command: ["serve"]
+  # Continuous backup of rconn.db; runs when $DIR/litestream.env exists (profile backup).
+  litestream:
+    image: litestream/litestream:0.5.18
+    profiles: [backup]
+    restart: unless-stopped
+    user: "10001:10001"
+    depends_on: [signaling]
+    command: ["replicate"]
+    env_file:
+      - path: $DIR/litestream.env
+    volumes:
+      - rconn-data:/data
+      - $DIR/litestream.yml:/etc/litestream.yml:ro
 volumes:
   rconn-data:
+YAML
+# Same as deploy/docker/litestream.yml (keep them in step).
+cat > "$DIR/litestream.yml" <<'YAML'
+dbs:
+  - path: /data/rconn.db
+    replica:
+      type: s3
+      bucket: ${LITESTREAM_BUCKET}
+      path: ${LITESTREAM_PATH}
+      endpoint: ${LITESTREAM_ENDPOINT}
+      region: ${LITESTREAM_REGION}
+      sync-interval: 1s
+snapshot:
+  interval: 24h
+  retention: 720h
 YAML
 
 run() { docker compose -f "$DIR/compose.yaml" run --rm -T signaling "$@"; }
@@ -77,7 +109,13 @@ fi
 FP=$(grep -o 'sha256:[0-9a-f]\{64\}' "$DIR/init.txt")
 
 echo "== starting"
-docker compose -f "$DIR/compose.yaml" up -d
+PROFILES=()
+if [ -f "$DIR/litestream.env" ]; then
+  chmod 600 "$DIR/litestream.env"
+  PROFILES=(--profile backup)
+  BACKUP="Litestream -> bucket $(sed -n 's/^LITESTREAM_BUCKET=//p' "$DIR/litestream.env")"
+fi
+docker compose -f "$DIR/compose.yaml" "${PROFILES[@]}" up -d
 
 cat <<DONE
 
@@ -86,6 +124,8 @@ rconn server is running.
   Server URL        $URL
   Server pin        $FP
   Open these ports  TCP 443, UDP 3478, UDP 49160-49260
+  Database backup   ${BACKUP:-off (add $DIR/litestream.env, then: docker compose -f $DIR/compose.yaml --profile backup up -d)}
+  Master key        $DIR/keys/master.key  (copy it somewhere safe, apart from the backups)
 DONE
 if [ -n "${NEW_ADMIN:-}" ]; then
   echo "  Admin login       $ADMIN / $PASSWORD   (shown once; change it)"

@@ -1,9 +1,45 @@
-# rconn signaling server (+ built-in TURN relay). Build from the repo root:
+# syntax=docker/dockerfile:1
+# rconn signaling server (+ built-in TURN relay, + the /admin portal when portal/ exists).
+# Build from the repo root:
 #   docker build -f deploy/docker/Dockerfile -t rconn-signaling .
+#   docker build -f deploy/docker/Dockerfile --build-arg PORTAL_UI=off ...   # no Node at all
+# PORTAL_UI=on (default) builds portal/ with Node when portal/package.json exists and embeds
+# it (cargo feature portal-ui); without portal/ the server builds exactly as before.
+ARG PORTAL_UI=on
+
+# The admin portal SPA. Only this stage uses Node; PORTAL_UI=off never pulls the image.
+FROM node:22-bookworm-slim AS portal-on
+WORKDIR /portal
+RUN --mount=type=bind,target=/ctx \
+    mkdir -p /out \
+ && if [ -f /ctx/portal/package.json ]; then \
+      cp -a /ctx/portal/. . \
+      && rm -rf node_modules dist \
+      && npm ci --no-audit --no-fund \
+      && npm run build \
+      && cp -a dist/. /out/; \
+    else echo "no portal/package.json: building without the admin portal"; fi
+
+FROM rust:1-bookworm AS portal-off
+RUN mkdir -p /out
+
+FROM portal-${PORTAL_UI} AS portal
+
 FROM rust:1-bookworm AS build
+# Parallel rustc jobs (0: cargo's default, one per CPU).
+ARG CARGO_BUILD_JOBS=0
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p rconn-signaling \
+COPY --from=portal /out /portal-dist
+RUN features="" \
+ && if [ -f /portal-dist/index.html ] \
+      && grep -q '^portal-ui *=' crates/rconn-signaling/Cargo.toml; then \
+      rm -rf portal/dist && mkdir -p portal && cp -a /portal-dist portal/dist \
+      && features="--features portal-ui"; \
+    fi \
+ && if [ "$CARGO_BUILD_JOBS" != 0 ]; then export CARGO_BUILD_JOBS; else unset CARGO_BUILD_JOBS; fi \
+ && echo "cargo features: ${features:-none}" \
+ && cargo build --release --locked -p rconn-signaling $features \
  && strip target/release/rconn-signaling
 
 FROM debian:bookworm-slim

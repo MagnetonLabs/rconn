@@ -1,0 +1,27 @@
+# Litestream (0.5.x): continuous backup of the server database to S3-compatible storage.
+#
+# Every value comes from the environment (an env file, mode 600; see litestream.env.example),
+# so the same file works for Cloudflare R2, AWS S3, MinIO, Backblaze B2, DO Spaces, ...
+# Litestream reads LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY by itself.
+#
+# Only rconn.db is replicated. The master key (/keys/master.key) is deliberately not: a
+# copy of the bucket alone can't unseal the org CA keys. The other data-dir files
+# (tls.*, public-ca.*, session.key, turn.secret, public-hosts.jsonl, relay-usage.json,
+# audit.jsonl) are not in the database either; back them up as files.
+dbs:
+  - path: /data/rconn.db
+    replica:
+      type: s3
+      bucket: ${LITESTREAM_BUCKET}
+      # Key prefix inside the bucket; one prefix per server.
+      path: ${LITESTREAM_PATH}
+      # R2: https://<account_id>.r2.cloudflarestorage.com (region auto). Empty: AWS S3.
+      endpoint: ${LITESTREAM_ENDPOINT}
+      region: ${LITESTREAM_REGION}
+      # Ship WAL changes within about a second of the commit.
+      sync-interval: 1s
+
+# A full snapshot every day, kept 30 days; point-in-time restore anywhere in that window.
+snapshot:
+  interval: 24h
+  retention: 720h
