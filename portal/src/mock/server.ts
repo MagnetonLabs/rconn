@@ -401,7 +401,17 @@ export function createMockServer(db: Db = seed()): MockServer {
     }
     if ('group_id' in c.body) {
       const g = groupOf(orgId, c.body.group_id);
+      const from = x.group_id;
       x.group_id = g?.id ?? null;
+      if (from !== x.group_id) {
+        const name = (id: string | null) => db.groups.find((g) => g.org_id === orgId && g.id === id)?.name ?? null;
+        audit(orgId, 'computer.moved', user, { type: 'computer', id: x.id, label: x.name }, {
+          from: name(from),
+          to: name(x.group_id),
+          from_id: from,
+          to_id: x.group_id,
+        });
+      }
     }
     return ok(computerOut(x));
   });
@@ -444,7 +454,11 @@ export function createMockServer(db: Db = seed()): MockServer {
       created_at: iso(),
     };
     db.tokens.unshift(t);
-    audit(orgId, 'token.created', user, { type: 'token', id: t.id, label });
+    audit(orgId, 'token.created', user, { type: 'token', id: t.id, label }, {
+      expires_in_hours: hours,
+      group_id: t.group_id,
+      max_uses: t.max_uses,
+    });
     return ok({ ...strip(t), token: `rcet_${ids.secret(40)}` }, 201);
   });
   on('DELETE', `${ORG}/enrollment-tokens/([^/]+)`, (c) => {

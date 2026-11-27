@@ -453,15 +453,32 @@ pub async fn patch_computer(
         );
     }
     if group.is_some() && after.group_id != before.group_id {
+        let from = group_name(&st.db, &ctx, before.group_id.as_deref()).await?;
+        let to = group_name(&st.db, &ctx, after.group_id.as_deref()).await?;
         ctx.audit(
             &st,
             "computer.moved",
             Some(after.target()),
-            serde_json::json!({ "from": before.group_id, "to": after.group_id }),
+            serde_json::json!({
+                "from": from, "to": to,
+                "from_id": before.group_id, "to_id": after.group_id,
+            }),
         );
     }
     let online = st.app.online_in(ctx.org_id).await;
     Ok(Json(after.view(&online, &st.config.host_release)))
+}
+
+/// A group's name for the audit trail (`None`: no group, or one deleted meanwhile).
+async fn group_name(db: &Db, ctx: &OrgCtx, id: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(id) = id else { return Ok(None) };
+    Ok(
+        sqlx::query_scalar("SELECT name FROM host_groups WHERE org_id = ? AND id = ?")
+            .bind(ctx.org_id.to_string())
+            .bind(id)
+            .fetch_optional(db.pool())
+            .await?,
+    )
 }
 
 /// `POST /computers/{id}/revoke` (admin): refused from now on, live sessions end now.

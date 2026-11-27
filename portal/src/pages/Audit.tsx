@@ -56,6 +56,17 @@ function kindClass(k: string) {
 
 function detailText(e: AuditEvent): string {
   const d = e.detail ?? {};
+  if (e.kind === 'computer.moved') {
+    const g = (v: unknown) => (typeof v === 'string' ? v : 'No group');
+    return `${g(d.from)} → ${g(d.to)}`;
+  }
+  if (typeof d.token_label === 'string') return `With token ${d.token_label}`;
+  if (typeof d.expires_in_hours === 'number') {
+    const h = d.expires_in_hours;
+    const life = h % 24 === 0 ? `${h / 24} ${h === 24 ? 'day' : 'days'}` : `${h} ${h === 1 ? 'hour' : 'hours'}`;
+    const uses = typeof d.max_uses === 'number' ? `, ${d.max_uses} ${d.max_uses === 1 ? 'use' : 'uses'}` : '';
+    return `Valid ${life}${uses}`;
+  }
   if (typeof d.duration_s === 'number') {
     const m = Math.round(d.duration_s / 60);
     return m >= 1 ? `${m} min` : `${d.duration_s} s`;

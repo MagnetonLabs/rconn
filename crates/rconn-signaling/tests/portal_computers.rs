@@ -465,6 +465,23 @@ async fn rename_and_move_stay_inside_the_org() {
         2,
         "{kinds:?}"
     );
+    // Moves name the groups (the audit page and CSV show them), not just their ids.
+    let moved: Vec<String> =
+        sqlx::query_scalar("SELECT detail FROM audit WHERE event = 'computer.moved' ORDER BY id")
+            .fetch_all(w.p.db.pool())
+            .await
+            .unwrap();
+    let moved: Vec<Value> = moved
+        .iter()
+        .map(|d| serde_json::from_str::<Value>(d).unwrap()["detail"].clone())
+        .collect();
+    assert_eq!(
+        moved,
+        vec![
+            json!({ "from": null, "to": "Ops", "from_id": null, "to_id": mine }),
+            json!({ "from": "Ops", "to": null, "from_id": mine, "to_id": null }),
+        ]
+    );
 }
 
 #[tokio::test]
