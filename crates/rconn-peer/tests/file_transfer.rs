@@ -358,6 +358,99 @@ async fn a_100_mb_file_round_trips_both_ways_with_matching_sha256() {
     .expect("test timed out");
 }
 
+/// The main channel's round trip (ping to pong) during a large transfer each way, and
+/// how much file data a message on it could queue behind: on loopback the link is never
+/// the limit, so the bytes queued are what tells how long input would wait on a slow one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_messages_stay_prompt_during_a_large_transfer() {
+    tokio::time::timeout(Duration::from_secs(300), async {
+        let rig = rig(true, true).await;
+        let src = rig.viewer.path().join("large.bin");
+        noise_file(&src, 64 * MB);
+        std::fs::copy(&src, rig.host_root.path().join("large.bin")).unwrap();
+        let dc = rig.session.data.clone();
+        let dest = rig.viewer.path().join("dl");
+        for upload in [true, false] {
+            let progress = Progress::new();
+            let pings = async {
+                let mut out: Vec<(Duration, usize)> = Vec::new();
+                for n in 0u64.. {
+                    if progress.total() > 0 && progress.done() >= progress.total() {
+                        break;
+                    }
+                    let queued = rig.files.queued().await;
+                    let ping = DataMessage::Control(Control::Ping(n)).encode().unwrap();
+                    let sent = Instant::now();
+                    dc.send(BytesMut::from(&ping[..])).await.unwrap();
+                    loop {
+                        match dc.poll().await {
+                            Some(DataChannelEvent::OnMessage(m))
+                                if DataMessage::decode(&m.data).ok()
+                                    == Some(DataMessage::Control(Control::Pong(n))) =>
+                            {
+                                break;
+                            }
+                            Some(_) => {}
+                            None => return out,
+                        }
+                    }
+                    out.push((sent.elapsed(), queued));
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                out
+            };
+            let t = Instant::now();
+            let transfer = async {
+                if upload {
+                    rig.files.upload(&src, &progress).await.map(|_| ())
+                } else {
+                    rig.files
+                        .download("large.bin", &dest, &progress)
+                        .await
+                        .map(|_| ())
+                }
+            };
+            let (pings, done) = tokio::join!(pings, transfer);
+            done.unwrap();
+            let took = t.elapsed();
+            let mut rtts: Vec<Duration> = pings.iter().map(|p| p.0).collect();
+            rtts.sort();
+            let most_queued = pings.iter().map(|p| p.1).max().unwrap_or(0);
+            let wait_at = |mbit: f64| most_queued as f64 * 8.0 / (mbit * 1e6) * 1e3;
+            let pct = |p: usize| rtts[(rtts.len() - 1) * p / 100];
+            eprintln!(
+                "{}: 64 MB in {took:?} ({:.0} MB/s); {} pings, median {:?}, p95 {:?}, worst {:?}; \
+                 file data queued ahead of a ping: at most {} KB (on a 10 Mb/s link {:.0} ms, 2 Mb/s {:.0} ms)",
+                if upload { "upload" } else { "download" },
+                64.0 / took.as_secs_f64(),
+                rtts.len(),
+                pct(50),
+                pct(95),
+                rtts.last().unwrap(),
+                most_queued / 1024,
+                wait_at(10.0),
+                wait_at(2.0),
+            );
+            assert!(rtts.len() >= 5, "pings answered during the transfer");
+            assert!(
+                *rtts.last().unwrap() < Duration::from_millis(100),
+                "input waited behind file data: {:?}",
+                rtts.last()
+            );
+            if upload {
+                assert!(
+                    most_queued <= rconn_peer::files::HIGH_WATER,
+                    "{most_queued} bytes of file data ahead of input"
+                );
+            }
+        }
+        assert_eq!(sha256_of(&dest.join("large.bin")), sha256_of(&src));
+        rig.close().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_mid_transfer_removes_the_partial_file_on_both_sides() {
     tokio::time::timeout(Duration::from_secs(120), async {

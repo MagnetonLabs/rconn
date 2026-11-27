@@ -3,9 +3,9 @@
 //!
 //! Everything streams: a file is read and written a chunk at a time, hashed as it goes,
 //! and at most [`TRANSFER_WINDOW`] bytes are unacknowledged, so memory stays small however
-//! large the file. The sender also waits while the connection's SCTP queue holds more than
-//! [`HIGH_WATER`] bytes: the queue is shared with the main channel, and a short one keeps
-//! input and control messages from waiting behind file data.
+//! large the file. The sender also keeps at most [`HIGH_WATER`] bytes of its channel in
+//! SCTP, sent in [`SEND_CHUNK`]s: both channels go through one ordered queue and share the
+//! link, so a short queue keeps input and control messages from waiting behind file data.
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
@@ -26,12 +26,15 @@ use tokio::task::{JoinHandle, JoinSet};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::PeerConnection;
 
-/// Bytes queued in SCTP (this channel's share) before a sender waits. Measured on
-/// loopback (tests/file_transfer.rs): 1 MiB let bursts overflow and cost a main-channel
-/// ping up to ~1 s (a retransmission timeout); 256 KiB kept the worst ping under 20 ms
-/// and moved data faster. The price is throughput on long paths: at most this much per
-/// round trip (about 5 MB/s at 50 ms).
-pub const HIGH_WATER: usize = 256 * 1024;
+/// Most bytes of this channel in SCTP (queued or unacknowledged) at once. Whatever is
+/// there is ahead of a key press on a slow link: 256 KiB (0.1.5-0.1.10) was 0.2 s at
+/// 10 Mb/s and 1 s at 2 Mb/s; 32 KiB is 26 and 130 ms. (1 MiB also overflowed on
+/// loopback and cost a ping up to ~1 s, a retransmission timeout.) The price is
+/// throughput on long paths: at most this much per round trip, ~650 KB/s at 50 ms.
+pub const HIGH_WATER: usize = 32 * 1024;
+/// File content per Data message sent (receivers take up to [`FILE_CHUNK_BYTES`]): half
+/// of [`HIGH_WATER`], so one goes out while the other drains.
+pub const SEND_CHUNK: usize = HIGH_WATER / 2;
 /// Inbound messages buffered per request. More than a window's worth of chunks, so a peer
 /// that honours the window never fills it; one that doesn't loses the request.
 const QUEUE: usize = 128;
@@ -83,19 +86,19 @@ impl Wire {
             .map_err(|_| anyhow!(Stopped::Closed))
     }
 
-    /// Wait until SCTP has room for more file data.
-    async fn writable(&self) -> Result<()> {
+    /// Wait until SCTP has room for `len` more bytes of file data.
+    async fn writable(&self, len: usize) -> Result<()> {
         loop {
             let queued = self
                 .dc
                 .outstanding_bytes()
                 .await
                 .map_err(|_| anyhow!(Stopped::Closed))?;
-            if queued <= HIGH_WATER {
+            if queued + len <= HIGH_WATER || queued == 0 {
                 return Ok(());
             }
             // The event may not come (it tracks a slightly different counter): poll too.
-            let _ = tokio::time::timeout(Duration::from_millis(10), self.low.notified()).await;
+            let _ = tokio::time::timeout(Duration::from_millis(5), self.low.notified()).await;
         }
     }
 }
@@ -231,13 +234,13 @@ async fn send_content(
     control: &mut mpsc::Receiver<FileMessage>,
     progress: Option<&Progress>,
 ) -> Result<(u64, [u8; 32])> {
-    let mut buf = vec![0u8; FILE_CHUNK_BYTES];
+    let mut buf = vec![0u8; SEND_CHUNK.min(FILE_CHUNK_BYTES)];
     let (mut sent, mut acked) = (0u64, 0u64);
     let mut hasher = Sha256::new();
     loop {
         // Take what the peer sent; wait for credit while the window is full.
         loop {
-            let full = sent - acked + FILE_CHUNK_BYTES as u64 > TRANSFER_WINDOW;
+            let full = sent - acked + buf.len() as u64 > TRANSFER_WINDOW;
             let msg = if full {
                 match progress {
                     Some(p) => tokio::select! {
@@ -264,7 +267,7 @@ async fn send_content(
         if progress.is_some_and(|p| p.is_cancelled()) {
             return Err(Stopped::Cancelled.into());
         }
-        let want = (limit - sent).min(FILE_CHUNK_BYTES as u64) as usize;
+        let want = (limit - sent).min(buf.len() as u64) as usize;
         if want == 0 {
             break;
         }
@@ -273,7 +276,7 @@ async fn send_content(
             break;
         }
         hasher.update(&buf[..n]);
-        wire.writable().await?;
+        wire.writable(n).await?;
         wire.send(&FileMessage::Data {
             req,
             bytes: buf[..n].to_vec(),
@@ -821,6 +824,12 @@ impl FilesClient {
             rx,
             client: self.client.clone(),
         })
+    }
+
+    /// Bytes this channel has handed to SCTP that the host has not acknowledged yet:
+    /// what a message on the main channel may queue behind on a slow link.
+    pub async fn queued(&self) -> usize {
+        self.client.wire.dc.outstanding_bytes().await.unwrap_or(0)
     }
 
     /// Why the channel is unusable, if it is (refused or closed).
