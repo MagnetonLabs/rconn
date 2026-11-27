@@ -1,6 +1,6 @@
 {
-  "version": "0.1.9",
-  "baseUrl": "https://github.com/MagnetonLabs/rconn/releases/download/v0.1.9/",
+  "version": "0.1.10",
+  "baseUrl": "https://github.com/MagnetonLabs/rconn/releases/download/v0.1.10/",
   "files": [
     {
       "id": "macos",
@@ -9,9 +9,9 @@
       "arch": "universal",
       "archLabel": "Apple silicon and Intel",
       "scope": "any",
-      "file": "Rconn-0.1.9.dmg",
-      "sizeBytes": 53450514,
-      "sha256": "41c4b124ad0e650329c0f3729e2b125d79598d054a816fabf4b50de36cfeb905",
+      "file": "Rconn-0.1.10.dmg",
+      "sizeBytes": 53607323,
+      "sha256": "28d52589377dd33b82e367d588e1c6acdc04efb57f91132b08c07fd22a28f398",
       "requires": "macOS 13 Ventura or later"
     },
     {
@@ -21,9 +21,9 @@
       "arch": "x64",
       "archLabel": "x64 (Intel and AMD)",
       "scope": "system",
-      "file": "rconn-host-setup-x64-0.1.9.exe",
-      "sizeBytes": 23461981,
-      "sha256": "d5095db2ff80c6e48d33d5b3c233cb7ea80e0e708ce16b6299d38a529008396f",
+      "file": "rconn-host-setup-x64-0.1.10.exe",
+      "sizeBytes": 23482936,
+      "sha256": "bd7fc164c78c72cdd2ee40b75723e3e5f76f276d8bfb39258e840c4f28014eab",
       "requires": "64-bit Windows 11 (Windows 10 untested)"
     },
     {
@@ -33,9 +33,9 @@
       "arch": "x64",
       "archLabel": "x64 (Intel and AMD)",
       "scope": "user",
-      "file": "rconn-setup-user-x64-0.1.9.exe",
-      "sizeBytes": 18408247,
-      "sha256": "2ac64d6ff7ed4be72093945d015df16753bf3a10ae51522490d10d191ad20521",
+      "file": "rconn-setup-user-x64-0.1.10.exe",
+      "sizeBytes": 18434973,
+      "sha256": "037dd975ba9e55da2e051b6f76c6b92255a5b5f2cadc690c3c2915c68d7d1e18",
       "requires": "64-bit Windows 11 (Windows 10 untested)"
     },
     {
@@ -45,9 +45,9 @@
       "arch": "arm64",
       "archLabel": "ARM64 (Snapdragon and other Arm PCs)",
       "scope": "system",
-      "file": "rconn-host-setup-arm64-0.1.9.exe",
-      "sizeBytes": 20316078,
-      "sha256": "901848b47291e3a954c36255da68442be481d8614cf41ce3a5492f924f0bd766",
+      "file": "rconn-host-setup-arm64-0.1.10.exe",
+      "sizeBytes": 20341808,
+      "sha256": "d30cb458a95f67ae3ebfabd5f15eb675bfcd99ff9fda572b05bc495e73b72eeb",
       "requires": "Windows 11 on Arm"
     },
     {
@@ -57,9 +57,9 @@
       "arch": "arm64",
       "archLabel": "ARM64 (Snapdragon and other Arm PCs)",
       "scope": "user",
-      "file": "rconn-setup-user-arm64-0.1.9.exe",
-      "sizeBytes": 16011654,
-      "sha256": "1989308374de16d05a791527c316b214bb279d711a07666f68a6af3f3da80202",
+      "file": "rconn-setup-user-arm64-0.1.10.exe",
+      "sizeBytes": 16033224,
+      "sha256": "b0843ffa84832ef327143cc2a4336ef431660d6c00b96f759df2e5e4d0609c60",
       "requires": "Windows 11 on Arm"
     },
     {
@@ -69,9 +69,9 @@
       "arch": "amd64",
       "archLabel": "x86-64",
       "scope": "system",
-      "file": "rconn_0.1.9_amd64.deb",
-      "sizeBytes": 20370920,
-      "sha256": "781c00ab8608c0695195d746b3776618cf8483435fd6169c8ddd6716795350cb",
+      "file": "rconn_0.1.10_amd64.deb",
+      "sizeBytes": 20395524,
+      "sha256": "2ee027af2316a3c83f4ddf2442aece2e532c3882b6458f347893cda99d10f94a",
       "requires": "Ubuntu 24.04 or later, X11 or Wayland"
     },
     {
@@ -81,9 +81,9 @@
       "arch": "amd64",
       "archLabel": "x86-64",
       "scope": "user",
-      "file": "rconn-0.1.9-linux-amd64.tar.gz",
-      "sizeBytes": 28310702,
-      "sha256": "3abf7a21f55ce9125a8b3cce3cf7bdabf350c30130c6ba7970b6e9a9af51d174",
+      "file": "rconn-0.1.10-linux-amd64.tar.gz",
+      "sizeBytes": 28349527,
+      "sha256": "0f39210015681d34ce4bb66c8aa763bfb7cf2678911b26ea2ccf150adc3c80cd",
       "requires": "Ubuntu 24.04 or later, X11 or Wayland"
     },
     {
@@ -93,9 +93,9 @@
       "arch": "arm64",
       "archLabel": "ARM64",
       "scope": "system",
-      "file": "rconn_0.1.9_arm64.deb",
-      "sizeBytes": 18080084,
-      "sha256": "e297274f61237957743fe027023c33e6b02ba4026fdafa239b010cb376c58cc7",
+      "file": "rconn_0.1.10_arm64.deb",
+      "sizeBytes": 18102912,
+      "sha256": "c39532232cc0b39bc760090a9d6203728de7f011b06f00a1f07c7fdf602e48ee",
       "requires": "Ubuntu 24.04 or later, X11 or Wayland"
     },
     {
@@ -105,9 +105,9 @@
       "arch": "arm64",
       "archLabel": "ARM64",
       "scope": "user",
-      "file": "rconn-0.1.9-linux-arm64.tar.gz",
-      "sizeBytes": 26510959,
-      "sha256": "d890b9dcd055cc48edd52f1854d169b70cbb226e46bf0720994e5122146c9349",
+      "file": "rconn-0.1.10-linux-arm64.tar.gz",
+      "sizeBytes": 26545648,
+      "sha256": "5f23bab1c2a56008a4613a5c39303d5d7d0be7a245fc17ad8b514706e6532674",
       "requires": "Ubuntu 24.04 or later, X11 or Wayland"
     }
   ]
