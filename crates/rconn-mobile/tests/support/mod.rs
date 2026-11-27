@@ -1,10 +1,12 @@
 //! A signaling server and a host streaming a synthetic test pattern behind an access
 //! password, all in-process: shared by the session test and the `test_host` example (which
-//! the iOS app connects to in the simulator).
+//! the iOS app connects to in the simulator). Once the password checks out it also sends a
+//! test tone and, given a folder, shares it on the file channel as a real host does.
 
 #![allow(dead_code)]
 
 use bytes::BytesMut;
+use rconn_core::files::FILES_CHANNEL_LABEL;
 use rconn_core::fleet::{FleetCa, HostKey};
 use rconn_core::guest::{HostCheck, make_verifier};
 use rconn_core::ids::{HostId, OrgId};
@@ -12,6 +14,7 @@ use rconn_core::protocol::{Control, DataMessage, GuestMessage, GuestRefusal, Inp
 use rconn_media::capture::{Capturer, TestPattern};
 use rconn_media::cisco::local_binary_path;
 use rconn_media::video::{EncoderSettings, VideoEncoder};
+use rconn_peer::files::ServeConfig;
 use rconn_peer::rtc::PeerOptions;
 use rconn_peer::session::{HostSession, SessionHandler, run_host};
 use rconn_peer::signaling::{HostCredentials, SignalingClient};
@@ -22,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::watch;
 use webrtc::data_channel::DataChannelEvent;
 
 const SERVER_ID: &str = "wss://mobile.test";
@@ -34,6 +38,8 @@ pub struct HostSetup {
     pub height: usize,
     /// Signaling listen address, e.g. `127.0.0.1:0`.
     pub listen: String,
+    /// The folder the file channel shares (none: the channel is refused).
+    pub files_root: Option<PathBuf>,
 }
 
 /// What the host saw from the viewer.
@@ -43,6 +49,7 @@ pub struct HostLog {
     pub resizes: Mutex<Vec<(u32, u32)>>,
     pub keyframe_requests: AtomicUsize,
     pub frames_sent: AtomicUsize,
+    pub sound_packets_sent: AtomicUsize,
 }
 
 pub fn openh264() -> PathBuf {
@@ -98,6 +105,7 @@ pub async fn start(setup: HostSetup) -> (String, String, Arc<HostLog>) {
             lib.clone(),
             host_log.clone(),
             (setup.width, setup.height),
+            setup.files_root.clone(),
         ));
     });
     let opts = PeerOptions {
@@ -117,19 +125,47 @@ async fn host_session(
     lib: PathBuf,
     log: Arc<HostLog>,
     size: (usize, usize),
+    files_root: Option<PathBuf>,
 ) {
     let HostSession {
         binding,
         policy,
         video,
+        audio,
         mut channels,
         ..
     } = s;
     assert!(policy.guest, "a guest session must be flagged to the host");
     let mut video = Some(video);
+    let mut audio = audio;
     let Some(dc) = channels.recv().await else {
         return;
     };
+    // Later channels: the file channel, served once the password checked out.
+    let (allowed_tx, allowed) = watch::channel(false);
+    let more = tokio::spawn(async move {
+        while let Some(dc) = channels.recv().await {
+            if dc.label().await.unwrap_or_default() != FILES_CHANNEL_LABEL {
+                continue;
+            }
+            let (root, allowed) = (files_root.clone(), *allowed.borrow());
+            tokio::spawn(async move {
+                match root {
+                    Some(root) if allowed => {
+                        let cfg = ServeConfig {
+                            inbox: root.join("Downloads").join("Rconn"),
+                            root,
+                            free_space: None,
+                            session: "test".into(),
+                        };
+                        rconn_peer::files::serve(dc, cfg).await;
+                    }
+                    Some(_) => rconn_peer::files::refuse(dc, "not allowed in yet").await,
+                    None => rconn_peer::files::refuse(dc, "file transfer is off").await,
+                }
+            });
+        }
+    });
     let send = |m: DataMessage| {
         let dc = dc.clone();
         async move {
@@ -146,6 +182,7 @@ async fn host_session(
     .await;
     let keyframe = Arc::new(AtomicBool::new(false));
     let mut streaming = None;
+    let mut tones = Vec::new();
     while let Some(ev) = dc.poll().await {
         let DataChannelEvent::OnMessage(m) = ev else {
             continue;
@@ -156,6 +193,10 @@ async fn host_session(
                 match c.finish(&msg, &confirm) {
                     Ok(confirm) => {
                         send(DataMessage::Guest(GuestMessage::Accepted { confirm })).await;
+                        allowed_tx.send_replace(true);
+                        if let Some(a) = audio.take() {
+                            tones.push(tokio::spawn(tone(a, log.clone())));
+                        }
                         if let Some(v) = video.take() {
                             streaming = Some(tokio::spawn(stream(
                                 v,
@@ -188,6 +229,43 @@ async fn host_session(
     }
     if let Some(t) = streaming {
         t.abort();
+    }
+    for t in tones {
+        t.abort();
+    }
+    more.abort();
+}
+
+/// A quiet 440 Hz beep, 150 ms every second, as Opus in 20 ms packets (silence between,
+/// as a real host fills gaps).
+async fn tone(audio: rconn_peer::video::AudioSender, log: Arc<HostLog>) {
+    const FRAME: usize = 960;
+    let mut enc = rconn_media::codec::opus_encoder().unwrap();
+    let mut out = vec![0u8; 4000];
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    let mut n = 0usize;
+    loop {
+        tick.tick().await;
+        let mut pcm = Vec::with_capacity(FRAME * 2);
+        for _ in 0..FRAME {
+            let on = n % 48_000 < 7_200;
+            let v = if on {
+                (2.0 * std::f32::consts::PI * 440.0 * n as f32 / 48_000.0).sin() * 0.1
+            } else {
+                0.0
+            };
+            pcm.extend([v, v]);
+            n += 1;
+        }
+        let len = enc.encode_float(&pcm, &mut out).unwrap();
+        if audio
+            .write(out[..len].to_vec(), Duration::from_millis(20))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        log.sound_packets_sent.fetch_add(1, Ordering::Relaxed);
     }
 }
 

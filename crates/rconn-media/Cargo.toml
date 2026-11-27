@@ -16,6 +16,12 @@ openh264 = { version = "0.9", default-features = false }
 openh264-sys2 = { version = "0.9.10", default-features = false }
 opus.workspace = true
 thiserror.workspace = true
+# Sound playback ([`playback`]), for the viewers.
+cpal = { version = "0.18.2", optional = true }
+anyhow = { workspace = true, optional = true }
+
+[features]
+playback = ["dep:cpal", "dep:anyhow"]
 
 # Windows ARM64: libopus 1.6.1's NEON code fails under clang-cl (MSVC-only `__emit` in
 # runtime CPU detection; missing declarations when NEON is presumed). Scalar build until

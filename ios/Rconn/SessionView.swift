@@ -1,11 +1,12 @@
 import SwiftUI
 
 /// Full-screen session: the remote screen, a status line until the picture shows, and a
-/// small toolbar (keyboard, paste, disconnect).
+/// small toolbar (keyboard, Keys menu, sound, files, paste, disconnect).
 struct SessionView: View {
     @ObservedObject var model: SessionModel
     let onClose: (String) -> Void
     @State private var screen: RemoteScreenView?
+    @State private var showingFiles = false
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -31,6 +32,26 @@ struct SessionView: View {
                     .foregroundStyle(.white.opacity(0.8))
                 Spacer()
                 toolbarButton("keyboard", label: "Keyboard") { screen?.showKeyboard() }
+                Menu {
+                    ForEach(Array(model.combos.enumerated()), id: \.offset) { i, combo in
+                        Button(combo.label) { model.sendCombo(i) }
+                    }
+                } label: {
+                    toolbarIcon("command")
+                }
+                .tint(.white)
+                .accessibilityLabel("Keys")
+                .accessibilityHint("Send keys this device can't type, such as Ctrl+Alt+Del")
+                .accessibilityIdentifier("keys")
+                toolbarButton(model.soundOn ? "speaker.wave.2.fill" : "speaker.slash.fill",
+                              label: "Sound") { model.toggleSound() }
+                    .opacity(model.soundOn ? 1 : 0.6)
+                    .accessibilityValue(model.soundOn ? "on" : "off")
+                    .accessibilityHint(model.soundOn ? "Plays the computer's sound: tap to mute"
+                                                     : "The computer's sound is muted: tap to hear it")
+                    .accessibilityIdentifier("sound")
+                toolbarButton("folder", label: "Files") { showingFiles = true }
+                    .accessibilityIdentifier("files")
                 toolbarButton("doc.on.clipboard", label: "Paste to computer") { model.pasteToComputer() }
                 toolbarButton("xmark", label: "Disconnect") { model.disconnect() }
                     .accessibilityIdentifier("disconnect")
@@ -46,17 +67,22 @@ struct SessionView: View {
         .onChange(of: model.closedReason) { _, reason in
             if let reason { onClose(reason) }
         }
+        .sheet(isPresented: $showingFiles) {
+            FilesView(files: model.files)
+        }
+    }
+
+    private func toolbarIcon(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 15, weight: .semibold))
+            .frame(width: 36, height: 36)
+            .background(.ultraThinMaterial, in: Circle())
     }
 
     private func toolbarButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 15, weight: .semibold))
-                .frame(width: 36, height: 36)
-                .background(.ultraThinMaterial, in: Circle())
-        }
-        .tint(.white)
-        .accessibilityLabel(label)
+        Button(action: action) { toolbarIcon(symbol) }
+            .tint(.white)
+            .accessibilityLabel(label)
     }
 }
 

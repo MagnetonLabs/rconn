@@ -11,12 +11,15 @@ settings:
     DEVELOPMENT_TEAM: 7727LYTG96
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
 targets:
   Rconn:
     type: application
     platform: iOS
+    # MARKETING_VERSION and CURRENT_PROJECT_VERSION: the workspace version, written by
+    # build-rust.sh from Cargo.toml.
+    configFiles:
+      Debug: Generated/Version.xcconfig
+      Release: Generated/Version.xcconfig
     sources:
       - path: Rconn
       - path: Generated/Swift
@@ -26,6 +29,11 @@ targets:
         embed: false
       - sdk: SystemConfiguration.framework
       - sdk: Security.framework
+      # Sound (cpal on RemoteIO, AVAudioSession).
+      - sdk: AVFoundation.framework
+      - sdk: AVFAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
     preBuildScripts:
       - name: Check Rust library
         basedOnDependencyAnalysis: false
@@ -38,6 +46,9 @@ targets:
       path: Rconn/Info.plist
       properties:
         CFBundleDisplayName: Rconn
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.productivity
         UILaunchScreen: {}
         UIApplicationSupportsIndirectInputEvents: true
         UISupportedInterfaceOrientations:
@@ -49,8 +60,18 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+        # Downloads land in Documents: show it in the Files app ("On My iPhone > Rconn").
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         # WebRTC connects straight to the computer when it is on the same network.
         NSLocalNetworkUsageDescription: Rconn connects directly to your computers when they are on the same network.
+        # The share sheet after a download offers "Save Image" for pictures.
+        NSPhotoLibraryAddUsageDescription: Rconn saves pictures you download from your computer to Photos when you choose Save Image.
+        # The sessions' DTLS/SRTP (WebRTC) and TLS (rustls) are standard algorithms, but
+        # implemented in the app rather than taken from iOS: App Store Connect's export
+        # compliance questions apply (no proprietary encryption; a French declaration only
+        # for distribution in France).
+        ITSAppUsesNonExemptEncryption: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.rconn.ios
@@ -58,3 +79,32 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         DEAD_CODE_STRIPPING: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+  # Drives the app in the simulator against the test_host example (keys, sound, files) and
+  # saves screenshots. Not part of the app.
+  RconnUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: RconnUITests
+    dependencies:
+      - target: Rconn
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.rconn.ios.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+schemes:
+  Rconn:
+    build:
+      targets:
+        Rconn: all
+        RconnUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - RconnUITests
+    archive:
+      config: Release
