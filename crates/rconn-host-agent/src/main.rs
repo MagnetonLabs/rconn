@@ -378,9 +378,15 @@ async fn serve_session(
     if password_first && !session.policy.guest {
         tracing::warn!(%session.session_id, "server sent a session without the password check to a computer owned by nobody; requiring the password");
     }
-    let gate = access::Gate::new(password_first);
+    let checks = access::Checks::new(password_first, session.policy.require_approval);
+    let gate = access::Gate::new(checks.gated());
     let policy = access::Policy {
-        verifier: settings.settings().access_password.clone(),
+        // The organization wants the person here to accept: a password doesn't replace that.
+        verifier: if checks.approval {
+            String::new()
+        } else {
+            settings.settings().access_password.clone()
+        },
         ask_with_password: settings.settings().ask_with_password,
     };
     let binding = session.binding.clone();
@@ -432,6 +438,7 @@ async fn serve_session(
     tokio::spawn(async move {
         while let Some(dc) = channels.recv().await {
             let guest = Guest {
+                viewer_checks: checks.viewer,
                 gate: channel_gate.clone(),
                 policy: policy.clone(),
                 binding: binding.clone(),
@@ -473,8 +480,20 @@ async fn serve_session(
     if !connected {
         anyhow::bail!("peer connection did not connect");
     }
-    if password_first {
-        tracing::info!(%session_id, "guest session: waiting for the password or the person here");
+    if checks.host_asks {
+        // A signed-in operator under a policy that needs the person here to accept: their
+        // viewer doesn't take part, so ask now (it waits on a black picture meanwhile).
+        tracing::info!(%session_id, "organization policy: asking the person at the computer");
+        match access::ask(&gate, access::Pending::Ask, access::ORG_VIEWER) {
+            Ok(ticket) => {
+                let answer = prompt::ask(&ticket.viewer, access::ASK_TIMEOUT).await;
+                let _ = access::decided(&gate, ticket, answer);
+            }
+            Err(reply) => tracing::warn!(?reply, "couldn't ask the person at the computer"),
+        }
+    }
+    if checks.gated() {
+        tracing::info!(%session_id, "waiting for the password or the person here");
         if !gate.wait(Duration::from_secs(60)).await {
             // Let the refusal reach the viewer before the connection closes.
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -501,8 +520,10 @@ async fn serve_session(
         software: false,
         codec: session.video.codec(),
     };
-    // Host sound runs alongside the picture; losing it never ends the session.
-    if let (Some(audio_track), false) = (session.audio.take(), cli.no_audio) {
+    // Host sound runs alongside the picture; losing it never ends the session. The
+    // organization's policy may turn it off.
+    let no_audio = cli.no_audio || !session.policy.audio;
+    if let (Some(audio_track), false) = (session.audio.take(), no_audio) {
         let source = if cli.test_tone {
             audio::Source::TestTone
         } else {
@@ -534,6 +555,8 @@ async fn serve_session(
 
 /// The guest check for a session (open from the start for signed-in operators).
 struct Guest {
+    /// The viewer takes part in the check (password or "ask the person here").
+    viewer_checks: bool,
     gate: Arc<access::Gate>,
     policy: access::Policy,
     binding: rconn_core::guest::Binding,
@@ -579,7 +602,7 @@ async fn serve_channel(
     };
     let gate = guest.gate.clone();
     let mut pending = access::Pending::None;
-    if gate.needs_check() {
+    if guest.viewer_checks && gate.needs_check() {
         let label = dc.label().await.unwrap_or_default();
         let (p, first) = access::open(&gate, &guest.policy, &guest.binding, &label);
         pending = p;

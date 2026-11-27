@@ -458,6 +458,9 @@ async fn serve(store: &DataDir, key_path: &Path, args: ServeArgs) -> Result<()> 
         state.trust_client_ip_header(name);
     }
     state.record_hosts_in(Arc::new(DbInventory::spawn(db.clone())));
+    state.use_policies(Arc::new(
+        rconn_signaling::portal::policies::DbPolicies::new(db.clone()),
+    ));
     // Load the database before accepting anyone, then follow its changes (and import
     // legacy files that old scripts may still write) without a restart.
     let mut seen = rconn_signaling::reload::Seen::default();

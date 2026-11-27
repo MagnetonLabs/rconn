@@ -181,7 +181,17 @@ export function createMockServer(db: Db = seed()): MockServer {
     });
   }
 
-  const csvCell = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+  // As the server does: quoted when needed, and never read as a formula by a spreadsheet.
+  const csvCell = (raw: string) => {
+    const v = /^[=+\-@\t\r]/.test(raw) ? `'${raw}` : raw;
+    return /[",\n\r]/.test(v) || /^ | $/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+  };
+  // policy.changed carries the whole policy before and after, and what changed.
+  const policyChange = (before: Policy, after: Policy) => ({
+    before,
+    after,
+    changed: (Object.keys(after) as (keyof Policy)[]).filter((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k])),
+  });
 
   const ORG = '/orgs/([^/]+)';
   const routes: [string, RegExp, Handler][] = [];
@@ -573,8 +583,9 @@ export function createMockServer(db: Db = seed()): MockServer {
     const g = groupOf(orgId, c.params[1])!;
     need(m, 'admin');
     const p = validPolicy(c.body);
+    const before = db.policies[policyKey(orgId, g.id)] ?? db.policies[policyKey(orgId, null)] ?? DEFAULT_POLICY;
     db.policies[policyKey(orgId, g.id)] = p;
-    audit(orgId, 'policy.changed', user, { type: 'group', id: g.id, label: g.name });
+    audit(orgId, 'policy.changed', user, { type: 'group', id: g.id, label: g.name }, policyChange(before, p));
     return ok(p);
   });
   on('GET', `${ORG}/policy/default`, (c) => {
@@ -585,8 +596,9 @@ export function createMockServer(db: Db = seed()): MockServer {
     const { orgId, m, user } = member(c);
     need(m, 'admin');
     const p = validPolicy(c.body);
+    const before = db.policies[policyKey(orgId, null)] ?? DEFAULT_POLICY;
     db.policies[policyKey(orgId, null)] = p;
-    audit(orgId, 'policy.changed', user, { type: 'group', id: 'default', label: 'Company default' });
+    audit(orgId, 'policy.changed', user, { type: 'group', id: 'default', label: 'Company default' }, policyChange(before, p));
     return ok(p);
   });
 

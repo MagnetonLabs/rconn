@@ -71,6 +71,8 @@ async fn rig(setting: bool, policy: bool) -> Rig {
             clipboard: true,
             guest: false,
             file_transfer: policy,
+            audio: true,
+            require_approval: false,
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/ws", listener.local_addr().unwrap());

@@ -176,6 +176,9 @@ describe('computers, tokens, policies, audit', () => {
     const good = { ...bad, allowed_hours: { ...bad.allowed_hours, timezone: 'America/Chicago' } };
     expect((await policies.putPolicy(ORG_A, null, good)).allowed_hours?.timezone).toBe('America/Chicago');
     expect((await policies.getPolicy(ORG_A, null)).allowed_hours?.days).toEqual(['mon']);
+    const changed = (await audit.listAudit(ORG_A, { kind: 'policy.changed' })).items[0];
+    expect(changed.detail.changed).toEqual(['allowed_hours']);
+    expect((changed.detail.after as policies.Policy).allowed_hours?.timezone).toBe('America/Chicago');
   });
 
   it('pages audit events with a cursor and exports CSV', async () => {

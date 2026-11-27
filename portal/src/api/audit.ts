@@ -3,6 +3,7 @@ import { api, orgPath, url } from './http';
 export const AUDIT_KINDS = [
   'session.start',
   'session.end',
+  'session.refused',
   'file.upload',
   'file.download',
   'computer.enrolled',

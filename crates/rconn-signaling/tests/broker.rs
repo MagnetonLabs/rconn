@@ -67,6 +67,8 @@ impl Authenticator for TestAuth {
             show_indicator: false,
             clipboard: true,
             file_transfer: true,
+            audio: true,
+            require_approval: false,
         }
     }
 }

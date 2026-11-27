@@ -80,6 +80,15 @@ pub enum AuditEvent {
         operator_id: OperatorId,
         reason: String,
     },
+    /// A session to an org computer refused by the organization's policy (outside the
+    /// allowed hours, access password not allowed, host too old to enforce it).
+    PolicyRefused {
+        org_id: OrgId,
+        host_id: HostId,
+        operator_id: OperatorId,
+        guest: bool,
+        reason: String,
+    },
     /// Someone signed in to the admin portal. `orgs`: the orgs they are a member of (the
     /// event shows in each one's log).
     PortalSignIn {

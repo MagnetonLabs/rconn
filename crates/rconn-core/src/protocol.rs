@@ -39,10 +39,20 @@ pub const HOST_CAP_HOST_NAME: &str = "host_name";
 /// Host capability: checks guests with the connection-bound access-password proof
 /// ([`DATA_CHANNEL_LABEL`]) and refuses legacy guest channels.
 pub const HOST_CAP_GUEST_V2: &str = "guest_v2";
+/// Host capability: honours [`SessionPolicy::audio`] (no host sound when it is off).
+pub const HOST_CAP_POLICY_AUDIO: &str = "policy_audio";
+/// Host capability: honours [`SessionPolicy::require_approval`] (the person at the
+/// computer accepts every session, signed-in operators' too).
+pub const HOST_CAP_POLICY_APPROVAL: &str = "policy_approval";
 /// Capabilities this build's host agent sends in [`ClientMessage::HostHello`]. The server
 /// refuses (fails closed) a policy that needs one the host lacks; unknown entries are
 /// ignored. Hosts from 0.1.x send none.
-pub const HOST_CAPABILITIES: &[&str] = &[HOST_CAP_HOST_NAME, HOST_CAP_GUEST_V2];
+pub const HOST_CAPABILITIES: &[&str] = &[
+    HOST_CAP_HOST_NAME,
+    HOST_CAP_GUEST_V2,
+    HOST_CAP_POLICY_AUDIO,
+    HOST_CAP_POLICY_APPROVAL,
+];
 
 /// Longest `os` / `version` string in [`ClientMessage::HostHello`] the server keeps.
 pub const MAX_HOST_FACT_CHARS: usize = 64;
@@ -281,6 +291,15 @@ pub struct SessionPolicy {
     /// existed don't send it: on, like the host setting's default.
     #[serde(default = "yes")]
     pub file_transfer: bool,
+    /// Play the host's sound to the viewer. Servers from before it existed don't send it:
+    /// on. Only hosts with [`HOST_CAP_POLICY_AUDIO`] honour "off" (the server refuses
+    /// sessions that need it to other hosts).
+    #[serde(default = "yes")]
+    pub audio: bool,
+    /// The person at the computer must accept the session first, whoever asks (guests and
+    /// signed-in operators). Only hosts with [`HOST_CAP_POLICY_APPROVAL`] honour it.
+    #[serde(default)]
+    pub require_approval: bool,
 }
 
 fn yes() -> bool {
@@ -703,6 +722,8 @@ mod tests {
         let old: SessionPolicy =
             serde_json::from_str(r#"{"show_indicator":false,"clipboard":true}"#).unwrap();
         assert!(old.file_transfer);
+        assert!(old.audio, "sound stays on with older servers");
+        assert!(!old.require_approval);
         assert!(!old.guest);
         let off = SessionPolicy {
             file_transfer: false,

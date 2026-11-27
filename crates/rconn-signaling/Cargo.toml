@@ -31,6 +31,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 argon2 = "0.6.0"
 hmac = "0.13"
 base64 = "0.23.1"
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tzdb-bundle-always"] }
 openidconnect = "4"
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }

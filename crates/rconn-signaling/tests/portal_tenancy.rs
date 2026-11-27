@@ -226,8 +226,15 @@ async fn each_role_gets_what_the_table_says() {
             let r = w.p.call(&mut b, method.clone(), &path, body).await;
             let allowed = role.at_least(action.min_role());
             if allowed {
+                // Past the role check: any answer but 401/403/500 (a route may 404 the
+                // made-up id, 409 a name taken by an earlier role, 400 a stub body).
                 assert!(
-                    r.status == StatusCode::OK || r.status == StatusCode::NOT_IMPLEMENTED,
+                    !matches!(
+                        r.status,
+                        StatusCode::UNAUTHORIZED
+                            | StatusCode::FORBIDDEN
+                            | StatusCode::INTERNAL_SERVER_ERROR
+                    ),
                     "{role:?} {method} {path}: {} {}",
                     r.status,
                     r.text
@@ -346,7 +353,7 @@ async fn a_person_in_two_orgs_reaches_both_and_sees_both() {
             None,
         )
         .await;
-    assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(r.status, StatusCode::OK);
     // The sign-in shows in both orgs' logs.
     let rows = w.p.audit_rows().await;
     for org in [w.a, w.b] {

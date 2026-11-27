@@ -68,6 +68,17 @@ struct Inner {
     client_ip_header: std::sync::OnceLock<HeaderName>,
     /// Where org hosts' online/offline/enrollment are recorded, when configured.
     inventory: std::sync::OnceLock<Arc<dyn HostInventory>>,
+    /// Org computers' session policies (the portal's groups), when configured.
+    policies: std::sync::OnceLock<Arc<dyn PolicySource>>,
+}
+
+/// Where the broker finds an org computer's session policy (the portal's groups and
+/// company default). See [`portal::policies`].
+#[async_trait::async_trait]
+pub trait PolicySource: Send + Sync + 'static {
+    /// The policy for a new session to `host`; None: not an org managed here (the
+    /// authenticator's static policy applies).
+    async fn policy(&self, host: HostIdentity) -> anyhow::Result<Option<portal::policies::Policy>>;
 }
 
 struct OnlineHost {
@@ -75,6 +86,8 @@ struct OnlineHost {
     tx: Outbox,
     /// Who may connect without the access password (and sees it in their list).
     owner: Option<HostOwner>,
+    /// What it said it supports in `HostHello` (policies it can enforce).
+    capabilities: Vec<String>,
 }
 
 #[derive(Default)]
@@ -117,6 +130,7 @@ impl AppState {
                 public: std::sync::OnceLock::new(),
                 client_ip_header: std::sync::OnceLock::new(),
                 inventory: std::sync::OnceLock::new(),
+                policies: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -145,6 +159,46 @@ impl AppState {
     /// account are never recorded.
     pub fn record_hosts_in(&self, inventory: Arc<dyn HostInventory>) {
         let _ = self.inner.inventory.set(inventory);
+    }
+
+    /// Apply these session policies to org computers: allowed hours and the access
+    /// password are enforced here, the rest by the host (refused when it can't).
+    pub fn use_policies(&self, policies: Arc<dyn PolicySource>) {
+        let _ = self.inner.policies.set(policies);
+    }
+
+    /// The session policy for a new session to `host`, or why it is refused. Computers
+    /// without an account, and orgs not in the database, get the authenticator's.
+    async fn session_policy(
+        &self,
+        host: HostIdentity,
+        guest: bool,
+        caps: &[String],
+    ) -> Result<rconn_core::protocol::SessionPolicy, String> {
+        let public = self
+            .inner
+            .public
+            .get()
+            .is_some_and(|p| p.org_id() == host.org_id);
+        let managed = match self.inner.policies.get() {
+            Some(src) if !public => match src.policy(host).await {
+                Ok(p) => p,
+                Err(e) => {
+                    // Fail closed: a policy that can't be read can't be applied.
+                    tracing::error!(error = %format!("{e:#}"), host = %host.host_id, "reading session policy failed");
+                    return Err("couldn't check your organization's policy; try again".into());
+                }
+            },
+            _ => None,
+        };
+        match managed {
+            Some(p) => portal::policies::decide(&p, guest, caps, jiff::Timestamp::now()),
+            None => {
+                let mut p = self.inner.auth.session_policy(host).await;
+                p.guest = guest;
+                Ok(p)
+            }
+        }
     }
 
     /// Report to the inventory, unless the host is one without an account. Never blocks.
@@ -451,6 +505,7 @@ async fn step(
                                 identity,
                                 tx: tx.clone(),
                                 owner,
+                                capabilities: facts.capabilities.clone(),
                             },
                         );
                         match &facts.label {
@@ -902,11 +957,11 @@ async fn request_session(
     host_id: HostId,
     guest: bool,
 ) {
-    let mut reg = state.inner.registry.lock().await;
+    let reg = state.inner.registry.lock().await;
     // A session without the access password only for the host's owner; guests (who must
     // know the password) only for the one computer they typed. Same answer for "offline",
     // "other org" and "not yours", so nobody can probe for computers.
-    let Some((host, host_tx)) = reg
+    let found = reg
         .hosts
         .get(&host_id)
         .filter(|h| {
@@ -916,8 +971,9 @@ async fn request_session(
                 owner_admits(h.owner, op.org_id, op.operator_id)
             }
         })
-        .map(|h| (h.identity, h.tx.clone()))
-    else {
+        .map(|h| (h.identity, h.tx.clone(), h.capabilities.clone()));
+    drop(reg);
+    let Some((host, host_tx, caps)) = found else {
         if !guest {
             state.audit(AuditEvent::SessionRefused {
                 host_id,
@@ -928,17 +984,45 @@ async fn request_session(
         send_err(tx, ErrorCode::NotFound, "host not found or offline".into());
         return;
     };
+    // Read without the registry lock: it may wait on the database.
+    let policy = match state.session_policy(host, guest, &caps).await {
+        Ok(p) => p,
+        Err(reason) => {
+            tracing::info!(%host_id, operator = %op.operator_id, %reason, "session refused by policy");
+            state.audit(AuditEvent::PolicyRefused {
+                org_id: host.org_id,
+                host_id,
+                operator_id: op.operator_id,
+                guest,
+                reason: reason.clone(),
+            });
+            send_err(tx, ErrorCode::Forbidden, reason);
+            return;
+        }
+    };
     let session_id = SessionId::new();
-    reg.sessions.insert(
-        session_id,
-        SessionEntry {
-            host,
-            host_tx: host_tx.clone(),
-            operator: op,
-            operator_tx: tx.clone(),
-        },
-    );
-    drop(reg);
+    {
+        let mut reg = state.inner.registry.lock().await;
+        // The host may have gone (or reconnected) while the policy was read.
+        if !reg
+            .hosts
+            .get(&host_id)
+            .is_some_and(|h| h.tx.same_channel(&host_tx))
+        {
+            drop(reg);
+            send_err(tx, ErrorCode::NotFound, "host not found or offline".into());
+            return;
+        }
+        reg.sessions.insert(
+            session_id,
+            SessionEntry {
+                host,
+                host_tx: host_tx.clone(),
+                operator: op,
+                operator_tx: tx.clone(),
+            },
+        );
+    }
 
     state.audit(AuditEvent::SessionOpened {
         org_id: op.org_id,
@@ -946,8 +1030,6 @@ async fn request_session(
         host_id,
         operator_id: op.operator_id,
     });
-    let mut policy = state.inner.auth.session_policy(host).await;
-    policy.guest = guest;
     let _ = host_tx.send(ServerMessage::IncomingSession {
         session_id,
         operator_id: op.operator_id,

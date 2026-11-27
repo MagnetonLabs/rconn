@@ -108,6 +108,38 @@ pub fn needs_password(policy_guest: bool, owner: LocalOwner, operator: OperatorI
     policy_guest || !owner_admits
 }
 
+/// Who the prompt says is asking, for a signed-in operator of the computer's organization
+/// (the host knows only their id).
+pub const ORG_VIEWER: &str = "Someone from your organization";
+
+/// What has to happen before a session may see and control the computer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checks {
+    /// The viewer takes part: it proves the access password or asks the person here.
+    pub viewer: bool,
+    /// The host asks the person here by itself (a signed-in operator under a policy that
+    /// requires approval; their viewer doesn't speak the guest exchange).
+    pub host_asks: bool,
+    /// The organization's policy requires the person here to accept.
+    pub approval: bool,
+}
+
+impl Checks {
+    /// `password_first`: from [`needs_password`]; `require_approval`: the session policy.
+    pub fn new(password_first: bool, require_approval: bool) -> Self {
+        Self {
+            viewer: password_first,
+            host_asks: require_approval && !password_first,
+            approval: require_approval,
+        }
+    }
+
+    /// Nothing is shown or accepted until a check passes.
+    pub fn gated(&self) -> bool {
+        self.viewer || self.host_asks
+    }
+}
+
 /// How this computer lets guests in (from its settings).
 #[derive(Clone, Default)]
 pub struct Policy {
@@ -326,6 +358,33 @@ mod tests {
             viewer_dtls: "sha-256 aa".into(),
             host_dtls: "sha-256 bb".into(),
         }
+    }
+
+    #[test]
+    fn an_approval_policy_gates_every_session() {
+        // Signed-in operator, no policy: open at once.
+        let c = Checks::new(false, false);
+        assert!(!c.gated());
+        // Signed-in operator, approval required: the host asks by itself.
+        let c = Checks::new(false, true);
+        assert!(c.gated() && c.host_asks && !c.viewer);
+        // Guest, approval required: the viewer asks (no password shortcut).
+        let c = Checks::new(true, true);
+        assert!(c.gated() && c.viewer && !c.host_asks && c.approval);
+        let c = Checks::new(true, false);
+        assert!(c.gated() && c.viewer && !c.host_asks && !c.approval);
+    }
+
+    #[test]
+    fn the_host_asking_for_an_operator_opens_the_gate_only_on_accept() {
+        let gate = Gate::new(Checks::new(false, true).gated());
+        assert!(!gate.is_open());
+        let Ok(ticket) = ask(&gate, Pending::Ask, ORG_VIEWER) else {
+            panic!("not asked")
+        };
+        assert_eq!(ticket.viewer, ORG_VIEWER);
+        decided(&gate, ticket, Answer::Accept);
+        assert!(gate.is_open());
     }
 
     fn policy(verifier: &str, ask_with_password: bool) -> Policy {

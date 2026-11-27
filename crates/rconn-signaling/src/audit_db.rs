@@ -11,7 +11,7 @@
 
 use crate::audit::{AuditEvent, AuditSink};
 use crate::db::Db;
-use rconn_core::ids::{OperatorId, OrgId, SessionId};
+use rconn_core::ids::{HostId, OperatorId, OrgId, SessionId};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
@@ -20,7 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 pub const AUDIT_QUEUE: usize = 8192;
 /// Most events inserted in one transaction.
 pub const AUDIT_BATCH: usize = 256;
-/// Open sessions remembered so `session.end` lands in the same org as `session.start`.
+/// Open sessions remembered so `session.end` lands in the same org as `session.start`
+/// (with its computer and how long it lasted).
 const OPEN_SESSIONS_CAP: usize = 100_000;
 
 enum Msg {
@@ -49,7 +50,7 @@ impl DbAudit {
     pub fn spawn(db: Db) -> Self {
         let (tx, mut rx) = mpsc::channel::<Msg>(AUDIT_QUEUE);
         tokio::spawn(async move {
-            let mut open: HashMap<SessionId, (OrgId, OperatorId)> = HashMap::new();
+            let mut open: HashMap<SessionId, Open> = HashMap::new();
             while let Some(first) = rx.recv().await {
                 let mut batch = vec![first];
                 while batch.len() < AUDIT_BATCH {
@@ -63,7 +64,7 @@ impl DbAudit {
                 for m in batch {
                     match m {
                         Msg::Event(ts, ev) => {
-                            rows.extend(rows_for(&ev, &mut open).into_iter().map(|r| (ts, r)))
+                            rows.extend(rows_for(&ev, ts, &mut open).into_iter().map(|r| (ts, r)))
                         }
                         Msg::Flush(done) => flushes.push(done),
                     }
@@ -110,6 +111,7 @@ impl DbAudit {
             | AuditEvent::GuestConnect { org_id, .. }
             | AuditEvent::HostEnrolled { org_id, .. }
             | AuditEvent::AnonymousEnrolled { org_id, .. }
+            | AuditEvent::PolicyRefused { org_id, .. }
             | AuditEvent::PortalAction { org_id, .. } => *org_id == skip,
             _ => false,
         }
@@ -151,7 +153,15 @@ fn row(org: Option<OrgId>, actor: Option<String>, kind: &str, d: serde_json::Val
 
 /// The rows an event becomes (none for events kept out of the database; one per org for
 /// a person's sign-in).
-fn rows_for(ev: &AuditEvent, open: &mut HashMap<SessionId, (OrgId, OperatorId)>) -> Vec<AuditRow> {
+/// What `session.end` needs from its `session.start`.
+struct Open {
+    org: OrgId,
+    operator: OperatorId,
+    host: HostId,
+    started_ms: i64,
+}
+
+fn rows_for(ev: &AuditEvent, ts: i64, open: &mut HashMap<SessionId, Open>) -> Vec<AuditRow> {
     let d = detail(ev);
     match ev {
         AuditEvent::HostOnline { org_id, .. } => {
@@ -173,10 +183,18 @@ fn rows_for(ev: &AuditEvent, open: &mut HashMap<SessionId, (OrgId, OperatorId)>)
             org_id,
             session_id,
             operator_id,
-            ..
+            host_id,
         } => {
             if open.len() < OPEN_SESSIONS_CAP {
-                open.insert(*session_id, (*org_id, *operator_id));
+                open.insert(
+                    *session_id,
+                    Open {
+                        org: *org_id,
+                        operator: *operator_id,
+                        host: *host_id,
+                        started_ms: ts,
+                    },
+                );
             }
             vec![row(
                 Some(*org_id),
@@ -196,9 +214,19 @@ fn rows_for(ev: &AuditEvent, open: &mut HashMap<SessionId, (OrgId, OperatorId)>)
             d,
         )],
         AuditEvent::SessionEnded { session_id, .. } => {
-            let (org, actor) = match open.remove(session_id) {
-                Some((o, a)) => (Some(o), Some(a.to_string())),
-                None => (None, None),
+            let (org, actor, d) = match open.remove(session_id) {
+                Some(o) => {
+                    let mut d = d;
+                    if let Some(m) = d.as_object_mut() {
+                        m.insert("host_id".into(), o.host.to_string().into());
+                        m.insert(
+                            "duration_s".into(),
+                            ((ts - o.started_ms).max(0) / 1000).into(),
+                        );
+                    }
+                    (Some(o.org), Some(o.operator.to_string()), d)
+                }
+                None => (None, None, d),
             };
             vec![row(org, actor, "session.end", d)]
         }
@@ -220,6 +248,17 @@ fn rows_for(ev: &AuditEvent, open: &mut HashMap<SessionId, (OrgId, OperatorId)>)
                 d,
             )]
         }
+        AuditEvent::PolicyRefused {
+            org_id,
+            operator_id,
+            guest,
+            ..
+        } => vec![row(
+            Some(*org_id),
+            (!*guest).then(|| operator_id.to_string()),
+            "session.refused",
+            d,
+        )],
         AuditEvent::PortalSignIn { user_id, orgs, .. } => {
             per_org(orgs, Some(user_id), "sign_in", d)
         }

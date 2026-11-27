@@ -19,6 +19,14 @@ const RANGES: [string, string, number | null][] = [
 const KIND_LABEL: Record<string, string> = {
   'session.start': 'Session started',
   'session.end': 'Session ended',
+  'session.refused': 'Session refused',
+  'session.guest': 'Guest connecting',
+  'computer.online': 'Computer online',
+  'computer.offline': 'Computer offline',
+  'group.created': 'Group created',
+  'group.renamed': 'Group renamed',
+  'group.deleted': 'Group deleted',
+  'org.renamed': 'Company renamed',
   'file.upload': 'File sent',
   'file.download': 'File received',
   'computer.enrolled': 'Computer enrolled',
@@ -36,7 +44,7 @@ const KIND_LABEL: Record<string, string> = {
 };
 
 function kindClass(k: string) {
-  if (k === 'sign_in.failed' || k === 'computer.revoked' || k === 'person.removed') return 'danger';
+  if (k === 'sign_in.failed' || k === 'session.refused' || k === 'computer.revoked' || k === 'person.removed') return 'danger';
   if (k.startsWith('session.')) return 'ok';
   if (k.startsWith('file.')) return '';
   return 'plain';
@@ -50,6 +58,9 @@ function detailText(e: AuditEvent): string {
   }
   if (typeof d.file === 'string') return `${d.file}${typeof d.bytes === 'number' ? ` (${(d.bytes / 1e6).toFixed(1)} MB)` : ''}`;
   if (typeof d.from === 'string' && typeof d.to === 'string') return `${d.from} → ${d.to}`;
+  if (Array.isArray(d.changed)) {
+    return d.changed.length ? `Changed: ${d.changed.map((f) => String(f).replace(/_/g, ' ')).join(', ')}` : 'No change';
+  }
   if (typeof d.method === 'string') return d.method.replace('_', ' ');
   if (typeof d.role === 'string') return d.role;
   if (typeof d.reason === 'string') return d.reason.replace('_', ' ');
