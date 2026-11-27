@@ -619,7 +619,6 @@ async fn uploads_land_in_the_chosen_folder_and_never_outside_the_root() {
             "Downloads/Rconn/plan (2).txt"
         );
 
-        let outside = tempfile::tempdir().unwrap();
         let before = files_in(root);
         for bad in [
             "..",
@@ -641,6 +640,7 @@ async fn uploads_land_in_the_chosen_folder_and_never_outside_the_root() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
             symlink(outside.path(), root.join("out")).unwrap();
             symlink(root.join("Projects"), root.join("in")).unwrap();
             let err = up(Some("out")).await.unwrap_err();
