@@ -29,7 +29,9 @@ struct SharedFile: Identifiable {
 /// app's Documents (shown in the Files app); uploads into the folder shown. Rust does the
 /// transfer and checks each file's SHA-256 (`Session.download` / `upload`).
 final class FilesModel: ObservableObject {
-    private weak var session: Session?
+    /// The current session (a reconnect replaces it).
+    private let currentSession: () -> Session?
+    private var session: Session? { currentSession() }
     /// The remote folder shown ("" is the computer's shared folder, usually home).
     @Published private(set) var folder = remoteStartFolder()
     @Published private(set) var entries: [RemoteEntry]?
@@ -38,8 +40,8 @@ final class FilesModel: ObservableObject {
     @Published var share: SharedFile?
     private var opened = false
 
-    init(session: Session?) {
-        self.session = session
+    init(session: @escaping () -> Session?) {
+        currentSession = session
     }
 
     var title: String { remoteFolderTitle(folder: folder) }

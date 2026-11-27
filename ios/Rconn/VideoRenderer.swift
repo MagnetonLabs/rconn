@@ -33,7 +33,31 @@ final class VideoRenderer: @unchecked Sendable {
         queue.async { self.render(frame) }
     }
 
+    /// In the background: drop pictures (nothing shows them; saves the decoder's work).
+    private var paused = false
+    /// Back from a pause: nothing to decode against until a keyframe.
+    private var needKeyframe = false
+
+    func pause() {
+        queue.async { self.paused = true }
+    }
+
+    func resume() {
+        queue.async {
+            self.paused = false
+            self.needKeyframe = true
+        }
+    }
+
     private func render(_ f: VideoFrame) {
+        if paused { return }
+        if needKeyframe {
+            guard f.keyframe else {
+                onNeedKeyframe?()
+                return
+            }
+            needKeyframe = false
+        }
         if let s = f.sps, let p = f.pps, s != sps || p != pps {
             format = Self.makeFormat(sps: s, pps: p)
             (sps, pps) = (s, p)

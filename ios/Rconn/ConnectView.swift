@@ -15,6 +15,7 @@ struct ConnectView: View {
     @State private var online: Set<String>?
     @State private var renaming: RecentComputer?
     @State private var newName = ""
+    @State private var showingInputSettings = false
     @FocusState private var focus: Field?
 
     private enum Field { case server, fingerprint, id, password }
@@ -141,6 +142,18 @@ struct ConnectView: View {
                 }
             }
             .navigationTitle("Rconn")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showingInputSettings = true } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel("Input settings")
+                    .accessibilityIdentifier("connectInputSettings")
+                }
+            }
+            .sheet(isPresented: $showingInputSettings) {
+                InputSettingsView()
+            }
             .alert("Rename", isPresented: Binding(
                 get: { renaming != nil }, set: { if !$0 { renaming = nil } }
             )) {

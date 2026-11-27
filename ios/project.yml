@@ -79,6 +79,21 @@ targets:
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         DEAD_CODE_STRIPPING: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+  # Unit tests of the app's logic (pointer input, reconnecting); run inside the app.
+  RconnTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: RconnTests
+    dependencies:
+      - target: Rconn
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.rconn.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Rconn.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Rconn
+        BUNDLE_LOADER: $(TEST_HOST)
   # Drives the app in the simulator against the test_host example (keys, sound, files) and
   # saves screenshots. Not part of the app.
   RconnUITests:
@@ -98,12 +113,14 @@ schemes:
     build:
       targets:
         Rconn: all
+        RconnTests: [test]
         RconnUITests: [test]
     run:
       config: Debug
     test:
       config: Debug
       targets:
+        - RconnTests
         - RconnUITests
     archive:
       config: Release

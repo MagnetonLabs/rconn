@@ -46,7 +46,9 @@ enum HID {
 /// Sends keys to the session, with modifiers latched from the modifier bar (the next key
 /// is sent with them held, then they release).
 final class KeySender {
-    weak var session: Session?
+    /// The current session (a reconnect replaces it).
+    var currentSession: () -> Session? = { nil }
+    private var session: Session? { currentSession() }
     private(set) var latched: Set<UInt16> = []
     var onLatchChange: (() -> Void)?
 
