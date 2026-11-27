@@ -18,9 +18,9 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_MOVE_RECT, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource,
+    CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_INVALID_CALL, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1,
+    IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::Interface;
 
@@ -69,6 +69,8 @@ pub struct DxgiCapturer {
     started: Instant,
     /// DXGI "access lost" count (logged sparingly).
     access_lost: u32,
+    /// DXGI_ERROR_INVALID_CALL answers since the last frame acquired (see `hold`).
+    invalid_calls: u32,
     /// Frames kept on the GPU (see [`gpu`]), when enabled.
     gpu: Option<gpu::GpuState>,
     /// Move rectangles DXGI reported since the last `take_moves` (picture coordinates).
@@ -81,6 +83,9 @@ mod gpu;
 
 /// With no first image from DXGI after this long, grab one through GDI instead.
 const FIRST_FRAME_FALLBACK: Duration = Duration::from_millis(500);
+/// DXGI_ERROR_INVALID_CALL answers in a row (no frame between) the duplication is made
+/// again for; then the error ends the capture, which starts over on a new device.
+const INVALID_CALLS: u32 = 3;
 
 // The COM objects are only used from the thread that owns the capturer at a time.
 unsafe impl Send for DxgiCapturer {}
@@ -128,6 +133,7 @@ impl DxgiCapturer {
                     want_full: true,
                     started: Instant::now(),
                     access_lost: 0,
+                    invalid_calls: 0,
                     gpu: None,
                     moves: Vec::new(),
                 });
@@ -303,7 +309,11 @@ impl DxgiCapturer {
         let dup = self.duplication()?.clone();
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        match unsafe { dup.AcquireNextFrame(ms, &mut info, &mut resource) } {
+        let acquired = unsafe { dup.AcquireNextFrame(ms, &mut info, &mut resource) };
+        if acquired.is_ok() {
+            self.invalid_calls = 0;
+        }
+        match acquired {
             Ok(()) => Ok(Some(Held {
                 dup,
                 info,
@@ -322,6 +332,19 @@ impl DxgiCapturer {
                 }
                 self.dup = None;
                 std::thread::sleep(Duration::from_millis(50));
+                Ok(None)
+            }
+            Err(e) if e.code() == DXGI_ERROR_INVALID_CALL && self.invalid_calls < INVALID_CALLS => {
+                // The duplication is in a state DXGI won't serve (as if a frame were still
+                // held). A new one on the same device works: made here, the stream carries
+                // on (a Windows VM got this 3 times in a session's first 12 s, and each
+                // ended the capture: capture and encoder rebuilt, a keyframe sent).
+                self.invalid_calls += 1;
+                tracing::info!(
+                    times = self.invalid_calls,
+                    "desktop duplication refused a call; making it again"
+                );
+                self.dup = None;
                 Ok(None)
             }
             Err(e) => Err(backend(e)),
@@ -573,5 +596,50 @@ impl Capturer for DxgiCapturer {
             return Ok(Some(frame));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAX: (usize, usize) = (8192, 8192);
+
+    /// The first picture of a (new) duplication: the whole desktop, at once.
+    fn first_picture(cap: &mut DxgiCapturer, pic: &mut Option<I420>) {
+        let t0 = Instant::now();
+        while cap
+            .next_into(Duration::from_millis(100), pic, MAX)
+            .expect("capture")
+            .is_none()
+        {
+            assert!(t0.elapsed() < Duration::from_secs(5), "no first picture");
+        }
+    }
+
+    /// DXGI answers `AcquireNextFrame` with DXGI_ERROR_INVALID_CALL (here: a frame
+    /// acquired and never released, its documented cause). The duplication is made
+    /// again in place: no error for the stream (which would rebuild capture and the
+    /// encoder and send a keyframe), and the new duplication's whole picture follows.
+    #[test]
+    fn an_invalid_call_makes_the_duplication_again() {
+        let Ok(mut cap) = DxgiCapturer::new(0) else {
+            return; // no display here
+        };
+        if cap.duplication().is_err() {
+            return; // no interactive desktop (a service session)
+        }
+        let mut pic = None;
+        first_picture(&mut cap, &mut pic);
+        // A fresh duplication gives its first frame at once: acquired, never released.
+        cap.dup = None;
+        let dup = cap.duplication().expect("duplicate").clone();
+        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut resource = None;
+        unsafe { dup.AcquireNextFrame(500, &mut info, &mut resource) }.expect("first frame");
+        drop((dup, resource)); // the capturer's is the last reference
+        let r = cap.next_into(Duration::from_millis(50), &mut pic, MAX);
+        assert!(matches!(r, Ok(None)), "{r:?}");
+        first_picture(&mut cap, &mut pic);
     }
 }
