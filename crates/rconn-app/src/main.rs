@@ -19,6 +19,12 @@ struct App {
 }
 
 impl eframe::App for App {
+    /// Clear to the theme's panel colour (light or dark, following the system): eframe's
+    /// default is near-black, which shows through the unfilled panels in light mode.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn on_exit(&mut self) {
         if !self.closed_by_window {
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]

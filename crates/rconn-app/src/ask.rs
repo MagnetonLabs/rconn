@@ -112,6 +112,12 @@ pub fn draw(ui: &mut egui::Ui, a: &mut Ask, now: Instant) {
 struct Window(Ask);
 
 impl eframe::App for Window {
+    /// Clear to the theme's panel colour (light or dark, following the system): eframe's
+    /// default is near-black, which shows through the unfilled panels in light mode.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if ui.input(|i| i.viewport().close_requested()) && self.0.answer.is_none() {
             self.0.answer = Some(Answer::Decline);

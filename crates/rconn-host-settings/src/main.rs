@@ -7,6 +7,12 @@ use rconn_host_settings::{platform, ui};
 struct App(Model);
 
 impl eframe::App for App {
+    /// Clear to the theme's panel colour (light or dark, following the system): eframe's
+    /// default is near-black, which shows through the unfilled panels in light mode.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let actions = ui::draw(ui, &mut self.0);
