@@ -17,7 +17,10 @@ export default function Account() {
   const [adding, setAdding] = useState(false);
   const [pkErr, setPkErr] = useState<string | null>(null);
   const [removing, setRemoving] = useState<Passkey | null>(null);
-  const supported = passkeysSupported();
+  // The server must offer passkeys too: it turns them off without an https portal URL, and
+  // http://localhost is a secure context for the browser all the same.
+  const options = useResource(() => auth.getOptions(), []);
+  const supported = passkeysSupported() && options.data?.passkey === true;
 
   useEffect(() => {
     if (me) setName(me.user.name);
@@ -131,7 +134,7 @@ export default function Account() {
             )}
             {keys.data?.length === 0 && <Empty title="No passkeys yet" />}
           </div>
-          {supported ? (
+          {options.loading && !options.data ? null : supported ? (
             <form className="toolbar" onSubmit={addKey}>
               <label className="visually-hidden" htmlFor="pk-name">
                 Passkey name

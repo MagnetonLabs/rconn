@@ -34,7 +34,7 @@ export interface Passkey {
   last_used: string | null;
 }
 
-export const getOptions = (email: string) => api<AuthOptions>('GET', '/auth/options', undefined, { email });
+export const getOptions = (email?: string) => api<AuthOptions>('GET', '/auth/options', undefined, { email });
 export const signInPassword = (email: string, password: string) =>
   api<Me>('POST', '/auth/password', { email, password });
 export const requestMagicLink = (email: string) => api<void>('POST', '/auth/magic-link', { email });
