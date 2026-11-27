@@ -153,6 +153,20 @@ fn openh264_slices(w: usize, h: usize) -> u32 {
     std::thread::available_parallelism().map_or(1, |n| n.get().min(4) as u32)
 }
 
+/// An engine kept for switching back to its size: the size, the engine, its stream
+/// headers and its name.
+type Spare = ((usize, usize), Engine, Vec<u8>, String);
+
+/// The finest quantizer of openh264 engines for halved moving pictures
+/// ([`VideoEncoder::set_motion_input`]): `RCONN_MOTION_MIN_QP`, default 30.
+fn motion_min_qp() -> u8 {
+    std::env::var("RCONN_MOTION_MIN_QP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+        .clamp(10, 48)
+}
+
 /// Frames between long-term reference marks on Media Foundation (~1 s at 30 fps; openh264
 /// marks every 30 frames on its own).
 #[cfg(windows)]
@@ -184,7 +198,7 @@ pub struct VideoEncoder {
     /// The stream headers (SPS/PPS) of the current encoder.
     headers: Vec<u8>,
     /// The encoder for the previously used size (and its headers), kept for switching back.
-    spare: Option<((usize, usize), Engine, Vec<u8>)>,
+    spare: Option<Spare>,
     /// Fraction of the captured size to encode (1.0 = full); lowered when the CPU is busy.
     scale: f32,
     last_was_key: bool,
@@ -367,8 +381,8 @@ impl VideoEncoder {
         // took 70-110 ms (7 fps): the screen at the viewer's size, at 30 fps. What made it
         // unusable before is handled: a keyframe every 30 frames (its GOP default), the
         // bitrate blown on keyframes (quantizer ceiling 32; see
-        // `crate::mf::SOFTWARE_MAX_QP`). Its motion search fails on wide pictures and on
-        // scrolled text (see [`Self::width_limit`]): large moving areas go to openh264.
+        // `crate::mf::SOFTWARE_MAX_QP`). Large changes it codes as new pictures (dense
+        // text scrolling) go to openh264 at half size (`set_motion_input`).
         #[cfg(windows)]
         if !self.software_only
             && ((self.mf_software && !self.motion_input)
@@ -478,7 +492,15 @@ impl VideoEncoder {
             // still: they only stand in until the screen is still, and the rate
             // controller skipped most of them at 38.
             .qp(openh264::encoder::QpRange::new(
-                10,
+                // Moving pictures never finer than this: after a still spell the rate
+                // controller sits at a fine quantizer, and the first scrolled pictures
+                // came out at 770-970 KB at 1496x938 (8 Mbps), after which it skipped
+                // pictures for up to 3 s to pay them back.
+                if self.motion_input {
+                    motion_min_qp()
+                } else {
+                    10
+                },
                 if self.motion_input {
                     48
                 } else if self.scaled_input && !ltr {
@@ -610,9 +632,8 @@ impl VideoEncoder {
 
     /// The widest picture this engine (or the one the next frame builds) encodes well
     /// (`None`: no limit): Microsoft's software encoder [`crate::mf::SOFTWARE_MAX_WIDTH`].
-    /// It also codes large moving areas as new pictures at any width once they move more
-    /// than a few pixels a frame (575-886 KB a scrolled 2688x1686 picture at 8 Mbps):
-    /// see [`Self::set_motion_input`].
+    /// It codes some large changes (dense text scrolling, redrawn areas) as new pictures
+    /// at any width: see [`Self::set_motion_input`].
     pub fn width_limit(&self) -> Option<usize> {
         #[cfg(windows)]
         {
@@ -629,7 +650,7 @@ impl VideoEncoder {
                 }
             };
             if software_mf {
-                return Some(crate::mf::SOFTWARE_MAX_WIDTH);
+                return Some(crate::mf::software_max_width());
             }
         }
         None
@@ -1097,15 +1118,19 @@ impl VideoEncoder {
             // encoder kept for the other size; its next frame must be a keyframe.
             let previous = self.encoder.take().zip(self.dims);
             let old_headers = std::mem::take(&mut self.headers);
+            let old_name = std::mem::take(&mut self.engine_name);
             let engine = match self.spare.take() {
-                Some((dims, engine, headers)) if dims == (w, h) => {
+                Some((dims, engine, headers, name)) if dims == (w, h) => {
                     self.force_key = true;
                     self.headers = headers;
+                    // (The kept engine's own name: a stale one made the host treat
+                    // Microsoft's encoder as openh264 after the first switch.)
+                    self.engine_name = name;
                     engine
                 }
                 _ => self.build(w, h)?,
             };
-            self.spare = previous.map(|(e, d)| (d, e, old_headers));
+            self.spare = previous.map(|(e, d)| (d, e, old_headers, old_name));
             self.encoder = Some(engine);
             self.dims = Some((w, h));
             // A new or switched-to encoder's first picture is a keyframe of its own.

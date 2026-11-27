@@ -85,13 +85,22 @@ pub const MAX_QP: u8 = 32;
 /// refinement passes), so a still screen is sharpened by re-encoding it (the host's
 /// top-off), each picture finer within the bitrate.
 pub const SOFTWARE_MAX_QP: u8 = 44;
-/// The widest picture given to Microsoft's software encoder: its motion search gives up
-/// on wider ones (a desktop scrolling 7 px a frame: 16 KB a picture at 2688x1686, QP <= 44
-/// and 8 Mbps; 553 KB at 2704x1696, 1.2 MB at 2992x1878, every picture coded as new;
-/// quality settings, worker threads, slices and levels made no difference). Fewer
-/// pixels also make its keyframes smaller: the host loop on a 2992x1878 screen kept a
-/// video at 18.6 fps capped, 10.3 uncapped (Windows 11 ARM VM, `stream::host_loop`).
+/// The widest picture given to Microsoft's software encoder (`RCONN_MF_MAX_WIDTH`
+/// overrides it). Wider pictures make larger keyframes (a 2992x1878 text screen: 218 KB
+/// against 174 KB at 2688 px). What it fails on, dense text scrolling (0.5 MB a picture
+/// at 2688 px, 1.2 MB at 2992 px, 17-18 dB either way; Windows 11 ARM VM,
+/// `encode_bench::probe_widths`), fails at any width: those pictures go to openh264 at
+/// half size (`stream::MF_OVERSIZE`).
 pub const SOFTWARE_MAX_WIDTH: usize = 2688;
+
+/// [`SOFTWARE_MAX_WIDTH`], or `RCONN_MF_MAX_WIDTH` (comparisons).
+pub fn software_max_width() -> usize {
+    std::env::var("RCONN_MF_MAX_WIDTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&w: &usize| w >= 64)
+        .unwrap_or(SOFTWARE_MAX_WIDTH)
+}
 /// Frames between keyframes asked of Microsoft's software encoder: "0" (its default) put
 /// one in every 30 frames (2.28 MB each at 2992x1878); keyframes come on request.
 const SOFTWARE_GOP: u32 = 100_000;
@@ -376,6 +385,9 @@ impl MfH264Encoder {
                         &VARIANT::from(u32::from(max_qp_for(hardware))),
                     );
                 }
+            }
+            if let Some(codec) = &codec {
+                experimental_settings(codec);
             }
             // Long-term references for repairing losses without a keyframe (Windows 8.1+;
             // optional for vendors' encoders, so asked for and checked, never assumed).
@@ -682,6 +694,52 @@ impl MfH264Encoder {
                 Err(e) => Err(err(e)),
             }
         }
+    }
+}
+
+/// `RCONN_MF_SET=Name:value+Name:value`: encoder settings to try (benches), from a short
+/// list of the codec API's; each attempt is logged with its result.
+fn experimental_settings(codec: &ICodecAPI) {
+    use windows::Win32::Media::MediaFoundation as m;
+    let Ok(list) = std::env::var("RCONN_MF_SET") else {
+        return;
+    };
+    for item in list.split('+').filter(|s| !s.is_empty()) {
+        let Some((name, value)) = item.split_once(':') else {
+            continue;
+        };
+        let Ok(value) = value.parse::<u32>() else {
+            continue;
+        };
+        let api = match name {
+            "MinQP" => m::CODECAPI_AVEncVideoMinQP,
+            "MaxQP" => CODECAPI_AVEncVideoMaxQP,
+            "Quality" => m::CODECAPI_AVEncCommonQuality,
+            "QualityVsSpeed" => CODECAPI_AVEncCommonQualityVsSpeed,
+            "RateControl" => CODECAPI_AVEncCommonRateControlMode,
+            "Threads" => m::CODECAPI_AVEncNumWorkerThreads,
+            "SliceMode" => m::CODECAPI_AVEncSliceControlMode,
+            "SliceSize" => m::CODECAPI_AVEncSliceControlSize,
+            "RefFrames" => m::CODECAPI_AVEncVideoMaxNumRefFrame,
+            "ContentType" => m::CODECAPI_AVEncVideoContentType,
+            "Level" => m::CODECAPI_AVEncMPVLevel,
+            "Cabac" => m::CODECAPI_AVEncH264CABACEnable,
+            "LowLatency" => CODECAPI_AVLowLatencyMode,
+            "MotionTradeoff" => m::CODECAPI_AVEncVideoCBRMotionTradeoff,
+            "IntraRefresh" => m::CODECAPI_AVEncVideoGradualIntraRefresh,
+            _ => {
+                tracing::warn!(name, "RCONN_MF_SET: unknown setting");
+                continue;
+            }
+        };
+        let v = if name == "LowLatency" || name == "Cabac" {
+            VARIANT::from(value != 0)
+        } else {
+            VARIANT::from(value)
+        };
+        let supported = unsafe { codec.IsSupported(&api) }.is_ok();
+        let set = unsafe { codec.SetValue(&api, &v) };
+        tracing::info!(name, value, supported, ok = set.is_ok(), "RCONN_MF_SET");
     }
 }
 

@@ -2,7 +2,7 @@
 //! picks, with a window of ours in front of everything playing a benchmark scenario
 //! ([`crate::encode_bench::Desktop`]) at `RCONN_LIVE_HZ` (60) for `RCONN_BENCH_SECS` (8).
 //!
-//! `RCONN_LIVE_SCENARIO` = idle | typing | scrolling (default) | video; the viewer shows
+//! `RCONN_LIVE_SCENARIO` = idle | typing | scrolling (default) | video | mix (`RCONN_LIVE_KBPS`: the link, default 25000); the viewer shows
 //! the picture `RCONN_BENCH_VIEW` large (default: the screen's size); input is reported
 //! every 100 ms (someone interacting) unless `RCONN_LIVE_INPUT=0`. `RCONN_LIVE_SIZE=WxH`:
 //! the window covers only that much (top left; a browser scrolling under its toolbars),
@@ -161,6 +161,7 @@ fn live_loop() {
         Some("idle") => Scenario::Idle,
         Some("typing") => Scenario::Typing,
         Some("video") => Scenario::Video,
+        Some("mix") => Scenario::Mix,
         _ => Scenario::Scrolling,
     };
     let hz: u32 = env("RCONN_LIVE_HZ")
@@ -170,6 +171,10 @@ fn live_loop() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
     let input = env("RCONN_LIVE_INPUT").as_deref() != Some("0");
+    // `RCONN_LIVE_KBPS`: the link's bitrate (default 25000).
+    let bps = env("RCONN_LIVE_KBPS")
+        .and_then(|v| v.parse::<u32>().ok())
+        .map_or(25_000_000, |k| k * 1000);
     let size_knob = |k: &str| {
         env(k).and_then(|v| {
             let (w, h) = v.split_once('x')?;
@@ -203,13 +208,13 @@ fn live_loop() {
         cfg: StreamConfig {
             openh264: lib,
             max_fps: 30,
-            max_bitrate_bps: 25_000_000,
+            max_bitrate_bps: bps,
             max_size: (3840, 2400),
             motion_half_res: false,
             software: false,
             codec: rconn_media::caps::VideoCodec::H264,
         },
-        target: TargetBitrate::fixed(25_000_000.0),
+        target: TargetBitrate::fixed(f64::from(bps)),
         want_key: Arc::default(),
         feedback: keyframes.feedback.clone(),
         stop: Arc::default(),

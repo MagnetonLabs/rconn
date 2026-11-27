@@ -35,7 +35,18 @@ pub enum Scenario {
     Typing,
     Scrolling,
     Video,
+    /// Live bench only (`stream_live.rs`, at 60 Hz): a working session in 10 s rounds,
+    /// pauses of at most 1.5 s: a scroll (2.5 s), still, drawing (3 s: a stroke growing
+    /// every frame, the canvas redrawn every 0.5 s, 60 % of the screen), still, typing.
+    #[cfg_attr(not(all(test, windows)), allow(dead_code))]
+    Mix,
 }
+
+/// [`Scenario::Mix`]: frames per round, and where each part starts.
+const MIX_ROUND: usize = 600;
+const MIX_SCROLL_END: usize = 150;
+const MIX_DRAW: (usize, usize) = (240, 420);
+const MIX_TYPE: usize = 510;
 
 impl Scenario {
     pub const ALL: [Scenario; 4] = [
@@ -51,6 +62,7 @@ impl Scenario {
             Scenario::Typing => "typing",
             Scenario::Scrolling => "scrolling",
             Scenario::Video => "video",
+            Scenario::Mix => "mix",
         }
     }
 }
@@ -71,6 +83,31 @@ fn page_pixel(x: usize, y: usize) -> [u8; 4] {
     [c, c, c.saturating_sub((line % 3) as u8 * 20), 255]
 }
 
+/// A pixel of a lighter page, for [`Scenario::Mix`] (`RCONN_LIVE_PAGE=dense`: the one
+/// above): 24 px lines of ragged length, words, letters of a few strokes; closer to a
+/// real document than [`page_pixel`], whose every 9x18 cell is inked (a 2688x1686
+/// keyframe of it from Microsoft's encoder: 1.67 MB; of a real desktop: 113 KB).
+fn light_pixel(x: usize, y: usize) -> [u8; 4] {
+    if y < TITLE || x < 240 {
+        return page_pixel(x, y);
+    }
+    let (line, col) = (y / 24, (x - 240) / 9);
+    let (cx, cy) = ((x - 240) % 9, y % 24);
+    let len = 30 + (line * 37) % 90;
+    let in_word = col < len && (col * 7 + line * 13) % 6 != 0 && line % 7 != 6;
+    let stroke = match (col + line) % 3 {
+        0 => cx == 1 || cx == 5 || cy == 13,
+        1 => cx == 1 || cy == 8 || cy == 17,
+        _ => cx == 3 || (cy == 8 && cx < 6),
+    };
+    let c = if in_word && (8..18).contains(&cy) && cx < 7 && stroke {
+        40
+    } else {
+        250
+    };
+    [c, c, c, 255]
+}
+
 /// Produces the scenario's frames: the current BGRA desktop and what changed.
 pub(crate) struct Desktop {
     scenario: Scenario,
@@ -84,15 +121,18 @@ pub(crate) struct Desktop {
 
 impl Desktop {
     pub(crate) fn new(scenario: Scenario, (w, h): (usize, usize), frames: usize) -> Self {
-        let rows = h + if scenario == Scenario::Scrolling {
-            frames * SCROLL_STEP
-        } else {
-            0
+        let rows = h + match scenario {
+            Scenario::Scrolling => frames * SCROLL_STEP,
+            Scenario::Mix => MIX_SCROLL_END * SCROLL_STEP,
+            _ => 0,
         };
+        let light =
+            scenario == Scenario::Mix && std::env::var("RCONN_LIVE_PAGE").as_deref() != Ok("dense");
+        let pixel = if light { light_pixel } else { page_pixel };
         let mut page = vec![0u8; w * rows * 4];
         for (y, row) in page.chunks_exact_mut(w * 4).enumerate() {
             for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                *px = page_pixel(x, y);
+                *px = pixel(x, y);
             }
         }
         let screen = page[..w * h * 4].to_vec();
@@ -180,6 +220,77 @@ impl Desktop {
                     w,
                     h: h - TITLE,
                 }]
+            }
+            Scenario::Mix => {
+                let p = (k - 1) % MIX_ROUND;
+                let round = (k - 1) / MIX_ROUND;
+                let (w, h) = (self.w, self.h);
+                if p < MIX_SCROLL_END {
+                    let off = (p + 1) * SCROLL_STEP;
+                    let src = &self.page[(TITLE + off) * w * 4..(h + off) * w * 4];
+                    self.screen[TITLE * w * 4..].copy_from_slice(src);
+                    return vec![Rect {
+                        x: 0,
+                        y: TITLE,
+                        w,
+                        h: h - TITLE,
+                    }];
+                }
+                if (MIX_DRAW.0..MIX_DRAW.1).contains(&p) {
+                    let i = p - MIX_DRAW.0;
+                    // The canvas: line art around a centre that moves each redraw.
+                    let canvas = Rect {
+                        x: (w / 10) & !1,
+                        y: (h / 8) & !1,
+                        w: (w * 8 / 10) & !1,
+                        h: (h * 3 / 4) & !1,
+                    };
+                    let mut out = Vec::new();
+                    if i.is_multiple_of(30) {
+                        let (cx, cy) = (
+                            (canvas.x + (i * 37 + round * 101) % canvas.w) as i64,
+                            (canvas.y + (i * 23 + round * 53) % canvas.h) as i64,
+                        );
+                        self.fill(canvas, |x, y| {
+                            let d = (x as i64 - cx).pow(2) + (y as i64 - cy).pow(2);
+                            let c = if (d / 900) % 9 == 0 { 40 } else { 245 };
+                            [c, c, 250, 255]
+                        });
+                        out.push(canvas);
+                    }
+                    // The stroke: a 16 px pen moving 10 px a frame along a wave.
+                    let x = canvas.x + 20 + (i * 10) % (canvas.w - 60);
+                    let y = canvas.y
+                        + canvas.h / 2
+                        + ((i as f32 / 9.0).sin() * (canvas.h as f32 / 3.0)) as usize;
+                    let pen = Rect {
+                        x: x & !1,
+                        y: y & !1,
+                        w: 16,
+                        h: 16,
+                    };
+                    self.fill(pen, |_, _| [30, 30, 200, 255]);
+                    out.push(pen);
+                    return out;
+                }
+                if p >= MIX_TYPE {
+                    let cell = Rect {
+                        x: 240 + 9 * (10 + p % 150),
+                        y: 18 * 20,
+                        w: 9,
+                        h: 18,
+                    };
+                    self.fill(cell, |x, y| {
+                        let g = ((x * 5 + y * 3 + k) % 7) < 3 && (y % 18) > 3 && (y % 18) < 15;
+                        if g {
+                            [20, 20, 20, 255]
+                        } else {
+                            [250, 250, 250, 255]
+                        }
+                    });
+                    return vec![cell];
+                }
+                Vec::new()
             }
             Scenario::Video => {
                 let area = self.video_area();
@@ -864,7 +975,7 @@ pub fn quality_report(frames: usize, openh264: &Path) -> Result<String> {
                 size: crate::stream::fit_width(
                     size,
                     at_view,
-                    Some(rconn_media::mf::SOFTWARE_MAX_WIDTH),
+                    Some(rconn_media::mf::software_max_width()),
                 ),
             },
         ));
@@ -1027,6 +1138,215 @@ mod tests {
             line += &format!(", top-off {k}: {p:.1}");
         }
         println!("{line}");
+    }
+
+    /// Luma PSNR (dB) of `got` (`gw` x `gh`, upscaled bilinearly when smaller) against
+    /// `want` (`w` x `h`): how close the viewer's picture is to the screen's own pixels.
+    fn psnr_native(
+        want: &[u8],
+        (w, h): (usize, usize),
+        got: &[u8],
+        (gw, gh): (usize, usize),
+    ) -> f64 {
+        let mut se = 0.0f64;
+        for y in 0..h {
+            let fy = (y as f64 + 0.5) * gh as f64 / h as f64 - 0.5;
+            let y0 = (fy.floor().max(0.0) as usize).min(gh - 1);
+            let y1 = (y0 + 1).min(gh - 1);
+            let ty = (fy - y0 as f64).clamp(0.0, 1.0);
+            for x in 0..w {
+                let fx = (x as f64 + 0.5) * gw as f64 / w as f64 - 0.5;
+                let x0 = (fx.floor().max(0.0) as usize).min(gw - 1);
+                let x1 = (x0 + 1).min(gw - 1);
+                let tx = (fx - x0 as f64).clamp(0.0, 1.0);
+                let p = |x: usize, y: usize| f64::from(got[y * gw + x]);
+                let v = (p(x0, y0) * (1.0 - tx) + p(x1, y0) * tx) * (1.0 - ty)
+                    + (p(x0, y1) * (1.0 - tx) + p(x1, y1) * tx) * ty;
+                se += (f64::from(want[y * w + x]) - v).powi(2);
+            }
+        }
+        10.0 * (255.0f64 * 255.0 / (se / (w * h) as f64).max(1e-9)).log10()
+    }
+
+    /// How the host's encoder (Microsoft's software one on a Windows host without a GPU
+    /// encoder) does at each width (`RCONN_PROBE_WIDTHS`, default 2688,2704,2992) of a
+    /// 2992x1878 text screen (`RCONN_LIVE_PAGE=light`: the lighter page), 8 Mbps
+    /// (`RCONN_BENCH_KBPS`): its first keyframe, a still picture re-encoded 30 times, a
+    /// keyframe asked for then (a switch back after motion), a 60-frame scroll (7 px a
+    /// frame), and the still picture after: bytes, encode time, keyframes, and luma
+    /// PSNR against the encoded picture and against the screen's own pixels.
+    /// `encode-tests.exe probe_widths --ignored --nocapture`
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn probe_widths() {
+        let Some(lib) = rconn_media::cisco::local_binary_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let (sw, sh) = size_knob("RCONN_BENCH_SIZE", (2992, 1878)).unwrap();
+        let widths: Vec<usize> = std::env::var("RCONN_PROBE_WIDTHS")
+            .unwrap_or_else(|_| "2688,2704,2992".into())
+            .split(',')
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        let scroll = 60;
+        println!(
+            "screen {sw}x{sh}, {} kbps; per phase: KB (mean/max), ms/frame, keys, PSNR dB vs encoded (min/last), vs screen (last)",
+            settings().bitrate_bps / 1000
+        );
+        for w in widths {
+            let h = ((w * sh + sw / 2) / sw) & !1;
+            let mut desk = Desktop::new(Scenario::Scrolling, (sw, sh), scroll + 4);
+            if std::env::var("RCONN_LIVE_PAGE").as_deref() == Ok("light") {
+                for (y, row) in desk.page.chunks_exact_mut(sw * 4).enumerate() {
+                    for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                        *px = light_pixel(x, y);
+                    }
+                }
+                let n = desk.screen.len();
+                desk.screen.copy_from_slice(&desk.page[..n]);
+            }
+            let mut screen = I420::new(sw, sh);
+            screen.fill_from_bgra(&desk.screen, sw);
+            let scaler = (w != sw).then(|| Scaler::new((sw, sh), (w, h)));
+            let mut scaled = None;
+            let mut enc = VideoEncoder::new(&lib, settings()).unwrap();
+            let mut dec = rconn_media::video::VideoDecoder::software(&lib).unwrap();
+            let mut last: Option<rconn_media::video::DecodedFrame> = None;
+            let mut first_engine = String::new();
+            // One phase: `n` frames (`step` changes the screen before each); its line.
+            let mut phase =
+                |name: &str,
+                 n: usize,
+                 desk: &mut Desktop,
+                 screen: &mut I420,
+                 enc: &mut VideoEncoder,
+                 key: bool,
+                 step: &mut dyn FnMut(&mut Desktop) -> Vec<Rect>| {
+                    let (mut bytes, mut max, mut keys, mut ms) = (0usize, 0usize, 0, 0.0);
+                    let mut min_psnr = f64::MAX;
+                    let mut last_psnr = 0.0;
+                    let mut coded = 0;
+                    for i in 0..n {
+                        let t = Instant::now();
+                        let rects = step(desk);
+                        if !rects.is_empty() {
+                            screen.fill_rects_from_bgra(&desk.screen, sw * 4, &rects);
+                        }
+                        let pic = match &scaler {
+                            Some(s) => {
+                                s.scale(screen, &mut scaled, None);
+                                scaled.as_ref().unwrap()
+                            }
+                            None => &*screen,
+                        };
+                        if key && i == 0 {
+                            enc.request_keyframe();
+                        }
+                        let t0 = Instant::now();
+                        let au = enc.encode_yuv(pic, None).unwrap();
+                        ms += t0.elapsed().as_secs_f64() * 1e3;
+                        if first_engine.is_empty() {
+                            first_engine = enc.engine_name().to_owned();
+                        }
+                        if let Some(au) = au {
+                            coded += 1;
+                            bytes += au.len();
+                            max = max.max(au.len());
+                            keys += usize::from(enc.last_frame().key);
+                            if let Some(f) = dec.decode(&au).unwrap() {
+                                last = Some(f);
+                            }
+                        }
+                        if let Some(f) = &last
+                            && f.y().len() == pic.luma().len()
+                        {
+                            let p = psnr_native(
+                                pic.luma(),
+                                pic.dimensions(),
+                                f.y(),
+                                (f.width, f.height),
+                            );
+                            min_psnr = min_psnr.min(p);
+                            last_psnr = p;
+                        }
+                        std::thread::sleep(
+                            (Duration::from_secs(1) / 30).saturating_sub(t.elapsed()),
+                        );
+                    }
+                    let native = last.as_ref().map_or(0.0, |f| {
+                        psnr_native(screen.luma(), (sw, sh), f.y(), (f.width, f.height))
+                    });
+                    println!(
+                        "{w}x{h} {name:<10} {:>7.1}/{:>7.1} KB {:>5.1} ms {keys} keys {:>5.1}/{:>5.1} dB, native {native:>5.1} dB ({coded}/{n} coded)",
+                        bytes as f64 / 1024.0 / coded.max(1) as f64,
+                        max as f64 / 1024.0,
+                        ms / n as f64,
+                        if min_psnr == f64::MAX { 0.0 } else { min_psnr },
+                        last_psnr,
+                    );
+                };
+            let mut still = |_: &mut Desktop| Vec::new();
+            phase(
+                "first",
+                1,
+                &mut desk,
+                &mut screen,
+                &mut enc,
+                false,
+                &mut still,
+            );
+            phase(
+                "still x30",
+                30,
+                &mut desk,
+                &mut screen,
+                &mut enc,
+                false,
+                &mut still,
+            );
+            phase(
+                "key again",
+                1,
+                &mut desk,
+                &mut screen,
+                &mut enc,
+                true,
+                &mut still,
+            );
+            phase(
+                "still x10",
+                10,
+                &mut desk,
+                &mut screen,
+                &mut enc,
+                false,
+                &mut still,
+            );
+            let mut k = 0;
+            let mut scrolling = |d: &mut Desktop| {
+                k += 1;
+                d.step(k)
+            };
+            phase(
+                "scroll x60",
+                scroll,
+                &mut desk,
+                &mut screen,
+                &mut enc,
+                false,
+                &mut scrolling,
+            );
+            phase(
+                "still x30",
+                30,
+                &mut desk,
+                &mut screen,
+                &mut enc,
+                false,
+                &mut still,
+            );
+            println!("{w}x{h} engine: {first_engine}");
+        }
     }
 
     /// Size policies compared: speed, bytes, and how sharp the viewer's picture is while

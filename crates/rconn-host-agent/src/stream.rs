@@ -104,6 +104,55 @@ const MOTION_CHANGE: f32 = 0.25;
 const MOTION_FRAMES: u32 = 6;
 /// ...which ends after this long without such a frame.
 const MOTION_SETTLE: Duration = Duration::from_millis(1000);
+/// Microsoft's software encoder scrolls a plain page well (11-28 KB a picture at 8
+/// Mbps), but codes dense or redrawn content as new pictures (0.5-1.2 MB a scrolled
+/// picture of dense text, 2.8 MB a redrawn canvas of line art: seconds on an 8 Mbps
+/// link). A picture of a large change from it this many times
+/// its share of the bitrate (a quarter of a second on the link; a page switching came
+/// out at 4-5 times) is not sent: the same change goes out at once at half size from
+/// openh264 (`VideoEncoder::set_motion_input`; a keyframe, which the viewer takes after
+/// the skipped frame id), and large changes stay there until still.
+const MF_OVERSIZE: usize = 8;
+/// Back to Microsoft's encoder at full size after this long without a large change, and
+/// only once the link is free (each switch is a keyframe: a live session that switched
+/// back after 1 s made 35 size keyframes in 2 minutes of drawing, the full-size ones
+/// holding the link for up to 3.4 s)...
+const MF_MOTION_SETTLE: Duration = Duration::from_secs(3);
+/// ...twice as long each time motion comes back this soon after switching back (a
+/// session of scrolls and drawing makes one round trip, not one per pause), up to
+/// [`MF_MOTION_SETTLE_MAX`]; after a longer calm it starts over.
+const MF_MOTION_RETURN: Duration = Duration::from_secs(15);
+const MF_MOTION_SETTLE_MAX: Duration = Duration::from_secs(16);
+/// The switch back also waits for the screen to be still this long: its keyframe can be
+/// large (199 KB a page of text at 2992x1878, 2.3 MB with a canvas of line art), and
+/// typing behind it would wait for it on the link. Someone typing on and on gets it
+/// [`MF_BACK_ANYWAY`] after the settle (never sharp text while typing otherwise).
+const MF_BACK_STILL: Duration = Duration::from_secs(1);
+const MF_BACK_ANYWAY: Duration = Duration::from_secs(3);
+
+/// Microsoft's encoder's half-size spell starts: how long it must be over before the
+/// switch back (`settle`: the last one's; `back`: when it last switched back).
+fn mf_settle_for(settle: Duration, back: Option<Instant>, now: Instant) -> Duration {
+    match back {
+        Some(t) if now.saturating_duration_since(t) < MF_MOTION_RETURN => {
+            (settle * 2).min(MF_MOTION_SETTLE_MAX)
+        }
+        _ => MF_MOTION_SETTLE,
+    }
+}
+
+/// Microsoft's encoder at half size: switch back now? `since_big`: since the last large
+/// change; `since_change`: since any; `link_free`: nothing sent is still on the link.
+fn mf_switch_back(
+    settle: Duration,
+    since_big: Duration,
+    since_change: Duration,
+    link_free: bool,
+) -> bool {
+    since_big >= settle
+        && (since_change >= MF_BACK_STILL || since_big >= settle + MF_BACK_ANYWAY)
+        && link_free
+}
 /// Changes covering at least this share of the screen, coming one after another (each
 /// within [`ANIMATION_GAP`] of the last, [`ANIMATION_FRAMES`] of them), are something
 /// playing that someone watches (a video in a window, a terminal printing): the full
@@ -636,13 +685,13 @@ fn run_generation(
     let mut motion = false;
     let mut big_streak = 0u32;
     let mut last_big = Instant::now();
-    // Captures in a row changing a large area (frames may wait for the link meanwhile).
-    let mut captured_big = 0u32;
-    // The CPU encoder is Microsoft's software one, and it has made a picture of a large
-    // change far above the bitrate (a scroll: its motion search fails): large areas
-    // moving then go to openh264 at half size (`VideoEncoder::set_motion_input`).
+    // The CPU encoder is Microsoft's software one: large changes it codes too large go
+    // to openh264 at half size (see `MF_OVERSIZE`).
     let mut mf_main = false;
-    let mut mf_struggles = false;
+    let mut told_motion = false;
+    // How long motion on it must be over before switching back, and when it last was.
+    let mut mf_settle = MF_MOTION_SETTLE;
+    let mut mf_back: Option<Instant> = None;
     // The widest picture the main CPU encoder handles well (kept while another engine
     // takes the moving pictures).
     let mut width_limit: Option<usize> = None;
@@ -741,11 +790,6 @@ fn run_generation(
                 last_change = Instant::now();
                 refined = false;
                 animation.note(last_change, c.changed);
-                captured_big = if c.changed >= MOTION_CHANGE {
-                    captured_big + 1
-                } else {
-                    0
-                };
                 if let Some(r) = refiner.as_mut() {
                     r.changed(last_change);
                 }
@@ -869,13 +913,25 @@ fn run_generation(
         mf_main |= !surfaces && width_limit.is_some();
         let may_halve = !surfaces
             && composer.is_none()
-            && ((target.is_none() && cfg.motion_half_res) || (mf_main && mf_struggles))
+            && ((target.is_none() && cfg.motion_half_res) || mf_main)
             && w * h >= MOTION_MIN_PIXELS;
-        // Motion over: one sharp full-size picture.
-        let sharpen = motion && last_big.elapsed() >= MOTION_SETTLE;
+        // Motion over: one sharp full-size picture (Microsoft's encoder: later, and not
+        // into a busy link, see `MF_MOTION_SETTLE`).
+        let sharpen = if mf_main {
+            motion
+                && mf_switch_back(
+                    mf_settle,
+                    last_big.elapsed(),
+                    last_change.elapsed(),
+                    link_free <= now,
+                )
+        } else {
+            motion && last_big.elapsed() >= MOTION_SETTLE
+        };
         if sharpen {
             motion = false;
             big_streak = 0;
+            mf_back = Some(now);
         }
         // Full rate while someone interacts, a big area moves or something plays.
         let changed = pending.as_ref().map_or(0.0, |p| p.changed);
@@ -991,16 +1047,13 @@ fn run_generation(
         } else if p.is_some() {
             big_streak = 0;
         }
-        if may_halve
-            && !motion
-            && (big_streak >= MOTION_FRAMES || (mf_main && big && captured_big >= 2))
-        {
+        if may_halve && !motion && !mf_main && big_streak >= MOTION_FRAMES {
             motion = true;
         }
         enc.set_motion_input(motion && may_halve);
         let t0 = Instant::now();
         let mut size = (w, h);
-        let encoded = match (&surface, &picture) {
+        let mut encoded = match (&surface, &picture) {
             (Some(s), _) => enc.encode_surface(s)?,
             (None, Some(pic)) if motion && may_halve => {
                 pic.half_into(&mut small);
@@ -1079,6 +1132,39 @@ fn run_generation(
             }
             (None, None) => unreachable!("checked above"),
         };
+        // Microsoft's encoder coded a large change far too large (see `MF_OVERSIZE`): not
+        // sent; the same picture at half size instead.
+        let share = enc.settings().bitrate_bps as usize / 8 / cfg.max_fps.max(1) as usize;
+        if mf_main
+            && may_halve
+            && !motion
+            && big
+            && !enc.last_frame().key
+            && encoded
+                .as_ref()
+                .is_some_and(|au| au.len() > MF_OVERSIZE * share)
+            && let Some(full) = &picture
+        {
+            stats.oversize += 1;
+            tracing::debug!(
+                bytes = encoded.as_ref().map_or(0, Vec::len),
+                "picture of a large change too large; half size from here"
+            );
+            motion = true;
+            mf_settle = mf_settle_for(mf_settle, mf_back, now);
+            if !std::mem::replace(&mut told_motion, true) {
+                tracing::info!(
+                    "large changes too large for this encoder: half size on openh264 until still"
+                );
+            }
+            enc.set_motion_input(true);
+            full.half_into(&mut small);
+            enc.set_scaled_input(true);
+            stats.half += 1;
+            let half = small.as_ref().expect("allocated by half_into");
+            size = half.dimensions();
+            encoded = enc.encode_yuv(half, None)?;
+        }
         let took = t0.elapsed();
         stats.encode += took;
         if urgent {
@@ -1089,13 +1175,6 @@ fn run_generation(
             let large = enc.settings().bitrate_bps as usize / 8 / cfg.max_fps.max(1) as usize / 2;
             if let Some(c) = converge.as_mut().filter(|_| topoff && au.len() >= large) {
                 c.1 = now; // still sharpening
-            }
-            if mf_main && big && !motion && !info.key && au.len() > 8 * large && !mf_struggles {
-                tracing::info!(
-                    bytes = au.len(),
-                    "large changes over the bitrate on this encoder; moving areas go at half size"
-                );
-                mf_struggles = true;
             }
             if let Some(r) = refiner.as_mut() {
                 let target = enc.settings().bitrate_bps;
@@ -1129,6 +1208,17 @@ fn run_generation(
                 });
                 stats.keys += 1;
                 stats.key_causes.add(cause);
+            }
+            if info.key || au.len() > 8 * large {
+                tracing::debug!(
+                    bytes = au.len(),
+                    key = info.key,
+                    w = size.0,
+                    h = size.1,
+                    engine = enc.engine_name(),
+                    changed = p.as_ref().map_or(0.0, |p| p.changed),
+                    "large picture"
+                );
             }
             if last_size.is_some_and(|s| s != size) {
                 stats.size_switches += 1;
@@ -1278,6 +1368,8 @@ struct Stats {
     urgent: u32,
     /// Frames sent at half size (motion).
     half: u32,
+    /// Pictures of large changes Microsoft's encoder made too large, not sent.
+    oversize: u32,
     /// Frames sent at the viewer's (smaller) size.
     scaled: u32,
     /// Still pictures re-sent to sharpen them (`TOPOFF_FRAMES`).
@@ -1353,6 +1445,7 @@ impl Stats {
             fps = format!("{:.1}", f64::from(self.frames) / secs),
             urgent_fps = format!("{:.1}", f64::from(self.urgent) / secs),
             half_size_fps = format!("{:.1}", f64::from(self.half) / secs),
+            oversize = self.oversize,
             view_size_fps = format!("{:.1}", f64::from(self.scaled) / secs),
             topoff_fps = format!("{:.1}", f64::from(self.topoffs) / secs),
             moved_pct = format!("{:.1}", self.moved * 100.0 / n),
@@ -1638,6 +1731,38 @@ mod tests {
 
     /// Something playing (a video in a window) is noticed after a few changes in a row;
     /// a blinking caret (twice a second) and a tiny spinner are not.
+    /// Microsoft's encoder at half size: back after the settle once the screen is still
+    /// (or long after, while typing goes on), never into a busy link; a quick return to
+    /// motion doubles the settle (up to a ceiling), a long calm resets it.
+    #[test]
+    fn half_size_spells_end_late_and_rarely() {
+        let s = MF_MOTION_SETTLE;
+        let ms = Duration::from_millis;
+        assert!(
+            !mf_switch_back(s, s - ms(1), ms(5000), true),
+            "settle not over"
+        );
+        assert!(
+            mf_switch_back(s, s, MF_BACK_STILL, true),
+            "settled and still"
+        );
+        assert!(!mf_switch_back(s, s, ms(100), true), "typing on");
+        assert!(
+            mf_switch_back(s, s + MF_BACK_ANYWAY, ms(10), true),
+            "typing on and on"
+        );
+        assert!(!mf_switch_back(s, s * 10, ms(5000), false), "link busy");
+        let t0 = Instant::now();
+        let now = t0 + ms(5000);
+        assert_eq!(mf_settle_for(s, None, now), s);
+        assert_eq!(mf_settle_for(s, Some(t0), now), s * 2);
+        assert_eq!(
+            mf_settle_for(MF_MOTION_SETTLE_MAX, Some(t0), now),
+            MF_MOTION_SETTLE_MAX
+        );
+        assert_eq!(mf_settle_for(s * 4, Some(t0), t0 + MF_MOTION_RETURN), s);
+    }
+
     #[test]
     fn sustained_changes_count_as_playing() {
         let t0 = Instant::now();
