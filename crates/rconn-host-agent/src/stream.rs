@@ -129,6 +129,10 @@ const MF_MOTION_SETTLE_MAX: Duration = Duration::from_secs(16);
 /// [`MF_BACK_ANYWAY`] after the settle (never sharp text while typing otherwise).
 const MF_BACK_STILL: Duration = Duration::from_secs(1);
 const MF_BACK_ANYWAY: Duration = Duration::from_secs(3);
+/// A spell with no large change after the one that started it (a window of dense text
+/// opening) ends after this long, still or not: it was no motion, and typing into the
+/// window must not stay blurred for [`MF_MOTION_SETTLE`] + [`MF_BACK_ANYWAY`].
+const MF_LONE_SETTLE: Duration = Duration::from_secs(1);
 
 /// Microsoft's encoder's half-size spell starts: how long it must be over before the
 /// switch back (`settle`: the last one's; `back`: when it last switched back).
@@ -142,16 +146,22 @@ fn mf_settle_for(settle: Duration, back: Option<Instant>, now: Instant) -> Durat
 }
 
 /// Microsoft's encoder at half size: switch back now? `since_big`: since the last large
-/// change; `since_change`: since any; `link_free`: nothing sent is still on the link.
+/// change; `since_change`: since any; `lone`: no large change came after the one that
+/// started the spell; `link_free`: nothing sent is still on the link.
 fn mf_switch_back(
     settle: Duration,
     since_big: Duration,
     since_change: Duration,
+    lone: bool,
     link_free: bool,
 ) -> bool {
-    since_big >= settle
-        && (since_change >= MF_BACK_STILL || since_big >= settle + MF_BACK_ANYWAY)
-        && link_free
+    let over = if lone {
+        since_big >= MF_LONE_SETTLE
+    } else {
+        since_big >= settle
+            && (since_change >= MF_BACK_STILL || since_big >= settle + MF_BACK_ANYWAY)
+    };
+    over && link_free
 }
 /// Changes covering at least this share of the screen, coming one after another (each
 /// within [`ANIMATION_GAP`] of the last, [`ANIMATION_FRAMES`] of them), are something
@@ -692,6 +702,8 @@ fn run_generation(
     // How long motion on it must be over before switching back, and when it last was.
     let mut mf_settle = MF_MOTION_SETTLE;
     let mut mf_back: Option<Instant> = None;
+    // Large changes in the half-size spell after the one that started it.
+    let mut spell_bigs = 0u32;
     // The widest picture the main CPU encoder handles well (kept while another engine
     // takes the moving pictures).
     let mut width_limit: Option<usize> = None;
@@ -923,6 +935,7 @@ fn run_generation(
                     mf_settle,
                     last_big.elapsed(),
                     last_change.elapsed(),
+                    spell_bigs == 0,
                     link_free <= now,
                 )
         } else {
@@ -1044,6 +1057,9 @@ fn run_generation(
         if big {
             last_big = now;
             big_streak += 1;
+            if motion {
+                spell_bigs += 1;
+            }
         } else if p.is_some() {
             big_streak = 0;
         }
@@ -1146,6 +1162,7 @@ fn run_generation(
             && let Some(full) = &picture
         {
             stats.oversize += 1;
+            spell_bigs = 0;
             tracing::debug!(
                 bytes = encoded.as_ref().map_or(0, Vec::len),
                 "picture of a large change too large; half size from here"
@@ -1729,29 +1746,40 @@ mod tests {
         assert!(starts < 27.0, "the old way: {starts:.1} fps");
     }
 
-    /// Something playing (a video in a window) is noticed after a few changes in a row;
-    /// a blinking caret (twice a second) and a tiny spinner are not.
     /// Microsoft's encoder at half size: back after the settle once the screen is still
-    /// (or long after, while typing goes on), never into a busy link; a quick return to
+    /// (or long after, while typing goes on; soon after a lone large change), never into
+    /// a busy link; a quick return to
     /// motion doubles the settle (up to a ceiling), a long calm resets it.
     #[test]
     fn half_size_spells_end_late_and_rarely() {
         let s = MF_MOTION_SETTLE;
         let ms = Duration::from_millis;
         assert!(
-            !mf_switch_back(s, s - ms(1), ms(5000), true),
+            !mf_switch_back(s, s - ms(1), ms(5000), false, true),
             "settle not over"
         );
         assert!(
-            mf_switch_back(s, s, MF_BACK_STILL, true),
+            mf_switch_back(s, s, MF_BACK_STILL, false, true),
             "settled and still"
         );
-        assert!(!mf_switch_back(s, s, ms(100), true), "typing on");
+        assert!(!mf_switch_back(s, s, ms(100), false, true), "typing on");
         assert!(
-            mf_switch_back(s, s + MF_BACK_ANYWAY, ms(10), true),
+            mf_switch_back(s, s + MF_BACK_ANYWAY, ms(10), false, true),
             "typing on and on"
         );
-        assert!(!mf_switch_back(s, s * 10, ms(5000), false), "link busy");
+        assert!(
+            !mf_switch_back(s, s * 10, ms(5000), false, false),
+            "link busy"
+        );
+        // A lone large change (a window opening): back soon, typing or not.
+        assert!(
+            mf_switch_back(s, MF_LONE_SETTLE, ms(10), true, true),
+            "lone"
+        );
+        assert!(
+            !mf_switch_back(s, MF_LONE_SETTLE - ms(1), ms(10), true, true),
+            "lone, too soon"
+        );
         let t0 = Instant::now();
         let now = t0 + ms(5000);
         assert_eq!(mf_settle_for(s, None, now), s);
@@ -1763,6 +1791,8 @@ mod tests {
         assert_eq!(mf_settle_for(s * 4, Some(t0), t0 + MF_MOTION_RETURN), s);
     }
 
+    /// Something playing (a video in a window) is noticed after a few changes in a row;
+    /// a blinking caret (twice a second) and a tiny spinner are not.
     #[test]
     fn sustained_changes_count_as_playing() {
         let t0 = Instant::now();

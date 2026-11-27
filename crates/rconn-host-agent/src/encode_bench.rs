@@ -83,8 +83,8 @@ fn page_pixel(x: usize, y: usize) -> [u8; 4] {
     [c, c, c.saturating_sub((line % 3) as u8 * 20), 255]
 }
 
-/// A pixel of a lighter page, for [`Scenario::Mix`] (`RCONN_LIVE_PAGE=dense`: the one
-/// above): 24 px lines of ragged length, words, letters of a few strokes; closer to a
+/// A pixel of a lighter page, for [`Scenario::Mix`] and with `RCONN_LIVE_PAGE=light`
+/// (`dense`: the one above): 24 px lines of ragged length, words, letters of a few strokes; closer to a
 /// real document than [`page_pixel`], whose every 9x18 cell is inked (a 2688x1686
 /// keyframe of it from Microsoft's encoder: 1.67 MB; of a real desktop: 113 KB).
 fn light_pixel(x: usize, y: usize) -> [u8; 4] {
@@ -126,8 +126,11 @@ impl Desktop {
             Scenario::Mix => MIX_SCROLL_END * SCROLL_STEP,
             _ => 0,
         };
-        let light =
-            scenario == Scenario::Mix && std::env::var("RCONN_LIVE_PAGE").as_deref() != Ok("dense");
+        let light = match std::env::var("RCONN_LIVE_PAGE").as_deref() {
+            Ok("light") => true,
+            Ok("dense") => false,
+            _ => scenario == Scenario::Mix,
+        };
         let pixel = if light { light_pixel } else { page_pixel };
         let mut page = vec![0u8; w * rows * 4];
         for (y, row) in page.chunks_exact_mut(w * 4).enumerate() {
