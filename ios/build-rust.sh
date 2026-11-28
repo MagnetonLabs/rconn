@@ -31,7 +31,7 @@ export IPHONEOS_DEPLOYMENT_TARGET=17.0
 for t in "${targets[@]}"; do
   rustup target list --installed | grep -qx "$t" || rustup target add "$t"
   # shellcheck disable=SC2086 # $flag is empty or one word
-  cargo build -p rconn-mobile --lib $flag --target "$t"
+  cargo rustc -p rconn-mobile --lib $flag --target "$t" --crate-type staticlib
 done
 
 out=ios/Generated

@@ -8,8 +8,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [lib]
-# staticlib: linked into the iOS app (ios/build-rust.sh). lib: tests and bindgen.
-crate-type = ["lib", "staticlib"]
+# The iOS app's static library is built by ios/build-rust.sh (`cargo rustc --crate-type
+# staticlib`), so workspace builds on the Mac don't link a 198 MB librconn_mobile.a.
 
 [[bin]]
 # Generates the Swift bindings from the built library (library mode).
