@@ -18,9 +18,11 @@ selection, check vs build vs test), and Cargo never deletes the old ones.
    ```sh
    main="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
    wt="$(git rev-parse --show-toplevel)"
-   mkdir -p "$wt/target"
+   mkdir -p "$wt/target/build.noindex"
    [ -e "$wt/target/debug" ]    || cp -c -R "$main/target/debug"    "$wt/target/debug"
    [ -e "$wt/target/openh264" ] || cp -c -R "$main/target/openh264" "$wt/target/openh264"
+   [ -e "$wt/target/build.noindex/debug" ] ||
+     cp -c -R "$main/target/build.noindex/debug" "$wt/target/build.noindex/debug"
    ```
 3. **Run every build and test through the queue:** `scripts/cargo-slot.sh cargo <args>`
    (two at a time, 9 jobs each). One build already uses the whole machine: six at once
@@ -47,7 +49,12 @@ selection, check vs build vs test), and Cargo never deletes the old ones.
    an empty cache cost +41 %. The earlier "25 hits, 997 misses" came from setting
    `CARGO_TARGET_DIR` as an environment variable (sccache 0.17 hashes every `CARGO_*`
    variable), not from the target path.
-8. **Find what is big:**
+8. **Build intermediates live in `target/build.noindex`** (Spotlight skips `.noindex`
+   folders). This Mac's `~/.cargo/config.toml` sets
+   `build-dir = "{workspace-root}/target/build.noindex"`; `~/.local/bin/rust-noindex`
+   sets it and moves older build output there. Final binaries stay in `target/debug` and
+   `target/release`.
+9. **Find what is big:**
    `du -hd 1 . .claude/worktrees target | sort -hr | head`.
 
 ## Never

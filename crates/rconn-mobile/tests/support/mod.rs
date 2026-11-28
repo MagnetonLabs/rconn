@@ -65,6 +65,9 @@ pub fn openh264() -> PathBuf {
 /// Signaling server plus a host whose access password is [`PASSWORD`]. Returns the server
 /// URL, the computer's ID as a user would type it, and the host's log.
 pub async fn start(setup: HostSetup) -> (String, String, Arc<HostLog>) {
+    // The host sends a test beep. A session in this process (a test) decodes it but
+    // never plays it on this machine's speakers.
+    rconn_mobile::sound::use_null_output();
     let ca = FleetCa::generate(OrgId::new()).unwrap();
     let auth = FleetAuthenticator::new(SERVER_ID).with_org_ca(ca.org_id(), ca.cert_pem());
     let listener = tokio::net::TcpListener::bind(&setup.listen).await.unwrap();
