@@ -8,7 +8,7 @@
 //! given folder (default: a new temporary one with a few files) on the file channel.
 //! Nothing here touches this Mac's screen or input.
 
-#[path = "../tests/support/mod.rs"]
+#[path = "../tests/it/support/mod.rs"]
 mod support;
 
 use std::sync::atomic::Ordering;

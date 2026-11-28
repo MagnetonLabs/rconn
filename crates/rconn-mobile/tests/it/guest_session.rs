@@ -3,7 +3,7 @@
 //! The AVCC samples the app would get are turned back into Annex-B and decoded, and the
 //! input the app sends is checked on the host.
 
-mod support;
+use crate::support;
 
 use rconn_core::hid::usage as u;
 use rconn_core::protocol::InputEvent;

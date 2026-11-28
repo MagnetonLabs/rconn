@@ -2,7 +2,7 @@
 //! tone is decoded (no output device is opened), and the app's file calls browse, fetch
 //! and send through the host's real `rconn-files/1` server.
 
-mod support;
+use crate::support;
 
 use rconn_mobile::{FileError, SessionListener, Transfer, VideoFrame, connect_guest};
 use std::path::Path;
