@@ -28,10 +28,20 @@ FROM portal-${PORTAL_UI} AS portal
 FROM rust:1-bookworm AS build
 # Parallel rustc jobs (0: cargo's default, one per CPU).
 ARG CARGO_BUILD_JOBS=0
+ARG TARGETARCH
 WORKDIR /src
+# The toolchain rust-toolchain.toml asks for, in its own layer: rebuilt only when that file
+# changes, instead of downloaded (25 s) by every build.
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
 COPY . .
 COPY --from=portal /out /portal-dist
-RUN features="" \
+# The crate downloads and target/ are BuildKit cache mounts, kept between image builds (one
+# per CPU architecture), so a source change recompiles only what changed instead of every
+# dependency. They are not part of the image: the binary is copied out of target/ below.
+RUN --mount=type=cache,id=rconn-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=rconn-signaling-target-${TARGETARCH},target=/src/target,sharing=locked \
+    features="" \
  && if [ -f /portal-dist/index.html ] \
       && grep -q '^portal-ui *=' crates/rconn-signaling/Cargo.toml; then \
       rm -rf portal/dist && mkdir -p portal && cp -a /portal-dist portal/dist \
@@ -40,7 +50,8 @@ RUN features="" \
  && if [ "$CARGO_BUILD_JOBS" != 0 ]; then export CARGO_BUILD_JOBS; else unset CARGO_BUILD_JOBS; fi \
  && echo "cargo features: ${features:-none}" \
  && cargo build --release --locked -p rconn-signaling $features \
- && strip target/release/rconn-signaling
+ && cp target/release/rconn-signaling /usr/local/bin/rconn-signaling \
+ && strip /usr/local/bin/rconn-signaling
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -48,7 +59,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home /data rconn \
  && mkdir -p /data /keys && chown rconn /data /keys && chmod 700 /keys
-COPY --from=build /src/target/release/rconn-signaling /usr/local/bin/rconn-signaling
+COPY --from=build /usr/local/bin/rconn-signaling /usr/local/bin/rconn-signaling
 USER rconn
 # The master key that seals org CA keys lives outside /data (and its backups).
 ENV RCONN_DATA_DIR=/data RCONN_MASTER_KEY_FILE=/keys/master.key RCONN_BIND=0.0.0.0:8080
