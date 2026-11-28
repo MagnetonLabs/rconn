@@ -36,6 +36,11 @@ selection, check vs build vs test), and Cargo never deletes the old ones.
    Each different `-p <crate>` selection recompiled 41-131 crates and added 0.2-1.4 GiB.
    Leave cross-target builds (Windows, Linux, iOS) and `scripts/check.sh` /
    `scripts/package.sh` to the main checkout once the branch is merged.
+   **While working, run only the tests your change can affect:** `scripts/test-changed.sh`
+   (the changed crates and every crate that depends on them, same build selection, so
+   nothing recompiles). After an `rconn-mobile` edit it ran 17 tests in 2.7 s instead of
+   419 in 25 s; an `rconn-core` edit still runs all 419. Before merging, run the full
+   `HEAVY=1 scripts/cargo-slot.sh scripts/check.sh`.
 5. **Run `cargo clean --workspace` after a merge that brings a version bump, or when
    `target/debug` passes 12 GiB.** It removes this workspace's old output and keeps the
    dependencies (7.8 to 2.4 GiB in a test); the rebuild takes 23 s. A version bump alone
