@@ -3,7 +3,7 @@
 //! lists. Routes not built yet answer 501 to members whose role passes; routes naming a
 //! resource answer 404 for an id that doesn't exist.
 
-mod portal_support;
+use crate::portal_support;
 
 use axum::http::{Method, StatusCode};
 use portal_support::{Browser, Portal};

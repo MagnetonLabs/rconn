@@ -1,7 +1,7 @@
 //! Portal sign-in over HTTP with cookies: password, magic link, sign-out, sessions,
 //! request checks, rate limits, `/me`, company sign-up, and the audit rows they write.
 
-mod portal_support;
+use crate::portal_support;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};

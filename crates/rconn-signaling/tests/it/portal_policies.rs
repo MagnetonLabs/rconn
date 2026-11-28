@@ -1,7 +1,7 @@
 //! Groups, session policies and the audit log through the portal API, and the effective
 //! policy applied when a session to an org computer is requested over `/v1/ws`.
 
-mod portal_support;
+use crate::portal_support;
 
 use axum::http::{Method, StatusCode};
 use futures_util::{SinkExt, StreamExt};

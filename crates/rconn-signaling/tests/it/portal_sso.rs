@@ -1,7 +1,7 @@
 //! Company SSO (OIDC against an in-process identity provider), domain verification
 //! through a fake DNS, and passkeys with a software authenticator.
 
-mod portal_support;
+use crate::portal_support;
 
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};

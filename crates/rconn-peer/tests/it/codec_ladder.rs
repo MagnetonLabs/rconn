@@ -4,7 +4,7 @@
 //! desktop (text, a scrolling page, a window being dragged, typing). Prints bytes, PSNR
 //! and times per codec:
 //!
-//! `cargo test --release -p rconn-peer --test codec_ladder -- --nocapture`
+//! `cargo test --release -p rconn-peer --test it codec_ladder:: -- --nocapture`
 #![cfg(target_os = "macos")]
 
 use bytes::Bytes;
@@ -399,7 +399,8 @@ fn av1_screen_content_decodes_on_videotoolbox_exactly() {
         "78da7307e286fe54",
         "a1f888aa86b76000",
     ];
-    let stream: &[u8] = include_bytes!("../../rconn-media/tests/fixtures/av1-screen-320x240.obu");
+    let stream: &[u8] =
+        include_bytes!("../../../rconn-media/tests/fixtures/av1-screen-320x240.obu");
     // Temporal units: each starts at a temporal delimiter.
     let units = rconn_core::codec::units(VideoCodec::Av1, stream);
     let mut tus: Vec<Vec<u8>> = Vec::new();

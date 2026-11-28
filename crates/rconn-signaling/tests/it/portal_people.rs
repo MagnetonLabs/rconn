@@ -2,7 +2,7 @@
 //! (portal sign-ins and live desktop sockets end), invites, and roles deciding who may
 //! list and connect from the desktop app, without breaking 0.1.x logins.
 
-mod portal_support;
+use crate::portal_support;
 
 use axum::http::{Method, StatusCode};
 use futures_util::{SinkExt, StreamExt};

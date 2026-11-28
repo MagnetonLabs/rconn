@@ -4,7 +4,7 @@
 //! two frames later (a round trip). The picture must continue, bit-exact with a viewer
 //! that lost nothing, with no keyframe but the first.
 //!
-//! `cargo test -p rconn-peer --test loss_repair -- --nocapture` prints the numbers.
+//! `cargo test -p rconn-peer --test it loss_repair:: -- --nocapture` prints the numbers.
 //! Needs `scripts/fetch-openh264.sh`.
 
 use bytes::Bytes;

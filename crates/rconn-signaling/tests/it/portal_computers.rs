@@ -2,7 +2,7 @@
 //! rename/move inside the org only, revoke (evicts now, refuses reconnects), enrollment
 //! tokens, and computers joining an org with one.
 
-mod portal_support;
+use crate::portal_support;
 
 use axum::http::{Method, StatusCode};
 use futures_util::{SinkExt, StreamExt};
